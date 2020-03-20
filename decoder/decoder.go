@@ -1,6 +1,7 @@
 package decoder
 
 /*
+#cgo LDFLAGS: -lwebp
 #include <stdlib.h>
 #include <webp/decode.h>
 */

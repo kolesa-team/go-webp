@@ -16,11 +16,16 @@ sudo apt-get install libwebp-dev
 `go get -u github.com/kolesa-team/go-webp`
 
 ## Example 
-#### Before run
+#### Install libwebp library
+For MacOs:
 ```bash
-export CGO_CFLAGS="-I /usr/local/opt/webp/include"
-export CGO_LDFLAGS="-L /usr/local/opt/webp/lib -lwebp"
-export LD_LIBRARY_PATH=/usr/local/opt/webp/lib
+brew update
+brew install webp
+```
+For Ubuntu:
+```bash
+apt update
+apt install libwebp-dev
 ```
 
 #### Decode:
