@@ -15,3 +15,7 @@ script:
 
 before_install:
   - sudo apt-get install libwebp-dev
+
+addons:
+  apt:
+    update: true
