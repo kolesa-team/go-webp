@@ -12,3 +12,6 @@ go:
 
 script:
   - go test -v ./...
+
+before_install:
+  - sudo apt-get install libwebp-dev
