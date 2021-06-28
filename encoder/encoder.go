@@ -1,3 +1,24 @@
+// The MIT License (MIT)
+//
+// Copyright (c) 2019 Amangeldy Kadyl
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy of
+// this software and associated documentation files (the "Software"), to deal in
+// the Software without restriction, including without limitation the rights to
+// use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+// the Software, and to permit persons to whom the Software is furnished to do so,
+// subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+// FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+// COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+// IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+// CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 package encoder
 
 /*
@@ -41,14 +62,14 @@ import (
 	"unsafe"
 )
 
-type (
-	Encoder struct {
-		options *Options
-		config  *C.WebPConfig
-		img     *image.NRGBA
-	}
-)
+// Encoder stores information to encode image
+type Encoder struct {
+	options *Options
+	config  *C.WebPConfig
+	img     *image.NRGBA
+}
 
+// NewEncoder return new encoder instance
 func NewEncoder(src image.Image, options *Options) (e *Encoder, err error) {
 	var config *C.WebPConfig
 
@@ -68,6 +89,7 @@ func NewEncoder(src image.Image, options *Options) (e *Encoder, err error) {
 	return
 }
 
+// Encode picture and flush to io.Writer
 func (e *Encoder) Encode(w io.Writer) error {
 	var size C.size_t
 
@@ -90,6 +112,8 @@ func (e *Encoder) Encode(w io.Writer) error {
 	return err
 }
 
+// Convert picture from any image.Image type to *image.NRGBA
+// @todo optimization needed
 func (e *Encoder) convertToNRGBA(src image.Image) (dst *image.NRGBA) {
 	dst = image.NewNRGBA(src.Bounds())
 	draw.Draw(dst, dst.Bounds(), src, src.Bounds().Min, draw.Src)
