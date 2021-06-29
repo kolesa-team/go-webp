@@ -1,3 +1,24 @@
+// The MIT License (MIT)
+//
+// Copyright (c) 2019 Amangeldy Kadyl
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy of
+// this software and associated documentation files (the "Software"), to deal in
+// the Software without restriction, including without limitation the rights to
+// use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+// the Software, and to permit persons to whom the Software is furnished to do so,
+// subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+// FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+// COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+// IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+// CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 package decoder
 
 /*
@@ -17,6 +38,7 @@ import (
 	"github.com/kolesa-team/go-webp/utils"
 )
 
+// Decoder stores information to decode picture
 type Decoder struct {
 	data    []byte
 	options *Options
@@ -25,6 +47,7 @@ type Decoder struct {
 	sPtr    C.size_t
 }
 
+// NewDecoder return new decoder instance
 func NewDecoder(r io.Reader, options *Options) (d *Decoder, err error) {
 	var data []byte
 
@@ -53,6 +76,7 @@ func NewDecoder(r io.Reader, options *Options) (d *Decoder, err error) {
 	return
 }
 
+// Decode picture from reader
 func (d *Decoder) Decode() (image.Image, error) {
 	// вписываем размеры итоговой картинки
 	d.config.output.width, d.config.output.height = d.getOutputDimensions()
@@ -77,6 +101,7 @@ func (d *Decoder) Decode() (image.Image, error) {
 	return img, nil
 }
 
+// GetFeatures return information about picture: width, height ...
 func (d *Decoder) GetFeatures() utils.BitstreamFeatures {
 	return utils.BitstreamFeatures{
 		Width:        int(d.config.input.width),
@@ -87,10 +112,12 @@ func (d *Decoder) GetFeatures() utils.BitstreamFeatures {
 	}
 }
 
+// parse features from picture
 func (d *Decoder) parseFeatures(dataPtr *C.uint8_t, sizePtr C.size_t) utils.VP8StatusCode {
 	return utils.VP8StatusCode(C.WebPGetFeatures(dataPtr, sizePtr, &d.config.input))
 }
 
+// return dimensions of result image
 func (d *Decoder) getOutputDimensions() (width, height C.int) {
 	width = d.config.input.width
 	height = d.config.input.height

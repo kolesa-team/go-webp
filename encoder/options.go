@@ -1,3 +1,24 @@
+// The MIT License (MIT)
+//
+// Copyright (c) 2019 Amangeldy Kadyl
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy of
+// this software and associated documentation files (the "Software"), to deal in
+// the Software without restriction, including without limitation the rights to
+// use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+// the Software, and to permit persons to whom the Software is furnished to do so,
+// subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+// FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+// COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+// IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+// CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 package encoder
 
 /*
@@ -7,6 +28,7 @@ package encoder
 import "C"
 import "errors"
 
+// Default libwebp image hints
 //noinspection GoUnusedConst
 const (
 	HintDefault ImageHint = iota
@@ -16,6 +38,7 @@ const (
 	HintLast
 )
 
+// Default libwebp presets
 //noinspection GoUnusedConst
 const (
 	PresetDefault EncodingPreset = iota
@@ -29,7 +52,8 @@ const (
 type (
 	ImageHint      int
 	EncodingPreset int
-	Options        struct {
+	// Options specifies webp encoding parameters
+	Options struct {
 		config *C.WebPConfig
 
 		Lossless         bool
@@ -48,8 +72,9 @@ type (
 		AlphaFiltering   int
 		alphaQuality     int
 		Pass             int
-		//QMin             int
-		//QMax             int
+		// Disabled for compatibility with old version libwebp
+		// QMin             int
+		// QMax             int
 		ShowCompressed  bool
 		Preprocessing   int
 		Partitions      int
@@ -64,6 +89,7 @@ type (
 	}
 )
 
+// NewLossyEncoderOptions build lossy encoding options
 func NewLossyEncoderOptions(preset EncodingPreset, quality float32) (options *Options, err error) {
 	options = &Options{
 		config: &C.WebPConfig{},
@@ -78,6 +104,7 @@ func NewLossyEncoderOptions(preset EncodingPreset, quality float32) (options *Op
 	return
 }
 
+// NewLosslessEncoderOptions build lossless encoding options
 func NewLosslessEncoderOptions(preset EncodingPreset, level int) (options *Options, err error) {
 	if options, err = NewLossyEncoderOptions(preset, 0); err != nil {
 		return
@@ -108,8 +135,9 @@ func (o *Options) sync() {
 	o.AlphaFiltering = int(o.config.alpha_filtering)
 	o.alphaQuality = int(o.config.alpha_quality)
 	o.Pass = int(o.config.pass)
-	//o.QMin = int(o.config.qmin)
-	//o.QMax = int(o.config.qmax)
+	// Disabled for compatibility with old version libwebp
+	// o.QMin = int(o.config.qmin)
+	// o.QMax = int(o.config.qmax)
 	o.ShowCompressed = o.config.show_compressed == 1
 	o.Preprocessing = int(o.config.preprocessing)
 	o.Partitions = int(o.config.partitions)
@@ -133,6 +161,7 @@ func (o *Options) boolToCInt(expression bool) (result C.int) {
 	return
 }
 
+// GetConfig build WebPConfig for libwebp
 func (o *Options) GetConfig() (*C.WebPConfig, error) {
 	o.config.lossless = o.boolToCInt(o.Lossless)
 	o.config.quality = C.float(o.Quality)
@@ -150,8 +179,9 @@ func (o *Options) GetConfig() (*C.WebPConfig, error) {
 	o.config.alpha_filtering = C.int(o.AlphaFiltering)
 	o.config.alpha_quality = C.int(o.alphaQuality)
 	o.config.pass = C.int(o.Pass)
-	//o.config.qmin = C.int(o.QMin)
-	//o.config.qmax = C.int(o.QMax)
+	// Disabled for compatibility with old version libwebp
+	// o.config.qmin = C.int(o.QMin)
+	// o.config.qmax = C.int(o.QMax)
 	o.config.show_compressed = o.boolToCInt(o.ShowCompressed)
 	o.config.preprocessing = C.int(o.Preprocessing)
 	o.config.partitions = C.int(o.Partitions)
