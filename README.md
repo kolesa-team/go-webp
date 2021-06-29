@@ -1,5 +1,5 @@
 # go-webp
-[![Build Status](https://travis-ci.org/kolesa-team/go-webp.svg)](https://travis-ci.org/kolesa-team/go-webp)
+[![Build Status](https://travis-ci.com/kolesa-team/go-webp.svg)](https://travis-ci.com/github/kolesa-team/go-webp)
 [![GoDoc](https://godoc.org/github.com/kolesa-team/go-webp?status.svg)](https://godoc.org/github.com/kolesa-team/go-webp)
 [![Go Report](https://goreportcard.com/badge/github.com/kolesa-team/go-webp)](https://goreportcard.com/report/github.com/kolesa-team/go-webp)
 
