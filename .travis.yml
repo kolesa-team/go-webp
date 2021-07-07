@@ -9,11 +9,15 @@ go:
   - master
 
 script:
-  - go test -v ./...
+  - go vet ./...
+  - go test -race -coverprofile=coverage.txt -covermode=atomic ./...
 
 before_install:
   - sudo apt-get install libwebp-dev
   - go mod vendor -v
+
+after_success:
+  - bash <(curl -s https://codecov.io/bash)
 
 addons:
   apt:
