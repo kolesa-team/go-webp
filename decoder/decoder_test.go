@@ -22,10 +22,9 @@
 package decoder
 
 import (
+	"github.com/kolesa-team/go-webp/utils"
 	"os"
 	"testing"
-
-	"github.com/kolesa-team/go-webp/utils"
 )
 
 func TestNewDecoder(t *testing.T) {
@@ -35,8 +34,12 @@ func TestNewDecoder(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if _, err := NewDecoder(file, &Options{}); err != nil {
+		if d, err := NewDecoder(file, &Options{}); err != nil {
 			t.Fatal(err)
+		} else if img, err := d.Decode(); err != nil {
+			t.Fatal(err)
+		} else if img.Bounds().Max.X <= 0 || img.Bounds().Max.Y <= 0 {
+			t.Fatal("invalid decoding result")
 		}
 	})
 	t.Run("empty file", func(t *testing.T) {

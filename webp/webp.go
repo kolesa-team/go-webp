@@ -28,6 +28,7 @@ import (
 	"io"
 )
 
+// Decode picture from reader
 func Decode(r io.Reader, options *decoder.Options) (image.Image, error) {
 	if dec, err := decoder.NewDecoder(r, options); err != nil {
 		return nil, err
@@ -36,6 +37,7 @@ func Decode(r io.Reader, options *decoder.Options) (image.Image, error) {
 	}
 }
 
+// Encode encode picture and write to io.Writer
 func Encode(w io.Writer, src image.Image, options *encoder.Options) error {
 	if enc, err := encoder.NewEncoder(src, options); err != nil {
 		return err

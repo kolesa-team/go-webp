@@ -74,37 +74,75 @@ func TestEncode(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+	t.Run("failed encoding with large size", func(t *testing.T) {
+		img := image.NewNRGBA(image.Rectangle{
+			Max: image.Point{X: 20000, Y: 1},
+		})
+
+		options, err := encoder.NewLosslessEncoderOptions(encoder.PresetDefault, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err = Encode(ioutil.Discard, img, options); err == nil {
+			t.Fatal("an error was expected")
+		}
+	})
 }
 
 func TestDecode(t *testing.T) {
-	r, err := os.Open("../test_data/images/m4_q75.webp")
-	if err != nil {
-		t.Fatal(err)
-	}
+	t.Run("decode lossy webp picture with many options", func(t *testing.T) {
+		r, err := os.Open("../test_data/images/webp-logo-lossy.webp")
+		if err != nil {
+			t.Fatal(err)
+		}
 
-	if img, err := Decode(r, &decoder.Options{
-		BypassFiltering:   true,
-		NoFancyUpsampling: true,
+		if img, err := Decode(r, &decoder.Options{
+			BypassFiltering:   true,
+			NoFancyUpsampling: true,
 
-		Crop: image.Rectangle{},
-		Scale: image.Rectangle{
-			Max: image.Point{
-				X: 400,
-				Y: 300,
+			Crop: image.Rectangle{},
+			Scale: image.Rectangle{
+				Max: image.Point{
+					X: 400,
+					Y: 300,
+				},
 			},
-		},
 
-		UseThreads:             true,
-		Flip:                   true,
-		DitheringStrength:      1,
-		AlphaDitheringStrength: 1,
-	}); err != nil {
-		t.Fatal(err)
-	} else if img == nil {
-		t.Fatal("img is empty")
-	} else if img.Bounds().Max.X != 400 || img.Bounds().Max.Y != 300 {
-		t.Fatal("img is invalid")
-	}
+			UseThreads:             true,
+			Flip:                   true,
+			DitheringStrength:      1,
+			AlphaDitheringStrength: 1,
+		}); err != nil {
+			t.Fatal(err)
+		} else if img == nil {
+			t.Fatal("img is empty")
+		} else if img.Bounds().Max.X != 400 || img.Bounds().Max.Y != 300 {
+			t.Fatal("img is invalid")
+		}
+	})
+	t.Run("decode lossless webp picture", func(t *testing.T) {
+		r, err := os.Open("../test_data/images/webp-logo-lossless.webp")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if img, err := Decode(r, &decoder.Options{}); err != nil {
+			t.Fatal(err)
+		} else if img == nil {
+			t.Fatal("img is empty")
+		}
+	})
+	t.Run("decode invalid webp file", func(t *testing.T) {
+		r, err := os.Open("../test_data/images/invalid.webp")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := Decode(r, &decoder.Options{}); err == nil {
+			t.Fatal("an error was expected")
+		}
+	})
 }
 
 func BenchmarkDecodeLossy(b *testing.B) {

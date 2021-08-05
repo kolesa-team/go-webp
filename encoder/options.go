@@ -50,7 +50,9 @@ const (
 )
 
 type (
-	ImageHint      int
+	// ImageHint hint of picture
+	ImageHint int
+	// EncodingPreset using Preset
 	EncodingPreset int
 	// Options specifies webp encoding parameters
 	Options struct {
