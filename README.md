@@ -1,3 +1,4 @@
+![logo](test_data/images/logo.jpg)
 # go-webp
 [![Build Status](https://travis-ci.com/kolesa-team/go-webp.svg)](https://travis-ci.com/github/kolesa-team/go-webp)
 [![GoDoc](https://godoc.org/github.com/kolesa-team/go-webp?status.svg)](https://godoc.org/github.com/kolesa-team/go-webp)
