@@ -3,6 +3,7 @@
 [![Build Status](https://travis-ci.com/kolesa-team/go-webp.svg)](https://travis-ci.com/github/kolesa-team/go-webp)
 [![GoDoc](https://godoc.org/github.com/kolesa-team/go-webp?status.svg)](https://godoc.org/github.com/kolesa-team/go-webp)
 [![Go Report](https://goreportcard.com/badge/github.com/kolesa-team/go-webp)](https://goreportcard.com/report/github.com/kolesa-team/go-webp)
+[![codecov](https://codecov.io/gh/kolesa-team/go-webp/branch/master/graph/badge.svg)](https://codecov.io/gh/kolesa-team/go-webp)
 
 Golang Webp library for encoding and decoding, using **C** binding for Google libwebp
 
