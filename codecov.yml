@@ -1,2 +1,4 @@
 ignore:
   - "_examples"
+  - "utils"
+  - "test_data"
