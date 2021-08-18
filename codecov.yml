@@ -2,3 +2,9 @@ ignore:
   - "_examples"
   - "utils"
   - "test_data"
+coverage:
+  status:
+    project:
+      default:
+        target: 80%
+        threshold: 1%
