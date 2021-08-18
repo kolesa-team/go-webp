@@ -23,6 +23,7 @@ package decoder
 
 import (
 	"github.com/kolesa-team/go-webp/utils"
+	"image"
 	"os"
 	"testing"
 )
@@ -34,7 +35,20 @@ func TestNewDecoder(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if d, err := NewDecoder(file, &Options{}); err != nil {
+		if d, err := NewDecoder(file, &Options{
+			BypassFiltering:   true,
+			NoFancyUpsampling: true,
+			Scale: image.Rectangle{
+				Max: image.Point{
+					X: 300,
+					Y: 300,
+				},
+			},
+			UseThreads:             true,
+			Flip:                   true,
+			DitheringStrength:      0,
+			AlphaDitheringStrength: 0,
+		}); err != nil {
 			t.Fatal(err)
 		} else if img, err := d.Decode(); err != nil {
 			t.Fatal(err)
@@ -48,7 +62,14 @@ func TestNewDecoder(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if _, err := NewDecoder(file, &Options{}); err == nil {
+		if _, err := NewDecoder(file, &Options{
+			Crop: image.Rectangle{
+				Max: image.Point{
+					X: 150,
+					Y: 150,
+				},
+			},
+		}); err == nil {
 			t.Fatal(err)
 		}
 	})
