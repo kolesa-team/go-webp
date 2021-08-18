@@ -6,7 +6,6 @@ go:
   - 1.15.x
   - 1.16.x
   - 1.x
-  - master
 
 script:
   - go vet ./...
