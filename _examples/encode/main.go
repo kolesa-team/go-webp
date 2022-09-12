@@ -40,7 +40,7 @@ func main() {
 		log.Fatalln(err)
 	}
 
-	output, err := os.Create("example/output_decode.webp")
+	output, err := os.Create("example/output_encode.webp")
 	if err != nil {
 		log.Fatal(err)
 	}
