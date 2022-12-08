@@ -26,7 +26,10 @@ package encoder
 #include <webp/encode.h>
 */
 import "C"
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 // Default libwebp image hints
 //noinspection GoUnusedConst
@@ -165,6 +168,13 @@ func (o *Options) boolToCInt(expression bool) (result C.int) {
 
 // GetConfig build WebPConfig for libwebp
 func (o *Options) GetConfig() (*C.WebPConfig, error) {
+	var err error
+	if o == nil {
+		o, err = NewLosslessEncoderOptions(PresetDefault, 0)
+		if err != nil {
+			return nil, fmt.Errorf("cannot validate default config: [%w]", err)
+		}
+	}
 	o.config.lossless = o.boolToCInt(o.Lossless)
 	o.config.quality = C.float(o.Quality)
 	o.config.method = C.int(o.Method)
