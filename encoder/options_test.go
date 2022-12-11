@@ -6,6 +6,15 @@ import (
 	"testing"
 )
 
+func TestNilOptions(t *testing.T) {
+	t.Run("config from nil Options succeeds", func(t *testing.T) {
+		var options *Options = nil
+		cfg, err := options.GetConfig()
+		require.NoError(t, err)
+		require.NotNil(t, cfg)
+	})
+}
+
 func TestNewLossyEncoderOptions(t *testing.T) {
 	t.Run("invalid quality", func(t *testing.T) {
 		options, err := NewLossyEncoderOptions(PresetDefault, -1)
