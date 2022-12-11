@@ -96,8 +96,8 @@ func (e *Encoder) Encode(w io.Writer) error {
 	output := C.encodeNRBBA(
 		e.config,
 		(*C.uint8_t)(&e.img.Pix[0]),
-		C.int(e.img.Rect.Max.X),
-		C.int(e.img.Rect.Max.Y),
+		C.int(e.img.Rect.Dx()),
+		C.int(e.img.Rect.Dy()),
 		C.int(e.img.Stride),
 		&size,
 	)
