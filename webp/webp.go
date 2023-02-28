@@ -22,10 +22,12 @@
 package webp
 
 import (
+	"image"
+	"image/color"
+	"io"
+
 	"github.com/kolesa-team/go-webp/decoder"
 	"github.com/kolesa-team/go-webp/encoder"
-	"image"
-	"io"
 )
 
 // Decode picture from reader
@@ -35,6 +37,21 @@ func Decode(r io.Reader, options *decoder.Options) (image.Image, error) {
 	} else {
 		return dec.Decode()
 	}
+}
+
+// DecodeConfig extracts simple metadata without decoding the image
+func DecodeConfig(r io.Reader, options *decoder.Options) (image.Config, error) {
+	dec, err := decoder.NewDecoder(r, options)
+	if err != nil {
+		return image.Config{}, err
+	}
+
+	feat := dec.GetFeatures()
+	return image.Config{
+		ColorModel: color.NRGBAModel,
+		Width:      feat.Width,
+		Height:     feat.Height,
+	}, nil
 }
 
 // Encode encode picture and write to io.Writer
