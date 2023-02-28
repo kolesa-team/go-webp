@@ -22,7 +22,8 @@
 package decoder
 
 /*
-#cgo LDFLAGS: -lwebp
+#cgo linux LDFLAGS: -lwebp
+#cgo darwin pkg-config: libwebp
 #include <stdlib.h>
 #include <webp/decode.h>
 */
@@ -32,7 +33,6 @@ import (
 	"fmt"
 	"image"
 	"io"
-	"io/ioutil"
 	"unsafe"
 
 	"github.com/kolesa-team/go-webp/utils"
@@ -51,7 +51,7 @@ type Decoder struct {
 func NewDecoder(r io.Reader, options *Options) (d *Decoder, err error) {
 	var data []byte
 
-	if data, err = ioutil.ReadAll(r); err != nil {
+	if data, err = io.ReadAll(r); err != nil {
 		return nil, err
 	}
 
