@@ -25,10 +25,11 @@ import (
 	"bytes"
 	"github.com/kolesa-team/go-webp/decoder"
 	"github.com/kolesa-team/go-webp/encoder"
-	"golang.org/x/image/webp"
+	"github.com/stretchr/testify/require"
 	"image"
+	"image/color"
 	"image/jpeg"
-	"io/ioutil"
+	"io"
 	"os"
 	"testing"
 )
@@ -50,7 +51,7 @@ func TestEncode(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if err = Encode(ioutil.Discard, img, options); err != nil {
+		if err = Encode(io.Discard, img, options); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -70,7 +71,7 @@ func TestEncode(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if err = Encode(ioutil.Discard, img, options); err != nil {
+		if err = Encode(io.Discard, img, options); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -84,7 +85,7 @@ func TestEncode(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if err = Encode(ioutil.Discard, img, options); err == nil {
+		if err = Encode(io.Discard, img, options); err == nil {
 			t.Fatal("an error was expected")
 		}
 	})
@@ -143,10 +144,28 @@ func TestDecode(t *testing.T) {
 			t.Fatal("an error was expected")
 		}
 	})
+	t.Run("decode lossy image via standard image.Decode", func(t *testing.T) {
+		r, err := os.Open("../test_data/images/webp-logo-lossy.webp")
+		require.NoError(t, err)
+		img, format, err := image.Decode(r)
+		require.NoError(t, err)
+
+		require.Equal(t, "webp", format)
+		require.Equal(t, color.NRGBAModel, img.ColorModel())
+	})
+	t.Run("decode lossless image via standard image.Decode", func(t *testing.T) {
+		r, err := os.Open("../test_data/images/webp-logo-lossless.webp")
+		require.NoError(t, err)
+		img, format, err := image.Decode(r)
+		require.NoError(t, err)
+
+		require.Equal(t, "webp", format)
+		require.Equal(t, color.NRGBAModel, img.ColorModel())
+	})
 }
 
 func BenchmarkDecodeLossy(b *testing.B) {
-	data, err := ioutil.ReadFile("../test_data/images/webp-logo-lossy.webp")
+	data, err := os.ReadFile("../test_data/images/webp-logo-lossy.webp")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -164,13 +183,13 @@ func BenchmarkDecodeLossy(b *testing.B) {
 }
 
 func BenchmarkDecodeXImageLossy(b *testing.B) {
-	data, err := ioutil.ReadFile("../test_data/images/webp-logo-lossy.webp")
+	data, err := os.ReadFile("../test_data/images/webp-logo-lossy.webp")
 	if err != nil {
 		b.Fatal(err)
 	}
 
 	for i := 0; i < b.N; i++ {
-		_, err = webp.Decode(bytes.NewBuffer(data))
+		_, err = Decode(bytes.NewBuffer(data), &decoder.Options{})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -178,7 +197,7 @@ func BenchmarkDecodeXImageLossy(b *testing.B) {
 }
 
 func BenchmarkDecodeLossless(b *testing.B) {
-	data, err := ioutil.ReadFile("../test_data/images/webp-logo-lossless.webp")
+	data, err := os.ReadFile("../test_data/images/webp-logo-lossless.webp")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -196,13 +215,13 @@ func BenchmarkDecodeLossless(b *testing.B) {
 }
 
 func BenchmarkDecodeXImageLossless(b *testing.B) {
-	data, err := ioutil.ReadFile("../test_data/images/webp-logo-lossless.webp")
+	data, err := os.ReadFile("../test_data/images/webp-logo-lossless.webp")
 	if err != nil {
 		b.Fatal(err)
 	}
 
 	for i := 0; i < b.N; i++ {
-		_, err = webp.Decode(bytes.NewBuffer(data))
+		_, err = Decode(bytes.NewBuffer(data), &decoder.Options{})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -226,7 +245,7 @@ func BenchmarkEncode(b *testing.B) {
 			b.Fatal(err)
 		}
 
-		if err = Encode(ioutil.Discard, img, options); err != nil {
+		if err = Encode(io.Discard, img, options); err != nil {
 			b.Fatal(err)
 		}
 	}
