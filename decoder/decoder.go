@@ -59,6 +59,9 @@ func NewDecoder(r io.Reader, options *Options) (d *Decoder, err error) {
 		return nil, errors.New("data is empty")
 	}
 
+	if options == nil {
+		options = &Options{}
+	}
 	d = &Decoder{data: data, options: options}
 
 	if d.config, err = d.options.GetConfig(); err != nil {
