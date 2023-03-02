@@ -75,6 +75,9 @@ type Encoder struct {
 func NewEncoder(src image.Image, options *Options) (e *Encoder, err error) {
 	var config *C.WebPConfig
 
+	if options == nil {
+		options, _ = NewLossyEncoderOptions(PresetDefault, 75)
+	}
 	if config, err = options.GetConfig(); err != nil {
 		return nil, err
 	}

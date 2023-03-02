@@ -23,6 +23,7 @@ package decoder
 
 import (
 	"github.com/kolesa-team/go-webp/utils"
+	"github.com/stretchr/testify/require"
 	"image"
 	"os"
 	"testing"
@@ -103,4 +104,12 @@ func TestDecoder_GetFeatures(t *testing.T) {
 	if features.HasAlpha {
 		t.Fatal("file has_animation is invalid")
 	}
+}
+
+func TestDecoder_NilOptions(t *testing.T) {
+	file, err := os.Open("../test_data/images/m4_q75.webp")
+	require.NoError(t, err)
+
+	_, err = NewDecoder(file, nil)
+	require.NoError(t, err)
 }
