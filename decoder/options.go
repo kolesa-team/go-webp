@@ -41,6 +41,10 @@ type Options struct {
 	Flip                   bool
 	DitheringStrength      int
 	AlphaDitheringStrength int
+
+	// These two are optimizations that require a little extra work on the caller side.
+	imageFactory ImageFactory // if nil, DefaultImageFactory will be used
+	buffer       []byte       // temp buffer to store data from reader.  If nil, default buffer will be used
 }
 
 // GetConfig build WebPDecoderConfig for libwebp
@@ -88,4 +92,14 @@ func (o *Options) GetConfig() (*C.WebPDecoderConfig, error) {
 	config.options.alpha_dithering_strength = C.int(o.AlphaDitheringStrength)
 
 	return &config, nil
+}
+
+type ImageFactory interface {
+	Get(width, height int) *image.NRGBA
+}
+
+type DefaultImageFactory struct{}
+
+func (d *DefaultImageFactory) Get(width, height int) *image.NRGBA {
+	return image.NewNRGBA(image.Rect(0, 0, width, height))
 }
