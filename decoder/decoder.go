@@ -63,6 +63,10 @@ func NewDecoder(r io.Reader, options *Options) (d *Decoder, err error) {
 		return nil, err
 	}
 
+	if len(buf.Bytes()) == 0 {
+		return nil, errors.New("data is empty")
+	}
+
 	d = &Decoder{data: buf.Bytes(), options: options}
 
 	if d.config, err = d.options.GetConfig(); err != nil {
