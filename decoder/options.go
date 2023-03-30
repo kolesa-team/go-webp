@@ -46,11 +46,11 @@ type Options struct {
 
 	// if nil, DefaultImageFactory will be used.  If non-nil, decode will return an image that must be put back into the pool
 	// when you're done with it
-	imageFactory ImageFactory
+	ImageFactory ImageFactory
 	// if nil, a default buffer will be used.  If non-nil, decode will use this buffer to store data from the reader.
 	// The idea is that this buffer be reused, so either pass this back in next time you call decode, or put it back into
 	// a pool when you're done with it.
-	buffer []byte
+	Buffer []byte
 }
 
 // GetConfig build WebPDecoderConfig for libwebp
