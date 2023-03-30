@@ -53,11 +53,11 @@ func NewDecoder(r io.Reader, options *Options) (d *Decoder, err error) {
 		options = &Options{}
 	}
 
-	if options.imageFactory == nil {
-		options.imageFactory = &DefaultImageFactory{}
+	if options.ImageFactory == nil {
+		options.ImageFactory = &DefaultImageFactory{}
 	}
 
-	buf := bytes.NewBuffer(options.buffer)
+	buf := bytes.NewBuffer(options.Buffer)
 
 	if _, err = io.Copy(buf, r); err != nil {
 		return nil, err
@@ -92,7 +92,7 @@ func (d *Decoder) Decode() (image.Image, error) {
 	d.config.output.colorspace = C.MODE_RGBA
 	d.config.output.is_external_memory = 1
 
-	img := d.options.imageFactory.Get(int(d.config.output.width), int(d.config.output.height))
+	img := d.options.ImageFactory.Get(int(d.config.output.width), int(d.config.output.height))
 
 	buff := (*C.WebPRGBABuffer)(unsafe.Pointer(&d.config.output.u[0]))
 	buff.stride = C.int(img.Stride)

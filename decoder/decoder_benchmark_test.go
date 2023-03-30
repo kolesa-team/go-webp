@@ -28,7 +28,7 @@ func BenchmarkDecodePooled(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			buf := bufferPool.Get()
-			decoder, err := NewDecoder(bytes.NewReader(data), &Options{imageFactory: imagePool, buffer: buf})
+			decoder, err := NewDecoder(bytes.NewReader(data), &Options{ImageFactory: imagePool, Buffer: buf})
 			img, err := decoder.Decode()
 			if err != nil {
 				b.Fatal(err)
