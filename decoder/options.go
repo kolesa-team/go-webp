@@ -43,8 +43,14 @@ type Options struct {
 	AlphaDitheringStrength int
 
 	// These two are optimizations that require a little extra work on the caller side.
-	imageFactory ImageFactory // if nil, DefaultImageFactory will be used
-	buffer       []byte       // temp buffer to store data from reader.  If nil, default buffer will be used
+
+	// if nil, DefaultImageFactory will be used.  If non-nil, decode will return an image that must be put back into the pool
+	// when you're done with it
+	imageFactory ImageFactory
+	// if nil, a default buffer will be used.  If non-nil, decode will use this buffer to store data from the reader.
+	// The idea is that this buffer be reused, so either pass this back in next time you call decode, or put it back into
+	// a pool when you're done with it.
+	buffer []byte
 }
 
 // GetConfig build WebPDecoderConfig for libwebp
