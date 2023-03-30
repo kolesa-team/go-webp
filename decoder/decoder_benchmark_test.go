@@ -5,8 +5,6 @@ import (
 	"image"
 	"os"
 	"testing"
-
-	"github.com/kolesa-team/go-webp/pool"
 )
 
 func loadImage(b *testing.B) []byte {
@@ -24,8 +22,8 @@ func BenchmarkDecodePooled(b *testing.B) {
 
 	data := loadImage(b)
 
-	imagePool := pool.NewSimplePool()
-	bufferPool := pool.NewBufferPool()
+	imagePool := NewImagePool()
+	bufferPool := NewBufferPool()
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
