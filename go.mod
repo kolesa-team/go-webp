@@ -1,8 +1,8 @@
-module github.com/kolesa-team/go-webp
+module github.com/SongStitch/go-webp
 
 go 1.10
 
 require (
+	github.com/SongStitch/go-webp v1.1.0
 	github.com/stretchr/testify v1.7.0
-	golang.org/x/image v0.0.0-20210628002857-a66eb6448b8d
 )
