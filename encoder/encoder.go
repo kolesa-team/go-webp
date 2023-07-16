@@ -59,7 +59,6 @@ import "C"
 import (
 	"errors"
 	"image"
-	"image/draw"
 	"io"
 	"unsafe"
 )
@@ -68,7 +67,7 @@ import (
 type Encoder struct {
 	options *Options
 	config  *C.WebPConfig
-	img     *image.NRGBA
+	img     *image.RGBA
 }
 
 // NewEncoder return new encoder instance
@@ -85,10 +84,10 @@ func NewEncoder(src image.Image, options *Options) (e *Encoder, err error) {
 	e = &Encoder{options: options, config: config}
 
 	switch v := src.(type) {
-	case *image.NRGBA:
+	case *image.RGBA:
 		e.img = v
 	default:
-		e.img = e.convertToNRGBA(src)
+		return nil, errors.New("unsupported image type")
 	}
 
 	return
@@ -115,13 +114,4 @@ func (e *Encoder) Encode(w io.Writer) error {
 	_, err := w.Write(((*[1 << 30]byte)(unsafe.Pointer(output)))[0:int(size):int(size)])
 
 	return err
-}
-
-// Convert picture from any image.Image type to *image.NRGBA
-// @todo optimization needed
-func (e *Encoder) convertToNRGBA(src image.Image) (dst *image.NRGBA) {
-	dst = image.NewNRGBA(src.Bounds())
-	draw.Draw(dst, dst.Bounds(), src, src.Bounds().Min, draw.Src)
-
-	return
 }
