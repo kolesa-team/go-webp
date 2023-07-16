@@ -23,8 +23,8 @@ package webp
 
 import (
 	"bytes"
-	"github.com/kolesa-team/go-webp/decoder"
-	"github.com/kolesa-team/go-webp/encoder"
+	"github.com/SongStitch/go-webp/decoder"
+	"github.com/SongStitch/go-webp/encoder"
 	"github.com/stretchr/testify/require"
 	"image"
 	"image/color"

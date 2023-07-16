@@ -22,7 +22,7 @@
 package decoder
 
 import (
-	"github.com/kolesa-team/go-webp/utils"
+	"github.com/SongStitch/go-webp/utils"
 	"github.com/stretchr/testify/require"
 	"image"
 	"os"

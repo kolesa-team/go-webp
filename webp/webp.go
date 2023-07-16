@@ -22,8 +22,8 @@
 package webp
 
 import (
-	"github.com/kolesa-team/go-webp/decoder"
-	"github.com/kolesa-team/go-webp/encoder"
+	"github.com/SongStitch/go-webp/decoder"
+	"github.com/SongStitch/go-webp/encoder"
 	"image"
 	"image/color"
 	"io"
