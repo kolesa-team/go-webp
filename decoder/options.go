@@ -22,10 +22,11 @@
 package decoder
 
 /*
-#cgo LDFLAGS: -lwebp
+#cgo LDFLAGS: -lwebp -lm -lpthread
 #include <webp/decode.h>
 */
 import "C"
+
 import (
 	"errors"
 	"image"
@@ -33,14 +34,14 @@ import (
 
 // Options specifies webp decoding parameters
 type Options struct {
-	BypassFiltering        bool
-	NoFancyUpsampling      bool
 	Crop                   image.Rectangle
 	Scale                  image.Rectangle
-	UseThreads             bool
-	Flip                   bool
 	DitheringStrength      int
 	AlphaDitheringStrength int
+	BypassFiltering        bool
+	NoFancyUpsampling      bool
+	UseThreads             bool
+	Flip                   bool
 }
 
 // GetConfig build WebPDecoderConfig for libwebp

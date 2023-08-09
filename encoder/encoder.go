@@ -23,7 +23,7 @@ package encoder
 
 /*
 
-#cgo linux LDFLAGS: -lwebp
+#cgo linux LDFLAGS: -lwebp -lm -lpthread
 #cgo darwin pkg-config: libwebp
 #include <stdlib.h>
 #include <webp/encode.h>
@@ -56,6 +56,7 @@ static uint8_t* encodeNRBBA(WebPConfig* config, const uint8_t* rgba, int width, 
 }
 */
 import "C"
+
 import (
 	"errors"
 	"image"

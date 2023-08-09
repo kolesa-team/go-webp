@@ -22,17 +22,18 @@
 package encoder
 
 /*
-#cgo LDFLAGS: -lwebp
+#cgo LDFLAGS: -lwebp -lm -lpthread
 #include <webp/encode.h>
 */
 import "C"
+
 import (
 	"errors"
 	"fmt"
 )
 
 // Default libwebp image hints
-//noinspection GoUnusedConst
+// noinspection GoUnusedConst
 const (
 	HintDefault ImageHint = iota
 	HintPicture
@@ -42,7 +43,7 @@ const (
 )
 
 // Default libwebp presets
-//noinspection GoUnusedConst
+// noinspection GoUnusedConst
 const (
 	PresetDefault EncodingPreset = iota
 	PresetPicture
@@ -59,38 +60,34 @@ type (
 	EncodingPreset int
 	// Options specifies webp encoding parameters
 	Options struct {
-		config *C.WebPConfig
-
-		Lossless         bool
-		Quality          float32
-		Method           int
+		config           *C.WebPConfig
+		AlphaFiltering   int
+		PartitionLimit   int
+		AlphaCompression int
 		ImageHint        ImageHint
 		TargetSize       int
-		TargetPsnr       float32
+		Exact            int
 		Segments         int
 		SnsStrength      int
 		FilterStrength   int
 		FilterSharpness  int
 		FilterType       int
-		Autofilter       bool
-		AlphaCompression int
-		AlphaFiltering   int
+		NearLossless     int
+		Method           int
 		alphaQuality     int
+		Partitions       int
 		Pass             int
-		// Disabled for compatibility with old version libwebp
-		// QMin             int
-		// QMax             int
-		ShowCompressed  bool
-		Preprocessing   int
-		Partitions      int
-		PartitionLimit  int
-		EmulateJpegSize bool
-		ThreadLevel     bool
-		LowMemory       bool
-		NearLossless    int
-		Exact           int
-		UseDeltaPalette bool
-		UseSharpYuv     bool
+		Preprocessing    int
+		Quality          float32
+		TargetPsnr       float32
+		ShowCompressed   bool
+		ThreadLevel      bool
+		EmulateJpegSize  bool
+		UseSharpYuv      bool
+		LowMemory        bool
+		Autofilter       bool
+		UseDeltaPalette  bool
+		Lossless         bool
 	}
 )
 

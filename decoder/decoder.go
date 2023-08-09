@@ -22,12 +22,13 @@
 package decoder
 
 /*
-#cgo linux LDFLAGS: -lwebp
+#cgo linux LDFLAGS: -lwebp -lm -lpthread
 #cgo darwin pkg-config: libwebp
 #include <stdlib.h>
 #include <webp/decode.h>
 */
 import "C"
+
 import (
 	"errors"
 	"fmt"
@@ -40,10 +41,10 @@ import (
 
 // Decoder stores information to decode picture
 type Decoder struct {
-	data    []byte
 	options *Options
 	config  *C.WebPDecoderConfig
 	dPtr    *C.uint8_t
+	data    []byte
 	sPtr    C.size_t
 }
 
@@ -73,7 +74,7 @@ func NewDecoder(r io.Reader, options *Options) (d *Decoder, err error) {
 
 	// получаем WebPBitstreamFeatures
 	if status := d.parseFeatures(d.dPtr, d.sPtr); status != utils.Vp8StatusOk {
-		return nil, errors.New(fmt.Sprintf("cannot fetch features: %s", status.String()))
+		return nil, fmt.Errorf("cannot fetch features: %s", status.String())
 	}
 
 	return
@@ -98,7 +99,7 @@ func (d *Decoder) Decode() (image.Image, error) {
 	buff.size = (C.size_t)(len(img.Pix))
 
 	if status := utils.VP8StatusCode(C.WebPDecode(d.dPtr, d.sPtr, d.config)); status != utils.Vp8StatusOk {
-		return nil, errors.New(fmt.Sprintf("cannot decode picture: %s", status.String()))
+		return nil, fmt.Errorf("cannot decode picture: %s", status.String())
 	}
 
 	return img, nil
