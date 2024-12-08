@@ -131,3 +131,4 @@ go run example/encode/main.go
 ## License
 MIT licensed. See the LICENSE file for details.
 
+This is a dummy change
