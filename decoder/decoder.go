@@ -29,6 +29,7 @@ package decoder
 */
 import "C"
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"image"
@@ -47,22 +48,26 @@ type Decoder struct {
 	sPtr    C.size_t
 }
 
-// NewDecoder return new decoder instance
 func NewDecoder(r io.Reader, options *Options) (d *Decoder, err error) {
-	var data []byte
-
-	if data, err = io.ReadAll(r); err != nil {
-		return nil, err
-	}
-
-	if len(data) == 0 {
-		return nil, errors.New("data is empty")
-	}
-
 	if options == nil {
 		options = &Options{}
 	}
-	d = &Decoder{data: data, options: options}
+
+	if options.ImageFactory == nil {
+		options.ImageFactory = &DefaultImageFactory{}
+	}
+
+	buf := bytes.NewBuffer(options.Buffer)
+
+	if _, err = io.Copy(buf, r); err != nil {
+		return nil, err
+	}
+
+	if len(buf.Bytes()) == 0 {
+		return nil, errors.New("data is empty")
+	}
+
+	d = &Decoder{data: buf.Bytes(), options: options}
 
 	if d.config, err = d.options.GetConfig(); err != nil {
 		return nil, err
@@ -87,10 +92,7 @@ func (d *Decoder) Decode() (image.Image, error) {
 	d.config.output.colorspace = C.MODE_RGBA
 	d.config.output.is_external_memory = 1
 
-	img := image.NewNRGBA(image.Rectangle{Max: image.Point{
-		X: int(d.config.output.width),
-		Y: int(d.config.output.height),
-	}})
+	img := d.options.ImageFactory.Get(int(d.config.output.width), int(d.config.output.height))
 
 	buff := (*C.WebPRGBABuffer)(unsafe.Pointer(&d.config.output.u[0]))
 	buff.stride = C.int(img.Stride)
