@@ -24,6 +24,7 @@ package decoder
 /*
 #cgo linux LDFLAGS: -lwebp
 #cgo darwin pkg-config: libwebp
+#cgo windows LDFLAGS: -lwebp
 #include <stdlib.h>
 #include <webp/decode.h>
 */

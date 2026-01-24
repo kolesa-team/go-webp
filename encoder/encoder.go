@@ -25,6 +25,7 @@ package encoder
 
 #cgo linux LDFLAGS: -lwebp
 #cgo darwin pkg-config: libwebp
+#cgo windows LDFLAGS: -lwebp
 #include <stdlib.h>
 #include <webp/encode.h>
 static uint8_t* encodeNRBBA(WebPConfig* config, const uint8_t* rgba, int width, int height, int stride, size_t* output_size) {
