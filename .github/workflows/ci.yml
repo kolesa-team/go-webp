@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        go: ["1.21", "stable"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - name: Check formatting
+        if: runner.os == 'Linux'
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:"; echo "$unformatted"; exit 1
+          fi
+      - name: Build without cgo
+        env:
+          CGO_ENABLED: "0"
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test ./...
+      - name: Test with the race detector
+        # The race detector needs cgo; it is enabled where a C toolchain is
+        # available by default.
+        if: runner.os != 'Windows'
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race -short -coverprofile=coverage.txt -covermode=atomic ./...
+      - name: Upload coverage
+        if: runner.os == 'Linux' && matrix.go == 'stable'
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.txt
+        continue-on-error: true
+
+  interop:
+    # Conformance against libwebp's cwebp/dwebp (test-only dependency).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      # Pin the reference to libwebp 1.6.0 (the version the codec is
+      # conformant with: older releases report different status codes for
+      # some truncated streams) using Google's prebuilt binaries.
+      - name: Install libwebp 1.6.0 tools
+        env:
+          LIBWEBP: libwebp-1.6.0-linux-x86-64
+          SHA256: 1c5ffab71efecefa0e3c23516c3a3a1dccb45cc310ae1095c6f14ae268e38067
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/libwebp.tar.gz" \
+            "https://storage.googleapis.com/downloads.webmproject.org/releases/webp/$LIBWEBP.tar.gz"
+          echo "$SHA256  $RUNNER_TEMP/libwebp.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/libwebp.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$LIBWEBP/bin" >> "$GITHUB_PATH"
+      - run: dwebp -version && cwebp -version
+      # Same scope as "make interop": the internal packages have interop
+      # tests too.
+      - run: go test -tags interop -run Interop ./...

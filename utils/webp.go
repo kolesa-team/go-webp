@@ -23,7 +23,7 @@ package utils
 
 type FormatType int
 
-//noinspection GoUnusedConst
+// noinspection GoUnusedConst
 const (
 	FormatUndefined FormatType = iota
 	FormatLossy

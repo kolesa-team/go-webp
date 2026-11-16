@@ -21,7 +21,7 @@
 
 package utils
 
-//noinspection GoUnusedConst
+// noinspection GoUnusedConst
 const (
 	Vp8StatusOk VP8StatusCode = iota
 	Vp8StatusOutOfMemory

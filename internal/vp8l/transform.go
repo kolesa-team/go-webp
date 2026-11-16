@@ -1,0 +1,336 @@
+package vp8l
+
+// Algorithm adapted from libwebp (BSD-3-Clause): inverse transforms
+// (src/dsp/lossless.c).
+
+const (
+	predictorTransform     = 0
+	crossColorTransform    = 1
+	subtractGreenTransform = 2
+	colorIndexingTransform = 3
+)
+
+// transform is one decoded image transform.
+type transform struct {
+	kind  int
+	bits  int
+	xsize int // width of the image the transform applies to
+	ysize int
+	data  []uint32 // sub-image (predictor, cross color) or palette
+}
+
+func subSampleSize(size, bits int) int {
+	return (size + 1<<bits - 1) >> bits
+}
+
+// addPixels adds two ARGB pixels per channel, modulo 256.
+func addPixels(a, b uint32) uint32 {
+	ag := (a & 0xff00ff00) + (b & 0xff00ff00)
+	rb := (a & 0x00ff00ff) + (b & 0x00ff00ff)
+	return ag&0xff00ff00 | rb&0x00ff00ff
+}
+
+func average2(a, b uint32) uint32 {
+	return ((a^b)&0xfefefefe)>>1 + a&b
+}
+
+// absDiff returns |a-b| for channel values a, b.
+func absDiff(a, b uint32) int32 {
+	d := int32(a) - int32(b)
+	m := d >> 31
+	return (d ^ m) - m
+}
+
+// clip255 clamps a to [0, 255].
+func clip255(a int32) uint32 {
+	if uint32(a) < 256 {
+		return uint32(a)
+	}
+	if a < 0 {
+		return 0
+	}
+	return 255
+}
+
+// clampAddSubFull implements predictor 12: per channel clip(a + b - c).
+func clampAddSubFull(a, b, c uint32) uint32 {
+	return clip255(int32(a>>24)+int32(b>>24)-int32(c>>24))<<24 |
+		clip255(int32(a>>16&0xff)+int32(b>>16&0xff)-int32(c>>16&0xff))<<16 |
+		clip255(int32(a>>8&0xff)+int32(b>>8&0xff)-int32(c>>8&0xff))<<8 |
+		clip255(int32(a&0xff)+int32(b&0xff)-int32(c&0xff))
+}
+
+func addSubHalf(a, b int32) uint32 {
+	return clip255(a + (a-b)/2)
+}
+
+// clampAddSubHalf implements predictor 13: per channel
+// clip(avg + (avg - tl) / 2) with avg = average2(l, t).
+func clampAddSubHalf(l, t, tl uint32) uint32 {
+	a := average2(l, t)
+	return addSubHalf(int32(a>>24), int32(tl>>24))<<24 |
+		addSubHalf(int32(a>>16&0xff), int32(tl>>16&0xff))<<16 |
+		addSubHalf(int32(a>>8&0xff), int32(tl>>8&0xff))<<8 |
+		addSubHalf(int32(a&0xff), int32(tl&0xff))
+}
+
+// predictRun adds predictor mode to the residuals in[x0:x1] and stores the
+// result in out. up is the previous output row, extended by one pixel (the
+// first pixel of out) so that the top-right of the last column is valid.
+// in may alias out.
+func predictRun(mode uint32, in, out, up []uint32, x0, x1 int) {
+	in = in[:x1]
+	out = out[:x1]
+	up = up[:x1+1]
+	switch mode {
+	case 1: // L
+		l := out[x0-1]
+		for x := x0; x < x1; x++ {
+			l = addPixels(in[x], l)
+			out[x] = l
+		}
+	case 2: // T
+		for x := x0; x < x1; x++ {
+			out[x] = addPixels(in[x], up[x])
+		}
+	case 3: // TR
+		for x := x0; x < x1; x++ {
+			out[x] = addPixels(in[x], up[x+1])
+		}
+	case 4: // TL
+		for x := x0; x < x1; x++ {
+			out[x] = addPixels(in[x], up[x-1])
+		}
+	case 5:
+		l := out[x0-1]
+		for x := x0; x < x1; x++ {
+			l = addPixels(in[x], average2(average2(l, up[x+1]), up[x]))
+			out[x] = l
+		}
+	case 6:
+		l := out[x0-1]
+		for x := x0; x < x1; x++ {
+			l = addPixels(in[x], average2(l, up[x-1]))
+			out[x] = l
+		}
+	case 7:
+		l := out[x0-1]
+		for x := x0; x < x1; x++ {
+			l = addPixels(in[x], average2(l, up[x]))
+			out[x] = l
+		}
+	case 8:
+		for x := x0; x < x1; x++ {
+			out[x] = addPixels(in[x], average2(up[x-1], up[x]))
+		}
+	case 9:
+		for x := x0; x < x1; x++ {
+			out[x] = addPixels(in[x], average2(up[x], up[x+1]))
+		}
+	case 10:
+		l := out[x0-1]
+		for x := x0; x < x1; x++ {
+			l = addPixels(in[x], average2(average2(l, up[x-1]), average2(up[x], up[x+1])))
+			out[x] = l
+		}
+	case 11:
+		l := out[x0-1]
+		for x := x0; x < x1; x++ {
+			t, tl := up[x], up[x-1]
+			// Sum over channels of |l-tl| - |t-tl| (libwebp Select).
+			s := absDiff(l>>24, tl>>24) - absDiff(t>>24, tl>>24) +
+				absDiff(l>>16&0xff, tl>>16&0xff) - absDiff(t>>16&0xff, tl>>16&0xff) +
+				absDiff(l>>8&0xff, tl>>8&0xff) - absDiff(t>>8&0xff, tl>>8&0xff) +
+				absDiff(l&0xff, tl&0xff) - absDiff(t&0xff, tl&0xff)
+			pred := l
+			if s <= 0 {
+				pred = t
+			}
+			l = addPixels(in[x], pred)
+			out[x] = l
+		}
+	case 12:
+		l := out[x0-1]
+		for x := x0; x < x1; x++ {
+			l = addPixels(in[x], clampAddSubFull(l, up[x], up[x-1]))
+			out[x] = l
+		}
+	case 13:
+		l := out[x0-1]
+		for x := x0; x < x1; x++ {
+			l = addPixels(in[x], clampAddSubHalf(l, up[x], up[x-1]))
+			out[x] = l
+		}
+	default: // 0, and 14/15 which libwebp treats as black too
+		for x := x0; x < x1; x++ {
+			out[x] = addPixels(in[x], 0xff000000)
+		}
+	}
+}
+
+// inversePredictor undoes the predictor transform for rows [y0, y1). in
+// holds the residual rows; the output rows start at c[o], and c[o-width:o]
+// must hold the previous output row (when y0 > 0).
+func inversePredictor(t *transform, y0, y1 int, in, c []uint32, o int) {
+	width := t.xsize
+	i := 0
+	if y0 == 0 {
+		out := c[o : o+width]
+		inr := in[:width]
+		out[0] = addPixels(inr[0], 0xff000000)
+		l := out[0]
+		for x := 1; x < width; x++ {
+			l = addPixels(inr[x], l)
+			out[x] = l
+		}
+		o += width
+		i += width
+		y0++
+	}
+	bits := t.bits
+	tileW := 1 << bits
+	tilesPerRow := subSampleSize(width, bits)
+	for y := y0; y < y1; y++ {
+		modes := t.data[(y>>bits)*tilesPerRow : (y>>bits+1)*tilesPerRow]
+		out := c[o : o+width]
+		up := c[o-width : o+1]
+		inr := in[i : i+width]
+		out[0] = addPixels(inr[0], up[0])
+		x := 1
+		for tx := 0; x < width; tx++ {
+			xEnd := min(x&^(tileW-1)+tileW, width)
+			predictRun(modes[tx]>>8&0xf, inr, out, up, x, xEnd)
+			x = xEnd
+		}
+		o += width
+		i += width
+	}
+}
+
+func colorTransformDelta(pred, color int8) int32 {
+	return (int32(pred) * int32(color)) >> 5
+}
+
+// inverseCrossColor undoes the cross-color transform for rows [y0, y1).
+// in may alias out.
+func inverseCrossColor(t *transform, y0, y1 int, in, out []uint32) {
+	width := t.xsize
+	bits := t.bits
+	tileW := 1 << bits
+	tilesPerRow := subSampleSize(width, bits)
+	i := 0
+	for y := y0; y < y1; y++ {
+		mults := t.data[(y>>bits)*tilesPerRow : (y>>bits+1)*tilesPerRow]
+		src := in[i : i+width]
+		dst := out[i : i+width]
+		for tx, m := range mults {
+			g2r := int8(m)
+			g2b := int8(m >> 8)
+			r2b := int8(m >> 16)
+			x0 := tx << bits
+			x1 := min(x0+tileW, width)
+			s := src[x0:x1]
+			d := dst[x0:x1]
+			d = d[:len(s)]
+			for k, argb := range s {
+				green := int8(argb >> 8)
+				r := int32(argb>>16) + colorTransformDelta(g2r, green)
+				r &= 0xff
+				b := int32(argb) + colorTransformDelta(g2b, green) + colorTransformDelta(r2b, int8(r))
+				b &= 0xff
+				d[k] = argb&0xff00ff00 | uint32(r)<<16 | uint32(b)
+			}
+		}
+		i += width
+	}
+}
+
+// addGreen undoes the subtract-green transform. in may alias out.
+func addGreen(in, out []uint32) {
+	out = out[:len(in)]
+	for i, argb := range in {
+		g := argb >> 8 & 0xff
+		rb := (argb&0x00ff00ff + (g<<16 | g)) & 0x00ff00ff
+		out[i] = argb&0xff00ff00 | rb
+	}
+}
+
+// inverseColorIndex maps palette indices (possibly bundled) of rows
+// [y0, y1) to colors. in must not overlap the part of out written before it
+// is read (see processRows).
+func inverseColorIndex(t *transform, y0, y1 int, in, out []uint32) {
+	width := t.xsize
+	pal := t.data
+	if t.bits == 0 {
+		n := (y1 - y0) * width
+		in = in[:n]
+		out = out[:n]
+		pal = pal[:256]
+		for i, p := range in {
+			out[i] = pal[p>>8&0xff]
+		}
+		return
+	}
+	bpp := uint(8 >> t.bits)
+	ppb := 1 << t.bits
+	mask := uint32(1)<<bpp - 1
+	pal = pal[:mask+1]
+	pw := subSampleSize(width, t.bits)
+	i, o := 0, 0
+	for y := y0; y < y1; y++ {
+		src := in[i : i+pw]
+		dst := out[o : o+width]
+		x := 0
+		for _, p := range src {
+			packed := p >> 8 & 0xff
+			n := min(ppb, width-x)
+			for k := 0; k < n; k++ {
+				dst[x] = pal[packed&mask]
+				packed >>= bpp
+				x++
+			}
+		}
+		i += pw
+		o += width
+	}
+}
+
+// inverseColorIndexAlpha is the 8-bit variant of inverseColorIndex used for
+// alpha planes: in holds the green (index) bytes, out receives the green
+// channel of the palette color. out may start at the same position as in, or
+// before it as arranged by decodeAlpha8.
+func inverseColorIndexAlpha(t *transform, height int, in, out []byte) {
+	width := t.xsize
+	var pal8 [256]byte
+	for i, c := range t.data {
+		pal8[i] = byte(c >> 8)
+	}
+	if t.bits == 0 {
+		n := width * height
+		in = in[:n]
+		out = out[:n]
+		for i, p := range in {
+			out[i] = pal8[p]
+		}
+		return
+	}
+	bpp := uint(8 >> t.bits)
+	ppb := 1 << t.bits
+	mask := byte(1)<<bpp - 1
+	pw := subSampleSize(width, t.bits)
+	i, o := 0, 0
+	for y := 0; y < height; y++ {
+		x := 0
+		for k := 0; k < pw; k++ {
+			packed := in[i+k]
+			n := min(ppb, width-x)
+			for j := 0; j < n; j++ {
+				out[o+x] = pal8[packed&mask]
+				packed >>= bpp
+				x++
+			}
+		}
+		i += pw
+		o += width
+	}
+}
