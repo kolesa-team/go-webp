@@ -21,17 +21,20 @@
 
 package decoder
 
-/*
-#cgo LDFLAGS: -lwebp
-#include <webp/decode.h>
-*/
-import "C"
 import (
-	"errors"
 	"image"
 )
 
-// Options specifies webp decoding parameters
+// Options specifies webp decoding parameters.
+//
+// Crop uses libwebp's convention: Crop.Min is the top-left corner
+// (crop_left, crop_top) and Crop.Max holds the crop WIDTH and HEIGHT
+// (crop_width, crop_height), not the bottom-right corner. Cropping is enabled
+// when both Crop.Max.X and Crop.Max.Y are positive. For lossy images the
+// corner is rounded down to even coordinates, as libwebp does.
+//
+// Scale.Max holds the output width and height; scaling is enabled when both
+// are positive. Scaling is applied after cropping.
 type Options struct {
 	BypassFiltering        bool
 	NoFancyUpsampling      bool
@@ -43,49 +46,69 @@ type Options struct {
 	AlphaDitheringStrength int
 }
 
-// GetConfig build WebPDecoderConfig for libwebp
-func (o *Options) GetConfig() (*C.WebPDecoderConfig, error) {
-	config := C.WebPDecoderConfig{}
+// Config is the decoding configuration built by Options.GetConfig. It mirrors
+// libwebp's WebPDecoderOptions field for field (C int flags are bools). In v1
+// GetConfig returned the cgo type *C.WebPDecoderConfig; v2 returns this pure
+// Go equivalent.
+type Config struct {
+	// BypassFiltering skips the in-loop deblocking filter (lossy).
+	BypassFiltering bool
+	// NoFancyUpsampling uses point-sampled chroma upsampling (lossy).
+	NoFancyUpsampling bool
+	// UseCropping enables cropping to the CropWidth x CropHeight rectangle
+	// whose top-left corner is (CropLeft, CropTop).
+	UseCropping bool
+	CropLeft    int
+	CropTop     int
+	CropWidth   int
+	CropHeight  int
+	// UseScaling enables rescaling of the (cropped) picture to
+	// ScaledWidth x ScaledHeight.
+	UseScaling   bool
+	ScaledWidth  int
+	ScaledHeight int
+	// UseThreads decodes lossy pictures with two goroutines.
+	UseThreads bool
+	// DitheringStrength in [0, 100] dithers the chroma of lossy pictures.
+	DitheringStrength int
+	// Flip mirrors the output vertically.
+	Flip bool
+	// AlphaDitheringStrength in [0, 100] smooths quantized alpha planes.
+	AlphaDitheringStrength int
+}
 
-	if C.WebPInitDecoderConfig(&config) == 0 {
-		return nil, errors.New("cannot init decoder config")
+// GetConfig builds the decoder configuration (the equivalent of libwebp's
+// WebPDecoderConfig options). A nil *Options yields the default
+// configuration.
+func (o *Options) GetConfig() (*Config, error) {
+	config := &Config{}
+	if o == nil {
+		return config, nil
 	}
 
-	if o.BypassFiltering {
-		config.options.bypass_filtering = 1
-	}
-
-	if o.NoFancyUpsampling {
-		config.options.no_fancy_upsampling = 1
-	}
+	config.BypassFiltering = o.BypassFiltering
+	config.NoFancyUpsampling = o.NoFancyUpsampling
 
 	// проверяем надо ли кропнуть
 	if o.Crop.Max.X > 0 && o.Crop.Max.Y > 0 {
-		config.options.use_cropping = 1
-		config.options.crop_left = C.int(o.Crop.Min.X)
-		config.options.crop_top = C.int(o.Crop.Min.Y)
-		config.options.crop_width = C.int(o.Crop.Max.X)
-		config.options.crop_height = C.int(o.Crop.Max.Y)
+		config.UseCropping = true
+		config.CropLeft = o.Crop.Min.X
+		config.CropTop = o.Crop.Min.Y
+		config.CropWidth = o.Crop.Max.X
+		config.CropHeight = o.Crop.Max.Y
 	}
 
 	// проверяем надо ли заскейлить
 	if o.Scale.Max.X > 0 && o.Scale.Max.Y > 0 {
-		config.options.use_scaling = 1
-		config.options.scaled_width = C.int(o.Scale.Max.X)
-		config.options.scaled_height = C.int(o.Scale.Max.Y)
+		config.UseScaling = true
+		config.ScaledWidth = o.Scale.Max.X
+		config.ScaledHeight = o.Scale.Max.Y
 	}
 
-	if o.UseThreads {
-		config.options.use_threads = 1
-	}
+	config.UseThreads = o.UseThreads
+	config.DitheringStrength = o.DitheringStrength
+	config.Flip = o.Flip
+	config.AlphaDitheringStrength = o.AlphaDitheringStrength
 
-	config.options.dithering_strength = C.int(o.DitheringStrength)
-
-	if o.Flip {
-		config.options.flip = 1
-	}
-
-	config.options.alpha_dithering_strength = C.int(o.AlphaDitheringStrength)
-
-	return &config, nil
+	return config, nil
 }
