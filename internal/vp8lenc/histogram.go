@@ -352,6 +352,9 @@ type clusterer struct {
 	// interrupt is Config.Interrupt during buildHistoImage: when it fires,
 	// the clustering loops stop early (the clustering stays valid).
 	interrupt func() bool
+	// crew runs the parallel remap (the crew of the scratch, set during
+	// buildHistoImage).
+	crew *crew
 }
 
 // newHisto returns an unused working histogram (contents unspecified).
@@ -726,7 +729,7 @@ func (c *clusterer) remap(out *histoSet, helpers int) {
 		// cluster 0 (a valid, if useless, clustering).
 		chunks := (len(orig) + remapChunk - 1) / remapChunk
 		if helpers > 0 && chunks > 1 && len(orig)*len(set) >= minParallelRemap {
-			parallel(chunks, helpers, func(_ int, claim func() (int, bool)) {
+			c.crew.run(chunks, helpers, func(_ int, claim func() (int, bool)) {
 				for {
 					k, ok := claim()
 					if !ok || c.interrupted() {

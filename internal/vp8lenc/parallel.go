@@ -14,9 +14,12 @@ import (
 // goroutines started through the process-wide budget of internal/workers:
 // when no slot is free, the caller does all the work itself. Items are
 // claimed through an atomic counter (no channel operation per item) and
-// are coarse (at least about half a millisecond of work each). Every
-// result is independent of the number of goroutines, so the output is
-// byte-identical to the sequential encode.
+// are coarse (at least about half a millisecond of work each). The
+// candidate configurations are spread by parallel; the stages within an
+// encoding run on the crew of its scratch, whose helpers are started once
+// per encode and serve all its stages. Every result is independent of the
+// number of goroutines, so the output is byte-identical to the sequential
+// encode.
 
 // parallel runs body on the calling goroutine (worker 0) and on up to
 // helpers helper goroutines (workers 1..helpers, never more than items-1),
@@ -68,6 +71,146 @@ func parallel(items, helpers int, body func(worker int, claim func() (int, bool)
 	}
 	body(0, claim)
 	finished = true
+}
+
+// crew is the set of helper goroutines of the parallel stages of one
+// encoding goroutine (hash chain stripes, predictor batches, histogram
+// remap): instead of starting helpers for every stage (the predictor runs
+// one stage per batch of tiles, dozens per image), the first stage starts
+// them through the process-wide budget and the following ones reuse them,
+// woken by a channel send each and joined through one channel; between
+// stages they wait, blocked, on their channel. stop ends them: the encode
+// that started them calls it before returning (the crew of a scratch is
+// stopped before the scratch goes back to its pool), so that no helper
+// outlives it.
+//
+// The zero value is ready to use. A crew is used by one goroutine at a
+// time (the one owning its scratch); run must not be called from a body.
+type crew struct {
+	tasks  []*workers.Task
+	start  []chan bool   // per helper: true runs body, false stops it
+	done   chan struct{} // one value per helper and job
+	failed []bool        // per helper: its body panicked (or exited)
+
+	// The current job, set before the helpers are woken.
+	body    func(worker int, claim func() (int, bool))
+	next    atomic.Int64
+	items   int64
+	claimFn func() (int, bool) // c.claim, bound once
+}
+
+func (c *crew) claim() (int, bool) {
+	i := c.next.Add(1) - 1
+	return int(i), i < c.items
+}
+
+// run is parallel on the crew: body runs on the calling goroutine (worker
+// 0) and on up to helpers helpers of the crew (workers 1..helpers, never
+// more than items-1), started if needed (and while the budget allows). It
+// returns when every body has returned. A panic in a helper is re-raised on
+// the caller (by its Task.Wait) once all bodies are done; when the caller's
+// body panics, the helpers stop claiming items and are waited for before
+// the panic unwinds further. The same rules as for parallel apply to body.
+func (c *crew) run(items, helpers int, body func(worker int, claim func() (int, bool))) {
+	if c.claimFn == nil {
+		c.claimFn = c.claim
+	}
+	c.items = int64(items)
+	c.next.Store(0)
+	n := min(helpers, items-1)
+	if n <= 0 {
+		body(0, c.claimFn)
+		return
+	}
+	c.grow(n)
+	n = min(n, len(c.tasks))
+	c.body = body
+	sent := 0
+	for k := 0; k < n; k++ {
+		select {
+		case c.start[k] <- true:
+			sent++
+		case <-c.tasks[k].Done(): // (cannot happen: run re-raises panics)
+		}
+	}
+	finished := false
+	defer func() {
+		const stopped = 1 << 62
+		if !finished {
+			c.next.Store(stopped) // the caller panicked: stop the helpers early
+		}
+		for ; sent > 0; sent-- {
+			<-c.done
+		}
+		c.body = nil
+		if finished {
+			for k, f := range c.failed {
+				if f {
+					c.tasks[k].Wait() // re-raises the helper's panic
+				}
+			}
+		}
+	}()
+	body(0, c.claimFn)
+	finished = true
+}
+
+// grow starts helpers until the crew has n, while the budget allows.
+func (c *crew) grow(n int) {
+	if c.done == nil {
+		c.done = make(chan struct{}, intraHelpers)
+	}
+	for k := len(c.tasks); k < n; k++ {
+		if k == len(c.start) {
+			c.start = append(c.start, make(chan bool, 1))
+			c.failed = append(c.failed, false)
+		}
+		start := c.start[k]
+		t := workers.Spawn(func() error {
+			for <-start {
+				c.work(k + 1)
+			}
+			return nil
+		})
+		if t == nil {
+			return
+		}
+		c.tasks = append(c.tasks, t)
+	}
+}
+
+// work runs the current job as worker w and reports it done, also when
+// the body panics (the panic then ends the helper; run re-raises it).
+func (c *crew) work(w int) {
+	ok := false
+	defer func() {
+		if !ok {
+			c.failed[w-1] = true
+		}
+		c.done <- struct{}{}
+	}()
+	c.body(w, c.claimFn)
+	ok = true
+}
+
+// stop ends the helpers of the crew and waits for them.
+func (c *crew) stop() {
+	for k, t := range c.tasks {
+		select {
+		case c.start[k] <- false:
+		case <-t.Done():
+		}
+	}
+	for k, t := range c.tasks {
+		t.Panicked() // waits for t (a panic was re-raised by run, or another one is unwinding)
+		select {
+		case <-c.start[k]: // the stop value of a helper that had panicked
+		default:
+		}
+		c.tasks[k] = nil
+		c.failed[k] = false
+	}
+	c.tasks = c.tasks[:0]
 }
 
 // intraHelpers is the largest number of helper goroutines one parallel stage
@@ -167,6 +310,7 @@ func encodeConfigs(argb []uint32, w, h int, p *params, configs []crunchConfig, p
 		if worker > 0 {
 			s, buf = getScratch(w*h), nil
 			defer putScratch(s)
+			defer s.crew.stop()
 		}
 		r := &res[worker]
 		r.idx = -1

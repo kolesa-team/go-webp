@@ -92,7 +92,9 @@ func TestCleanFastPath(t *testing.T) {
 					cleanFastPath = fast
 					argb := slices.Clone(src)
 					modes := make([]uint32, subSampleSize(c.w, bits)*subSampleSize(c.h, bits))
-					b := predictorImage(c.w, c.h, bits, maxBits, false, 1, true, true, false, argb, modes, new(scratch), helpers)
+					sc := new(scratch)
+					b := predictorImage(c.w, c.h, bits, maxBits, false, 1, true, true, false, argb, modes, sc, helpers)
+					sc.crew.stop()
 					return argb, modes, b
 				}
 				wantArgb, wantModes, wantBits := run(false, 0)
@@ -148,7 +150,9 @@ func TestPredictorParallel(t *testing.T) {
 						run := func(helpers int) ([]uint32, []uint32, int) {
 							argb := slices.Clone(in.argb)
 							modes := make([]uint32, subSampleSize(in.w, bits)*subSampleSize(in.h, bits))
-							b := predictorImage(in.w, in.h, bits, bits, false, maxQuant, subGreen, clean, false, argb, modes, new(scratch), helpers)
+							sc := new(scratch)
+							b := predictorImage(in.w, in.h, bits, bits, false, maxQuant, subGreen, clean, false, argb, modes, sc, helpers)
+							sc.crew.stop()
 							return argb, modes, b
 						}
 						wantArgb, wantModes, wantBits := run(0)
@@ -221,7 +225,9 @@ func TestPredictorOpaque(t *testing.T) {
 						run := func(opaque bool, helpers int) ([]uint32, []uint32, int) {
 							argb := slices.Clone(in.argb)
 							modes := make([]uint32, subSampleSize(in.w, bits)*subSampleSize(in.h, bits))
-							b := predictorImage(in.w, in.h, bits, maxBits, false, maxQuant, subGreen, false, opaque, argb, modes, new(scratch), helpers)
+							sc := new(scratch)
+							b := predictorImage(in.w, in.h, bits, maxBits, false, maxQuant, subGreen, false, opaque, argb, modes, sc, helpers)
+							sc.crew.stop()
 							return argb, modes, b
 						}
 						wantArgb, wantModes, wantBits := run(false, 0)

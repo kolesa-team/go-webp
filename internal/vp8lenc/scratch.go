@@ -37,6 +37,7 @@ type scratch struct {
 	bwTmp [2]bitWriter
 
 	// ThreadLevel only.
+	crew      crew         // helpers of the parallel stages (stopped by the encode)
 	predBatch []histo4     // per tile and mode histograms (predSearch.runPar)
 	predWork  []predWorker // per goroutine buffers (predSearch.runPar)
 	hcChain   []uint32     // hash chain kept apart from the results (fillStripes)
