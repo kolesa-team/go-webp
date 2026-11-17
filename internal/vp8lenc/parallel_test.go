@@ -307,3 +307,20 @@ func TestThreadLevelConcurrent(t *testing.T) {
 		}
 	}
 }
+
+// TestConfigHelpersBySize checks that only images up to
+// maxConfigPairPixels encode two configurations at a time, and only with
+// ThreadLevel.
+func TestConfigHelpersBySize(t *testing.T) {
+	p := params{parallel: true}
+	if got := p.configHelpersFor(maxConfigPairPixels); got != configHelpers {
+		t.Errorf("at the limit: %d helpers, want %d", got, configHelpers)
+	}
+	if got := p.configHelpersFor(maxConfigPairPixels + 1); got != 0 {
+		t.Errorf("above the limit: %d helpers, want 0", got)
+	}
+	p.parallel = false
+	if got := p.configHelpersFor(16); got != 0 {
+		t.Errorf("without ThreadLevel: %d helpers, want 0", got)
+	}
+}
