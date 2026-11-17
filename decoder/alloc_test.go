@@ -135,6 +135,10 @@ func TestAlphaDecodedWithVP8Rows(t *testing.T) {
 			if code := status.CodeOf(err); code != utils.Vp8StatusNotEnoughData {
 				t.Errorf("%s threads=%v: got %v, want VP8_STATUS_NOT_ENOUGH_DATA", name, threads, code)
 			}
+			// Reclaim the 1 GB frame now: on 32-bit targets the next GC
+			// goal (twice the live heap seen while it was being filled)
+			// would otherwise exceed the address space.
+			runtime.GC()
 		}
 	}
 }

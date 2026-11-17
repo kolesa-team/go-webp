@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"bytes"
 	"image"
 	"math/rand"
 	"runtime"
@@ -393,15 +394,27 @@ func FuzzSink(f *testing.F) {
 		W, H := int(w%64)+1, int(h%64)+1
 		p := Params{SrcW: W, SrcH: H, Crop: image.Rect(int(x0), int(y0), int(x1), int(y1)),
 			ScaleW: int(sw % 80), ScaleH: int(sh % 80), Flip: flip, Premultiply: premult}
-		s, img, err := NewSink(p)
-		if err != nil {
+		run := func(p Params) (*image.NRGBA, bool) {
+			s, img, err := NewSink(p)
+			if err != nil {
+				return nil, false
+			}
+			r := rand.New(rand.NewSource(seed))
+			feed(t, s, randomImage(r, W, H), 0, r, r.Intn(2) == 0)
+			return img(), true
+		}
+		out, ok := run(p)
+		if !ok {
 			return
 		}
-		r := rand.New(rand.NewSource(seed))
-		feed(t, s, randomImage(r, W, H), 0, r, r.Intn(2) == 0)
-		out := img()
 		if out == nil || out.Rect.Dx() <= 0 || out.Rect.Dy() <= 0 {
 			t.Fatal("bad output image")
+		}
+		// A reused dirty buffer that is just large enough gives the same
+		// image: every output byte is written.
+		p.Dst = dirtyImage(0, len(out.Pix))
+		if got, _ := run(p); got == nil || !bytes.Equal(out.Pix, got.Pix) || &got.Pix[0] != &p.Dst.Pix[:1][0] {
+			t.Fatal("output into a reused buffer differs")
 		}
 	})
 }

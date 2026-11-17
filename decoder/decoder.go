@@ -24,6 +24,7 @@
 package decoder
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"image"
@@ -57,7 +58,14 @@ type statusError struct {
 	err    error
 }
 
-func (e *statusError) Error() string { return e.prefix + ": " + status.CodeOf(e.err).String() }
+func (e *statusError) Error() string {
+	code := status.CodeOf(e.err)
+	if code == utils.Vp8StatusUserAbort {
+		// Cancelled through a context: say why.
+		return e.prefix + ": " + code.String() + ": " + e.err.Error()
+	}
+	return e.prefix + ": " + code.String()
+}
 
 func (e *statusError) Unwrap() error { return e.err }
 
@@ -165,14 +173,27 @@ func readFull(r io.Reader, b []byte, hint int) ([]byte, error) {
 
 // Decode picture from reader
 func (d *Decoder) Decode() (image.Image, error) {
-	img, err := d.decode()
+	img, err := d.decode(call{})
 	if err != nil {
 		return nil, &statusError{prefix: "cannot decode picture", err: err}
 	}
 	return img, nil
 }
 
-func (d *Decoder) decode() (*image.NRGBA, error) {
+// call holds the per-call arguments of the Decode variants.
+type call struct {
+	// dst lends its pixel memory to the output image (DecodeInto); nil
+	// allocates a new image.
+	dst *image.NRGBA
+	// ctx cancels the decode (DecodeContext); nil if it cannot be
+	// cancelled.
+	ctx context.Context
+}
+
+func (d *Decoder) decode(c call) (*image.NRGBA, error) {
+	if err := canceled(c.ctx); err != nil {
+		return nil, err
+	}
 	parsed, err := container.Parse(d.data)
 	if err != nil {
 		return nil, err
@@ -181,9 +202,9 @@ func (d *Decoder) decode() (*image.NRGBA, error) {
 		return nil, status.Unsupported("animated WebP is not supported")
 	}
 	if parsed.VP8L != nil {
-		return d.decodeLossless(parsed)
+		return d.decodeLossless(parsed, c)
 	}
-	return d.decodeLossy(parsed)
+	return d.decodeLossy(parsed, c)
 }
 
 // GetFeatures return information about picture: width, height ...
@@ -197,13 +218,14 @@ func (d *Decoder) GetFeatures() utils.BitstreamFeatures {
 	}
 }
 
-func (d *Decoder) decodeLossless(parsed *container.Image) (*image.NRGBA, error) {
+func (d *Decoder) decodeLossless(parsed *container.Image, cl call) (*image.NRGBA, error) {
 	c := d.config
 	p := pipeline.Params{
 		SrcW:        parsed.Width,
 		SrcH:        parsed.Height,
 		Flip:        c.Flip,
 		Premultiply: true,
+		Dst:         cl.dst,
 	}
 	if c.UseCropping {
 		p.Crop = image.Rect(c.CropLeft, c.CropTop, c.CropLeft+c.CropWidth, c.CropTop+c.CropHeight)
@@ -215,13 +237,13 @@ func (d *Decoder) decodeLossless(parsed *container.Image) (*image.NRGBA, error) 
 	if err != nil {
 		return nil, err
 	}
-	if err := vp8l.DecodeWithOptions(parsed.VP8L, sink, &vp8l.Options{UseThreads: c.UseThreads}); err != nil {
+	if err := vp8l.DecodeWithOptions(parsed.VP8L, cl.wrap(sink), &vp8l.Options{UseThreads: c.UseThreads}); err != nil {
 		return nil, err
 	}
 	return result(), nil
 }
 
-func (d *Decoder) decodeLossy(parsed *container.Image) (*image.NRGBA, error) {
+func (d *Decoder) decodeLossy(parsed *container.Image, cl call) (*image.NRGBA, error) {
 	c := d.config
 	w, h := parsed.Width, parsed.Height
 
@@ -258,7 +280,7 @@ func (d *Decoder) decodeLossy(parsed *container.Image) (*image.NRGBA, error) {
 			opts.BypassFiltering = true
 		}
 	}
-	if sink, result, err = pipeline.NewSink(pipeline.Params{SrcW: cw, SrcH: ch, ScaleW: sw, ScaleH: sh, Flip: c.Flip}); err != nil {
+	if sink, result, err = pipeline.NewSink(pipeline.Params{SrcW: cw, SrcH: ch, ScaleW: sw, ScaleH: sh, Flip: c.Flip, Dst: cl.dst}); err != nil {
 		return nil, err
 	}
 
@@ -267,13 +289,7 @@ func (d *Decoder) decodeLossy(parsed *container.Image) (*image.NRGBA, error) {
 	// broken VP8 stream never pays for a full-frame alpha decode.
 	var la *lazyAlpha
 	if parsed.ALPH != nil {
-		la = &lazyAlpha{alph: parsed.ALPH, w: w, h: h, crop: crop, dithering: c.AlphaDitheringStrength}
-		// With UseThreads the plane is first needed on the worker
-		// goroutine, while release runs on this one: a sync.Pool Get on
-		// another P misses the plane put back by the previous decode. Take
-		// a pooled plane here (without allocating one: the allocation stays
-		// lazy, see grow).
-		la.prefetch()
+		la = newLazyAlpha(parsed.ALPH, w, h, crop, c)
 		defer la.release()
 		opts.Alpha = la.get
 	}
@@ -284,13 +300,13 @@ func (d *Decoder) decodeLossy(parsed *container.Image) (*image.NRGBA, error) {
 		if !ok {
 			return nil, status.InvalidParam("scaling sink does not accept YUV")
 		}
-		ad := &yuvAdapter{sink: ys, alpha: la, top: crop.Min.Y, left: crop.Min.X, alphaStride: w}
+		ad := &yuvAdapter{sink: ys, alpha: la, top: crop.Min.Y, left: crop.Min.X, alphaStride: w, ctx: cl.ctx}
 		opts.Alpha = nil
 		err = vp8.DecodeYUV(parsed.VP8, &opts, &crop, ad)
 	case cw == w && ch == h:
-		err = vp8.Decode(parsed.VP8, nil, &opts, sink)
+		err = vp8.Decode(parsed.VP8, nil, &opts, cl.wrap(sink))
 	default:
-		err = vp8.DecodeRegion(parsed.VP8, nil, &opts, crop, sink)
+		err = vp8.DecodeRegion(parsed.VP8, nil, &opts, crop, cl.wrap(sink))
 	}
 	if err != nil {
 		return nil, err
@@ -318,6 +334,35 @@ type lazyAlpha struct {
 	plane   []byte             // rows [0, rows) are final
 	rows    int
 	err     error
+
+	// helperOK lets the first get start a helper goroutine (UseThreads);
+	// while async is set the helper owns dec, pp, spare, plane and rows,
+	// and get reads the published rows from hp.
+	helperOK bool
+	async    bool
+	hp       *alphaHelper
+}
+
+// newLazyAlpha returns the alpha decoder of a w x h frame whose output
+// region is crop. It must be released (on the calling goroutine).
+func newLazyAlpha(alph []byte, w, h int, crop image.Rectangle, c *Config) *lazyAlpha {
+	a := &lazyAlpha{alph: alph, w: w, h: h, crop: crop, dithering: c.AlphaDitheringStrength}
+	// With UseThreads the plane is first needed on the worker goroutine,
+	// while release runs on this one: a sync.Pool Get on another P misses
+	// the plane put back by the previous decode. Take a pooled plane here
+	// (without allocating one: the allocation stays lazy, see grow).
+	a.prefetch()
+	if c.UseThreads {
+		// Likewise the lossless alpha decoder (vp8l pools its state): set
+		// it up here, so that it comes from and returns to this goroutine's
+		// pool. An error is kept for the first get, which keeps the VP8
+		// errors that come before the first emitted row first.
+		a.start()
+		// The first get may hand the plane to a helper goroutine
+		// (alpha_helper.go).
+		a.helperOK = true
+	}
+	return a
 }
 
 // get returns the alpha plane with at least its first rowEnd rows decoded
@@ -327,14 +372,22 @@ func (a *lazyAlpha) get(rowEnd int) ([]byte, error) {
 		return nil, a.err
 	}
 	if !a.started {
-		a.started = true
-		if a.err = a.init(); a.err != nil {
+		if a.start(); a.err != nil {
 			return nil, a.err
 		}
 	}
 	rowEnd = min(rowEnd, a.h)
+	if a.async {
+		return a.getAsync(rowEnd)
+	}
 	if rowEnd <= a.rows {
 		return a.plane, nil
+	}
+	if a.helperOK {
+		a.helperOK = false
+		if a.useHelper() && a.startHelper() {
+			return a.getAsync(rowEnd)
+		}
 	}
 	if a.hdr.PreProcessing == alpha.PreprocessingLevels && a.dithering > 0 {
 		rowEnd = a.h // dequantization smooths the whole plane at once
@@ -343,6 +396,12 @@ func (a *lazyAlpha) get(rowEnd int) ([]byte, error) {
 		return nil, a.err
 	}
 	return a.plane, nil
+}
+
+// start initializes the alpha decoder, keeping a failure in a.err.
+func (a *lazyAlpha) start() {
+	a.started = true
+	a.err = a.init()
 }
 
 // init validates the ALPH header like libwebp's ALPHInit, which
@@ -454,6 +513,7 @@ func (a *lazyAlpha) prefetch() {
 }
 
 func (a *lazyAlpha) release() {
+	a.stopHelper()
 	if a.spare != nil {
 		planePool.Put(a.spare)
 		a.spare = nil
@@ -483,9 +543,13 @@ type yuvAdapter struct {
 	alpha       *lazyAlpha // nil for opaque images
 	top, left   int        // crop origin in the alpha plane
 	alphaStride int
+	ctx         context.Context // DecodeContext, may be nil
 }
 
 func (a *yuvAdapter) PutYUV(y, n int, ys []byte, yStride int, us, vs []byte, uvStride int) error {
+	if err := canceled(a.ctx); err != nil {
+		return err
+	}
 	var ap []byte
 	if a.alpha != nil {
 		plane, err := a.alpha.get(a.top + y + n)
