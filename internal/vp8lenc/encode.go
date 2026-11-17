@@ -7,7 +7,6 @@ import (
 	"errors"
 	"image"
 	"math"
-	"sync"
 )
 
 // Config controls the lossless encoder. Field semantics follow libwebp's
@@ -396,51 +395,11 @@ func encodeARGB(argb []uint32, w, h int, cfg *Config, useCache bool, prefix int,
 		// argb in place).
 		return encodeStream(argb[:n], true, w, h, &p, configs[0], prefix, sc, spare), nil
 	}
-	results := make([][]byte, len(configs))
+	helpers := 0
 	if p.parallel {
-		var wg sync.WaitGroup
-		for i := range configs {
-			wg.Add(1)
-			go func(i int) {
-				defer wg.Done()
-				s := sc
-				if i > 0 {
-					s = getScratch()
-					defer putScratch(s)
-				}
-				var buf []byte
-				if i == 0 {
-					buf = spare
-				}
-				results[i] = encodeStream(argb[:n], false, w, h, &p, configs[i], prefix, s, buf)
-			}(i)
-		}
-		wg.Wait()
-	} else {
-		// Keep only the best stream and one spare buffer: each trial
-		// writes into the buffer of the previous loser.
-		for i := range configs {
-			r := encodeStream(argb[:n], false, w, h, &p, configs[i], prefix, sc, spare)
-			if best == nil || len(r) < len(best) {
-				best, spare = r, best
-			} else {
-				spare = r
-			}
-		}
-		return best, spare
+		helpers = configHelpers
 	}
-	bi := 0
-	for i, r := range results {
-		if len(r) < len(results[bi]) {
-			bi = i
-		}
-	}
-	for i, r := range results {
-		if i != bi && cap(r) > cap(spareOut) {
-			spareOut = r
-		}
-	}
-	return results[bi], spareOut
+	return encodeConfigs(argb[:n], w, h, &p, configs, prefix, sc, spare, helpers)
 }
 
 // hashPix approximates palette entropy with a multiplicative hash.
