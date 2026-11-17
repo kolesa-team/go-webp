@@ -40,6 +40,12 @@ type iterator struct {
 	leftDerr   [2][2]int8
 	i4Boundary [40]byte
 
+	// maxEdge is the largest edge delta of each segment over the
+	// macroblocks this iterator coded in the current pass (merged into
+	// segmentInfo.maxEdge by mergeMaxEdge: every iterator of a wavefront
+	// pass keeps its own).
+	maxEdge [numMBSegments]int
+
 	// yLeft[0] is the top-left sample, yLeft[1..16] the left column.
 	yLeft        [17]byte
 	uLeft, vLeft [9]byte
@@ -77,8 +83,17 @@ func (it *iterator) reset(e *encoder) {
 	it.yuvP = it.yuvMem[3*yuvSize:]
 	it.analysis = false
 	it.doTrellis = false
+	it.maxEdge = [numMBSegments]int{}
 	it.setRow(0)
 	it.countDown = e.mbW * e.mbH
+}
+
+// mergeMaxEdge raises the segments' maxEdge to the iterator's (the maximum
+// does not depend on the order the macroblocks were coded in).
+func (e *encoder) mergeMaxEdge(it *iterator) {
+	for s, v := range it.maxEdge {
+		e.dqm[s].maxEdge = max(e.dqm[s].maxEdge, v)
+	}
 }
 
 func (e *encoder) initTop() {
@@ -137,6 +152,14 @@ func (it *iterator) next() bool {
 	}
 	it.countDown--
 	return it.countDown > 0
+}
+
+// nextInRow advances to the next macroblock of the row (wavefront pass,
+// which walks one row at a time and moves to another row with setRow).
+func (it *iterator) nextInRow() {
+	it.x++
+	it.predsIdx += 4
+	it.mbIdx++
 }
 
 func importBlock(src []byte, srcStride int, dst []byte, w, h, size int) {
