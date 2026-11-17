@@ -28,7 +28,7 @@ type scratch struct {
 	rowa     []uint32
 	rowb     []uint32
 	idxRow   []uint8
-	md       []uint8
+	md       []uint8  // near-lossless max diffs, or cleanMask
 	predMode []uint32 // mode images of all the samplings (predSearch)
 	predHist []histo4 // per sampling and mode residual histograms
 	predAccH []histo4 // per sampling accumulated histograms
