@@ -9,7 +9,7 @@ import (
 
 // bitReader is the VP8 boolean entropy decoder. It mirrors libwebp's
 // VP8BitReader: value holds up to 56+8 pending bits, rng stores range-1 in
-// [127, 254], and nbits counts the bits buffered beyond the 8 bits that are
+// [127, 255], and nbits counts the bits buffered beyond the 8 bits that are
 // always needed for the next comparison.
 type bitReader struct {
 	value uint64
@@ -59,59 +59,41 @@ func (br *bitReader) loadFinalBytes() {
 	}
 }
 
-// kNormShift[r] is the left shift that renormalizes a range r in [1, 255]
-// back into [128, 255].
-var kNormShift = func() (t [256]uint8) {
-	for r := 1; r < 256; r++ {
-		t[r] = uint8(bits.LeadingZeros32(uint32(r)) - 24)
-	}
-	return
-}()
-
-// kRenorm[r] packs libwebp's kVP8NewRange (the renormalized range minus
-// one, low byte) and kVP8Log2Range (the shift, high byte) for a range r.
-var kRenorm = func() (t [256]uint16) {
-	for r := 1; r < 256; r++ {
-		sh := int(kNormShift[r])
-		t[r] = uint16((r<<sh)-1) | uint16(sh)<<8
-	}
-	return
-}()
-
-// fill makes sure at least one bit can be decoded with bitNL.
-func (br *bitReader) fill() {
-	if br.nbits < 0 {
-		br.loadNewBytes()
-	}
-}
-
-// bitNL decodes one boolean whose probability of being 0 is prob/256. The
-// caller must have called fill first ("no load" variant, small enough to be
-// inlined in hot loops).
-func (br *bitReader) bitNL(prob uint8) bool {
-	var bit bool
-	br.value, br.rng, br.nbits, bit = decodeBit(br.value, br.rng, br.nbits, prob)
-	return bit
-}
-
-// decodeBit is bitNL on register copies of the reader state. Hot loops keep
-// value/rng/nbits in locals and call it (inlined) to avoid a memory round
-// trip on the bit decoding dependency chain. nbits must be >= 0.
+// decodeBit decodes one boolean whose probability of being 0 is prob/256
+// (libwebp's VP8GetBit) on register copies of the reader state. Hot loops
+// keep value/rng/nbits in locals and call it (it is inlined) to avoid a
+// memory round trip on the bit decoding dependency chain. nbits must be >= 0
+// (refill first).
+//
+// The new range r (not minus one) is split+1 or rng-split, both in [1, 255]
+// because rng stays in [127, 255] (255 only after decodeSigned). It is
+// renormalized into [128, 255] by a left shift of 7-floor(log2(r)) =
+// clz32(r)-24, which is one CLZ instruction instead of a table lookup on the
+// dependency chain (libwebp computes it the same way, with BitsLog2Floor).
 func decodeBit(value uint64, rng uint32, nbits int, prob uint8) (uint64, uint32, int, bool) {
 	split := (rng * uint32(prob)) >> 8
 	pos := uint(nbits) & 63
 	// Unsigned "value > split" as in libwebp's VP8GetBit: a 32-bit signed
 	// difference would disagree on corrupt streams where value-split >= 2^31.
-	m := uint32(int64(uint64(split)-uint64(uint32(value>>pos))) >> 63) // all ones if bit
-	rng = split + 1 + ((rng - 2*split - 1) & m)
-	value -= uint64((split+1)&m) << pos
-	e := kRenorm[uint8(rng)]
-	return value, uint32(e & 0xff), nbits - int(e>>8), m != 0
+	bit := uint32(value>>pos) > split
+	r := split + 1
+	if bit {
+		r = rng - split
+		value -= uint64(split+1) << pos
+	}
+	// r is in [1, 255], so the shift is in [0, 7]; the mask only tells the
+	// compiler that it is a valid 32-bit shift amount.
+	sh := uint(bits.LeadingZeros32(r)-24) & 31
+	return value, (r << sh) - 1, nbits - int(sh), bit
 }
 
-// decodeSigned is getSigned on register copies of the reader state.
+// decodeSigned returns v or -v using one bit of probability 1/2 (libwebp's
+// VP8GetSigned) on register copies of the reader state. nbits must be >= 0.
+// Unlike VP8GetBit, VP8GetSigned compares with a signed 32-bit difference,
+// which is kept here for bit-exactness on corrupt streams. The range does
+// not need renormalizing: it loses exactly one bit.
 func decodeSigned(value uint64, rng uint32, nbits int, v int) (uint64, uint32, int, int) {
-	pos := uint(nbits)
+	pos := uint(nbits) & 63
 	split := rng >> 1
 	mask := int32(split-uint32(value>>pos)) >> 31 // -1 if value > split
 	rng = (rng + uint32(mask)) | 1
@@ -129,11 +111,12 @@ func (br *bitReader) refill(value uint64, nbits int) (uint64, int) {
 
 // getBit decodes one boolean whose probability of being 0 is prob/256.
 func (br *bitReader) getBit(prob uint8) int {
-	br.fill()
-	if br.bitNL(prob) {
-		return 1
+	if br.nbits < 0 {
+		br.loadNewBytes()
 	}
-	return 0
+	var bit bool
+	br.value, br.rng, br.nbits, bit = decodeBit(br.value, br.rng, br.nbits, prob)
+	return b2i(bit)
 }
 
 // getSigned returns v or -v using one bit of probability 1/2 (libwebp's
@@ -142,14 +125,8 @@ func (br *bitReader) getSigned(v int) int {
 	if br.nbits < 0 {
 		br.loadNewBytes()
 	}
-	pos := uint(br.nbits)
-	split := br.rng >> 1
-	value := uint32(br.value >> pos)
-	mask := int32(split-value) >> 31 // -1 if value > split
-	br.nbits--
-	br.rng = (br.rng + uint32(mask)) | 1
-	br.value -= uint64((split+1)&uint32(mask)) << pos
-	return (v ^ int(mask)) - int(mask)
+	br.value, br.rng, br.nbits, v = decodeSigned(br.value, br.rng, br.nbits, v)
+	return v
 }
 
 // getValue reads an n-bit unsigned literal, most significant bit first.
