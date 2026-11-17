@@ -20,7 +20,8 @@ const (
 func (e *encoder) smoothSegmentMap() {
 	w, h := e.mbW, e.mbH
 	const majorityCnt3x3 = 5
-	tmp := make([]uint8, w*h)
+	tmp := bytePool.Get(w * h) // only the inner macroblocks are written and read
+	defer bytePool.Put(tmp)
 	for y := 1; y < h-1; y++ {
 		for x := 1; x < w-1; x++ {
 			var cnt [numMBSegments]int
