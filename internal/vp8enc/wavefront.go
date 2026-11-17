@@ -29,11 +29,14 @@ import (
 //     rows above), then refreshes the tables and starts a new epoch. A
 //     macroblock is coded only in its epoch, so the rows below a refresh
 //     point wait for it.
-//   - recordStats saturates, so the token statistics depend on the order of
-//     the tokens, and the autofilter SSIM sums are floating point: both are
-//     accumulated when a row is committed, in raster order. Workers record
-//     each row's tokens into a row buffer (with throw-away statistics) and
-//     the SSIM values into a list.
+//   - The token statistics and the autofilter SSIM sums are accumulated
+//     when a row is committed, in raster order. Workers record each row's
+//     tokens into a row buffer, with statistics counted from zero, and the
+//     SSIM values into a list. The statistics counters halve when they
+//     saturate, so the row's counts are added to the frame's only if no
+//     counter reaches that point (mergeStats, almost always); otherwise the
+//     row's tokens are replayed one by one. The SSIM values are floating
+//     point and are added one by one, in order.
 //   - Committing a row appends its tokens to e.tokens and sets its
 //     e.mbTokStart entries, so the frame's token buffer and everything that
 //     reads it after the pass are unchanged.
@@ -96,17 +99,17 @@ type wfWorker struct {
 	need, epochNeed, commitNeed int32
 
 	sizeP0, dist uint64
-	stats        [numTypes]statsArray // throw-away token statistics
 }
 
 // wfSlot holds the coded but not yet committed part of a row.
 type wfSlot struct {
 	tokens   tokenBuffer
-	mbEnd    []int32   // mbEnd[x+1]: end of macroblock x's tokens; mbEnd[0] = 0
-	lf       []float64 // autofilter SSIM values (appendFilterSSIMs)
-	lfPos    int       // values already committed
-	commitX  int       // macroblocks already committed
-	finished bool      // under mu: the row is coded
+	stats    [numTypes]statsArray // statistics of the tokens not committed yet
+	mbEnd    []int32              // mbEnd[x+1]: end of macroblock x's tokens; mbEnd[0] = 0
+	lf       []float64            // autofilter SSIM values (appendFilterSSIMs)
+	lfPos    int                  // values already committed
+	commitX  int                  // macroblocks already committed
+	finished bool                 // under mu: the row is coded
 }
 
 // wfState is the shared state of a wavefront pass.
@@ -316,6 +319,7 @@ func (wf *wfState) run(w *wfWorker) {
 		}
 		s := &wf.slots[r%nslots]
 		s.tokens.reset()
+		s.stats = [numTypes]statsArray{}
 		s.mbEnd[0] = 0
 		s.lf = s.lf[:0]
 		s.lfPos, s.commitX = 0, 0
@@ -326,7 +330,7 @@ func (wf *wfState) run(w *wfWorker) {
 			}
 			it.importMB()
 			it.decimate(rd, wf.rdOpt)
-			it.recordTokens(rd, &s.tokens, &w.stats)
+			it.recordTokens(rd, &s.tokens, &s.stats)
 			s.mbEnd[x+1] = int32(s.tokens.len())
 			w.sizeP0 += uint64(rd.H)
 			w.dist += uint64(rd.D)
@@ -415,7 +419,8 @@ func (wf *wfState) finishRow(r int) {
 
 // commit commits macroblocks [commitX, x1) of row r: it appends their
 // tokens to e.tokens, accumulates their token statistics and autofilter
-// values. Rows are committed in raster order.
+// values. Rows are committed in raster order, as the sequential pass
+// records them.
 func (wf *wfState) commit(r, x1 int) {
 	e := wf.e
 	s := &wf.slots[r%len(wf.slots)]
@@ -428,11 +433,18 @@ func (wf *wfState) commit(r, x1 int) {
 	for x := x0; x < x1; x++ {
 		e.mbTokStart[base+x] = s.mbEnd[x] + off
 	}
-	for start, end := int(s.mbEnd[x0]), int(s.mbEnd[x1]); start < end; {
-		c := s.tokens.chunk(start, end)
+	start, end := int(s.mbEnd[x0]), int(s.mbEnd[x1])
+	for i := start; i < end; {
+		c := s.tokens.chunk(i, end)
 		e.tokens.appendTokens(c)
-		recordTokenStats(c, &e.proba.stats)
-		start += len(c)
+		i += len(c)
+	}
+	if !mergeStats(&e.proba.stats, &s.stats) {
+		s.tokens.recordStatsRange(start, end, &e.proba.stats)
+	}
+	if x1 < wf.mbW {
+		// Count the rest of the row from zero.
+		s.stats = [numTypes]statsArray{}
 	}
 	if wf.lf {
 		for x := x0; x < x1; x++ {
@@ -493,4 +505,43 @@ func (wf *wfState) stop() {
 	wf.mu.Lock()
 	wf.wakeReadyLocked()
 	wf.mu.Unlock()
+}
+
+// mergeStats adds the statistics local, counted from zero, to global if
+// recording the same events into global one by one gives the same result:
+// when none of global's counters reaches the point where recordStats
+// halves it (and local's never did). Otherwise it leaves global unchanged
+// and returns false.
+func mergeStats(global, local *[numTypes]statsArray) bool {
+	ok := true
+	for t := range local {
+		for b := range local[t] {
+			for c := range local[t][b] {
+				g, l := &global[t][b][c], &local[t][b][c]
+				for p := range l {
+					// recordStats halves a counter before an event when its
+					// total is 0xfffe; a local total of 0x7fff or more may
+					// have been halved already.
+					n := l[p] >> 16
+					ok = ok && n < 0x7fff && g[p]>>16+n <= 0xfffe
+				}
+			}
+		}
+	}
+	if !ok {
+		return false
+	}
+	for t := range local {
+		for b := range local[t] {
+			for c := range local[t][b] {
+				g, l := &global[t][b][c], &local[t][b][c]
+				for p := range l {
+					// Totals and counts of ones add separately: the counts
+					// never exceed the totals, which stay below 0x10000.
+					g[p] += l[p]
+				}
+			}
+		}
+	}
+	return true
 }
