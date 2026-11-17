@@ -2,6 +2,7 @@ package vp8
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"image"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -310,30 +312,37 @@ func TestBatchRows(t *testing.T) {
 	}
 }
 
-// TestThreadedYUV checks DecodeYUV with UseThreads.
+// TestThreadedYUV checks DecodeYUV with UseThreads, whole frame and
+// cropped (odd crop origin and size, dithering).
 func TestThreadedYUV(t *testing.T) {
 	checkNoLeak(t)
 	setBatch(t, 1)
 	setBudget(t, 2, false)
 	vp8 := loadVP8(t, "mix_250x199_o4.webp")
-	run := func(threads bool) *traceYUV {
-		s := &traceYUV{w: 250, gids: map[uint64]bool{}}
-		if err := DecodeYUV(vp8, &Options{UseThreads: threads}, nil, s); err != nil {
-			t.Fatal(err)
+	for _, crop := range []*image.Rectangle{nil, {Min: image.Pt(37, 51), Max: image.Pt(200, 180)}} {
+		w := 250
+		if crop != nil {
+			w = crop.Dx()
 		}
-		return s
-	}
-	want, got := run(false), run(true)
-	if fmt.Sprint(want.log) != fmt.Sprint(got.log) || len(want.rows) != len(got.rows) {
-		t.Fatalf("PutYUV calls %v, want %v", got.log, want.log)
-	}
-	for i := range want.rows {
-		if !bytes.Equal(want.rows[i], got.rows[i]) {
-			t.Fatalf("row %d differs", i)
+		run := func(threads bool) *traceYUV {
+			s := &traceYUV{w: w, gids: map[uint64]bool{}}
+			if err := DecodeYUV(vp8, &Options{UseThreads: threads, DitheringStrength: 50}, crop, s); err != nil {
+				t.Fatal(err)
+			}
+			return s
 		}
-	}
-	if got.gids[goid()] {
-		t.Error("PutYUV ran on the caller goroutine")
+		want, got := run(false), run(true)
+		if fmt.Sprint(want.log) != fmt.Sprint(got.log) || len(want.rows) != len(got.rows) {
+			t.Fatalf("crop %v: PutYUV calls %v, want %v", crop, got.log, want.log)
+		}
+		for i := range want.rows {
+			if !bytes.Equal(want.rows[i], got.rows[i]) {
+				t.Fatalf("crop %v: row %d differs", crop, i)
+			}
+		}
+		if got.gids[goid()] {
+			t.Errorf("crop %v: PutYUV ran on the caller goroutine", crop)
+		}
 	}
 }
 
@@ -523,5 +532,123 @@ func TestThreadedConcurrentDecoders(t *testing.T) {
 	close(errs)
 	for err := range errs {
 		t.Error(err)
+	}
+}
+
+// TestThreadedAlphaCallback checks Options.Alpha with UseThreads: the
+// callback (which runs on the helper goroutine) sees the same row ends as in
+// a sequential decode, its plane gives the same pixels, a nil plane makes
+// the output opaque, and its error stops the decode after the same rows,
+// with or without a crop, whatever the batch size and the helper budget.
+func TestThreadedAlphaCallback(t *testing.T) {
+	checkNoLeak(t)
+	errAlpha := errors.New("alpha failure")
+	vp8 := loadVP8(t, "mix_250x199_o4.webp")
+	w, h, err := DecodeHeader(vp8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plane := make([]byte, w*h)
+	for i := range plane {
+		plane[i] = byte(i*7 + i/w)
+	}
+	run := func(threads bool, crop *image.Rectangle, failAt int, opaque bool) (string, map[uint64]bool) {
+		var calls []int
+		opts := Options{UseThreads: threads, Alpha: func(rowEnd int) ([]byte, error) {
+			calls = append(calls, rowEnd)
+			switch {
+			case len(calls) == failAt:
+				return nil, errAlpha
+			case opaque:
+				return nil, nil
+			}
+			return plane[:rowEnd*w], nil
+		}}
+		r := runDecode(vp8, opts, crop, 0, 0)
+		return fmt.Sprintf("calls %v err %q log %s pix %x", calls, r.err, r.log, sha256.Sum256(r.pix)), r.gids
+	}
+	crops := []*image.Rectangle{nil, {Min: image.Pt(31, 47), Max: image.Pt(230, 190)}}
+	for ci, crop := range crops {
+		for _, failAt := range []int{0, 1, 2, 7} {
+			for _, opaque := range []bool{false, true} {
+				want, _ := run(false, crop, failAt, opaque)
+				for _, mbs := range []int{1, 32} {
+					for _, b := range budgets {
+						// A subtest, so that the budget (and the slots an
+						// exhausted budget takes) is restored after each run.
+						t.Run(fmt.Sprintf("crop%d/fail%d/opaque%v/mbs%d/%s", ci, failAt, opaque, mbs, b.name), func(t *testing.T) {
+							setBatch(t, mbs)
+							setBudget(t, b.limit, b.exhausted)
+							got, gids := run(true, crop, failAt, opaque)
+							if got != want {
+								t.Fatalf("got  %s\nwant %s", got, want)
+							}
+							// Both regions span all 13 macroblock rows, enough
+							// for two batches of either size.
+							if helper := len(gids) > 1 || (len(gids) == 1 && !gids[goid()]); helper != !b.exhausted && failAt != 1 {
+								t.Errorf("helper used: %v, want %v", helper, !b.exhausted)
+							}
+						})
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestThreadedParserPanic checks the other panic path of UseThreads: a panic
+// in the parser (the calling goroutine), here while earlier batches are
+// still being reconstructed, stops and joins the helper before it
+// propagates with its own value, releases the helper slot and leaves no
+// goroutine behind. No input makes the parser panic, so the test breaks the
+// read position of one token partition of a 2-partition stream: the first
+// refill of partition p, at the first token of row p, slices out of range
+// (for p = 1, while row 0 is with the helper).
+func TestThreadedParserPanic(t *testing.T) {
+	checkNoLeak(t)
+	setBatch(t, 1)
+	setBudget(t, 1, false)
+	vp8 := loadVP8(t, "mix_64x48_p1.webp")
+	want := runDecode(vp8, Options{}, nil, 0, 0)
+	for _, part := range []int{0, 1} {
+		for round := 0; round < 20; round++ {
+			d := new(decoder)
+			if err := d.parseHeaders(vp8); err != nil {
+				t.Fatal(err)
+			}
+			if d.numPartsMinusOne != 1 {
+				t.Fatalf("%d token partitions, want 2", d.numPartsMinusOne+1)
+			}
+			// The setup of decoder.decode, without alpha or crop.
+			s := newTraceSink(d.width, d.height)
+			d.cropLeft, d.cropTop, d.cropRight, d.cropBottom = 0, 0, d.width, d.height
+			d.outW = d.width
+			d.enterCritical()
+			d.precomputeFilterStrengths()
+			d.initDithering(0)
+			d.sink, d.fancy = s, true
+			d.initFrame()
+			d.parts[part].nbits = -1 // refill at the first token of row part
+			d.parts[part].pos = -8
+			r := func() (r any) {
+				defer func() { r = recover() }()
+				_ = d.decodeFrameThreaded()
+				return nil
+			}()
+			if _, ok := r.(runtime.Error); !ok {
+				t.Fatalf("partition %d: recovered %v, want the parser's runtime error", part, r)
+			}
+			// The helper was joined before the panic left decodeFrameThreaded.
+			if n := workers.InUse(); n != 0 {
+				t.Fatalf("partition %d: %d helper slots in use after the panic", part, n)
+			}
+			// The helper only emitted rows parsed before the broken one.
+			if got := fmt.Sprint(s.log); !strings.HasPrefix(want.log, strings.TrimSuffix(got, "]")) {
+				t.Fatalf("partition %d: sink calls %s, not a prefix of %s", part, got, want.log)
+			}
+			if part == 0 && len(s.log) != 0 {
+				t.Fatalf("partition 0: sink calls %v before the first row was parsed", s.log)
+			}
+		}
 	}
 }
