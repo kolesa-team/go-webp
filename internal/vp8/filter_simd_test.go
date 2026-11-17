@@ -176,6 +176,69 @@ func TestFilterMBRandom(t *testing.T) {
 	}
 }
 
+// walkFilterPlane fills a plane with a 2D random walk whose steps are
+// drawn from steps (with random signs) and an occasional jump to an
+// extreme value, so that many lines sit right at a filter decision
+// threshold or clip at 0 or 255.
+func walkFilterPlane(r *rand.Rand, b []byte, stride int, steps []int) {
+	for i := range b {
+		prev := r.IntN(256)
+		switch x, y := i%stride, i/stride; {
+		case x > 0 && (y == 0 || r.IntN(2) == 0):
+			prev = int(b[i-1])
+		case y > 0:
+			prev = int(b[i-stride])
+		}
+		s := steps[r.IntN(len(steps))]
+		if r.IntN(2) == 0 {
+			s = -s
+		}
+		v := prev + s
+		if r.IntN(64) == 0 {
+			v = []int{0, 127, 128, 255}[r.IntN(4)]
+		}
+		b[i] = byte(min(max(v, 0), 255))
+	}
+}
+
+// TestFilterMBThresholdWalk compares filterMB with filterMBGo on caches
+// with arbitrary strides and block offsets (any alignment), every limit
+// 1..255 (251..255 take the Go fallback) and interior and hev thresholds
+// at 0, small, VP8's maximum and 255, on pixels whose neighbour
+// differences concentrate at those thresholds.
+func TestFilterMBThresholdWalk(t *testing.T) {
+	r := rand.New(rand.NewPCG(19, 20))
+	n := 100000
+	if testing.Short() {
+		n = 20000
+	}
+	for i := 0; i < n; i++ {
+		ft, mbW := 1+r.IntN(2), 1+r.IntN(3)
+		d := newFilterCache(ft, mbW)
+		if i&1 != 0 {
+			d.cacheYStride += r.IntN(17)
+			d.cacheUVStride += r.IntN(17)
+			d.cacheYOff = d.extraRows*d.cacheYStride + r.IntN(16)
+			d.cacheUVOff = d.extraRows/2*d.cacheUVStride + r.IntN(16)
+			d.cacheY = make([]byte, d.cacheYOff+16*d.cacheYStride+r.IntN(4))
+			d.cacheU = make([]byte, d.cacheUVOff+8*d.cacheUVStride+r.IntN(4))
+			d.cacheV = make([]byte, d.cacheUVOff+8*d.cacheUVStride+r.IntN(4))
+		}
+		limit := 1 + r.IntN(255)
+		if r.IntN(2) == 0 {
+			limit = min(2*(1+r.IntN(63))+r.IntN(64), 255)
+		}
+		il := []int{0, 1, 2, 63, 254, 255, r.IntN(64), r.IntN(256)}[r.IntN(8)]
+		hev := []int{0, 1, 2, 255, r.IntN(256)}[r.IntN(5)]
+		steps := []int{0, 0, 1, hev, hev + 1, il, il + 1, max(il-1, 0), limit / 2, limit/2 + 1, limit / 4, (limit + 4) / 2, (limit+4)/2 + 1, 127, 128, r.IntN(256)}
+		walkFilterPlane(r, d.cacheY, d.cacheYStride, steps)
+		walkFilterPlane(r, d.cacheU, d.cacheUVStride, steps)
+		walkFilterPlane(r, d.cacheV, d.cacheUVStride, steps)
+		f := fInfo{limit: uint8(limit), ilevel: uint8(il), hevThresh: uint8(hev), inner: uint8(r.IntN(2))}
+		checkFilterMB(t, d, r.IntN(mbW), r.IntN(2), f)
+	}
+}
+
 // TestFilterKernelGuardPages runs the NEON kernels (through filterMB) on
 // planes cut to exactly the bytes a macroblock's edges may touch, placed
 // against an inaccessible page at either end.

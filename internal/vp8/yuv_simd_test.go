@@ -224,6 +224,113 @@ func TestYUVToRGBExhaustive(t *testing.T) {
 	}
 }
 
+// offsetRow returns n bytes starting at a random offset 0..15 of a larger
+// buffer, so that the kernels also see unaligned rows, as with cropped
+// decodes; fill selects random contents (otherwise 0x5a).
+func offsetRow(r *rand.Rand, n int, fill bool) []byte {
+	off := r.IntN(16)
+	b := make([]byte, off+n+r.IntN(16))
+	for i := range b {
+		b[i] = 0x5a
+		if fill {
+			b[i] = byte(r.IntN(256))
+		}
+	}
+	return b[off : off+n]
+}
+
+// TestConvertersUnaligned compares the converters with the reference on
+// rows at random offsets, with every alpha and bottom row combination,
+// destinations longer than the row (as the decoder passes them; the bytes
+// past the row must stay untouched) and extreme values.
+func TestConvertersUnaligned(t *testing.T) {
+	r := rand.New(rand.NewPCG(31, 32))
+	trials := 32
+	if testing.Short() {
+		trials = 8
+	}
+	for _, w := range testWidths() {
+		uvW := (w + 1) >> 1
+		for i := 0; i < trials; i++ {
+			topY, botY := offsetRow(r, w, true), offsetRow(r, w, true)
+			topU, topV := offsetRow(r, uvW, true), offsetRow(r, uvW, true)
+			curU, curV := offsetRow(r, uvW, true), offsetRow(r, uvW, true)
+			var topA, botA []byte
+			if i&1 != 0 {
+				topA = offsetRow(r, w, true)
+			}
+			if i&2 != 0 {
+				botA = offsetRow(r, w, true)
+			}
+			if i&4 != 0 {
+				botY = nil
+			}
+			if i&8 != 0 {
+				for _, s := range [][]byte{topY, botY, topU, topV, curU, curV} {
+					fillRow(r, s, 1)
+				}
+			}
+			wantT, wantB := offsetRow(r, 4*w+64, false), offsetRow(r, 4*w+64, false)
+			gotT, gotB := offsetRow(r, 4*w+64, false), offsetRow(r, 4*w+64, false)
+			var wb, gb []byte
+			if botY != nil {
+				wb, gb = wantB, gotB
+			}
+			upsamplePairGo(topY, botY, topU, topV, curU, curV, wantT, wb, topA, botA, make([]uint32, w), make([]uint32, w), w)
+			upsamplePair(topY, botY, topU, topV, curU, curV, gotT, gb, topA, botA, make([]uint32, w), make([]uint32, w), w)
+			if !bytes.Equal(gotT, wantT) || !bytes.Equal(gotB, wantB) {
+				t.Fatalf("upsamplePair w=%d case %d: rows differ", w, i)
+			}
+
+			want, got := offsetRow(r, 4*w+64, false), offsetRow(r, 4*w+64, false)
+			sampleRowGo(topY, topU, topV, topA, want, w)
+			sampleRow(topY, topU, topV, topA, got, w)
+			if !bytes.Equal(got, want) {
+				t.Fatalf("sampleRow w=%d case %d: rows differ", w, i)
+			}
+		}
+	}
+}
+
+// TestUpsampleConvertExhaustive converts all 2^24 (y, u, v) triples with
+// the fancy upsampler: with constant chroma rows every upsampled sample is
+// (u, v), so the conversion inside the upsampling kernel sees every triple,
+// on both rows (the top one with alpha) and in both halves of its blocks.
+func TestUpsampleConvertExhaustive(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow")
+	}
+	const w = 16*256 + 1 // odd, so only pixel 0 is converted outside the kernel
+	uvW := (w + 1) >> 1
+	ys, as := make([]byte, w), make([]byte, w)
+	for x := range ys {
+		ys[x] = byte(x)
+		as[x] = byte(x * 7)
+	}
+	us, vs := make([]byte, uvW), make([]byte, uvW)
+	gotT, gotB := make([]byte, 4*w), make([]byte, 4*w)
+	uvT, uvB := make([]uint32, w), make([]uint32, w)
+	for u := 0; u < 256; u++ {
+		for i := range us {
+			us[i] = byte(u)
+		}
+		for v := 0; v < 256; v++ {
+			for i := range vs {
+				vs[i] = byte(v)
+			}
+			upsamplePair(ys, ys, us, vs, us, vs, gotT, gotB, as, nil, uvT, uvB, w)
+			for x := 0; x < w; x++ {
+				want := yuvPix(yuvTab, ys[x], byte(u), byte(v))
+				top := binary.LittleEndian.Uint32(gotT[4*x:])
+				bot := binary.LittleEndian.Uint32(gotB[4*x:])
+				if top != want|uint32(as[x])<<24 || bot != want|0xff000000 {
+					t.Fatalf("y=%d u=%d v=%d (x=%d): got %08x, %08x, want %08x", ys[x], u, v, x, top, bot, want)
+				}
+			}
+		}
+	}
+}
+
 // TestYUVGuardPages runs the converters on rows that end right before (or
 // start right after) an inaccessible page: an out-of-bounds access faults.
 func TestYUVGuardPages(t *testing.T) {
