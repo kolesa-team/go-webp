@@ -35,3 +35,5 @@ func predLuma16(p []byte, left, top []byte) { predLuma16Ref(p, left, top) }
 func predChroma8(p []byte, uLeft, vLeft, uvTop []byte) { predChroma8Ref(p, uLeft, vLeft, uvTop) }
 
 func predLuma4(p []byte, b []byte, t int) { predLuma4Ref(p, b, t) }
+
+func zeroBinStats(coeffs [][16]int16) (int, int) { return zeroBinStatsRef(coeffs) }
