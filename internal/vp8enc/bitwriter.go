@@ -55,12 +55,25 @@ func (bw *bitWriter) release() {
 	bw.buf = nil
 }
 
+// grow makes room for n more bytes when the output outgrows its estimate:
+// the larger buffer comes from bytePool and the outgrown one goes back to
+// it (append would leave it to the garbage collector).
+func (bw *bitWriter) grow(n int) {
+	nb := bytePool.Get(max(2*cap(bw.buf), len(bw.buf)+n, 1024))
+	nb = append(nb[:0], bw.buf...)
+	bytePool.Put(bw.buf)
+	bw.buf = nb
+}
+
 func (bw *bitWriter) flush() {
 	s := uint(8 + bw.nbBits)
 	bits := bw.value >> s
 	bw.value -= bits << s
 	bw.nbBits -= 8
 	if bits&0xff != 0xff {
+		if len(bw.buf)+bw.run >= cap(bw.buf) {
+			bw.grow(bw.run + 1)
+		}
 		if bits&0x100 != 0 { // overflow -> propagate carry over pending 0xff's
 			if n := len(bw.buf); n > 0 {
 				bw.buf[n-1]++

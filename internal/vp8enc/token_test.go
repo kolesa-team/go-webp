@@ -119,6 +119,32 @@ func TestEmitTokensExact(t *testing.T) {
 	}
 }
 
+// TestBitWriterGrow checks that an output outgrowing its initial capacity
+// (grown through the pool) is identical to one that never grows.
+func TestBitWriterGrow(t *testing.T) {
+	rng := rand.New(rand.NewSource(5))
+	var probas [numProbaSlots]uint8
+	for i := range probas {
+		probas[i] = uint8(rng.Intn(256))
+	}
+	toks := randomTokens(rng, 300000, &probas)
+	var small, big bitWriter
+	small.init(1)
+	big.init(1 << 20)
+	defer small.release()
+	defer big.release()
+	bigCap := cap(big.buf)
+	emitTokens(&small, toks, &probas)
+	emitTokens(&big, toks, &probas)
+	s, b := small.finish(), big.finish()
+	if cap(big.buf) != bigCap {
+		t.Fatal("the large buffer grew")
+	}
+	if len(s) < 10000 || !bytes.Equal(s, b) {
+		t.Fatalf("grown output differs (%d vs %d bytes)", len(s), len(b))
+	}
+}
+
 func BenchmarkEmitTokens(b *testing.B) {
 	rng := rand.New(rand.NewSource(1))
 	var probas [numProbaSlots]uint8
