@@ -3,6 +3,7 @@ package container
 import (
 	"encoding/binary"
 	"io"
+	"strings"
 
 	"github.com/kolesa-team/go-webp/v2/internal/status"
 )
@@ -81,22 +82,41 @@ func WriteLossless(w io.Writer, vp8l []byte) error {
 // header of a simple lossless file.
 const LosslessHeaderSize = riffHeaderSize + chunkHeaderSize
 
+// LossyHeaderSize is the size of the RIFF header plus the "VP8 " chunk
+// header of a simple lossy file (no alpha).
+const LossyHeaderSize = riffHeaderSize + chunkHeaderSize
+
 // FrameLossless turns buf, made of LosslessHeaderSize bytes of headroom
 // followed by a VP8L chunk payload, into a complete lossless WebP file in
 // place: it fills in the headers and appends the padding byte if needed
 // (reusing buf's capacity when possible). The result is what WriteLossless
 // writes for the same payload, without copying it.
 func FrameLossless(buf []byte) ([]byte, error) {
-	if len(buf) <= LosslessHeaderSize {
-		return nil, status.InvalidParam("empty VP8L payload")
+	return frameSimple(buf, "VP8L")
+}
+
+// FrameLossy is FrameLossless for a simple lossy file: buf is
+// LossyHeaderSize bytes of headroom followed by a "VP8 " chunk payload, and
+// the result is what WriteLossy writes for that payload without alpha.
+func FrameLossy(buf []byte) ([]byte, error) {
+	return frameSimple(buf, "VP8 ")
+}
+
+// frameSimple frames the payload buf[riffHeaderSize+chunkHeaderSize:] as
+// the only chunk (tag) of a simple WebP file, in place.
+func frameSimple(buf []byte, tag string) ([]byte, error) {
+	const hdr = riffHeaderSize + chunkHeaderSize
+	name := strings.TrimSpace(tag)
+	if len(buf) <= hdr {
+		return nil, status.InvalidParam("empty " + name + " payload")
 	}
-	n := len(buf) - LosslessHeaderSize
+	n := len(buf) - hdr
 	riff := uint64(tagSize) + chunkHeaderSize + padded(n)
 	if riff > maxRIFFPayload {
-		return nil, status.InvalidParam("VP8L payload too large")
+		return nil, status.InvalidParam(name + " payload too large")
 	}
 	putRIFF(buf, uint32(riff))
-	putChunkHeader(buf[riffHeaderSize:], "VP8L", n)
+	putChunkHeader(buf[riffHeaderSize:], tag, n)
 	if n&1 != 0 {
 		buf = append(buf, 0)
 	}

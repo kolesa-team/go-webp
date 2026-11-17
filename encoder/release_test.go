@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/kolesa-team/go-webp/v2/internal/bufpool"
 )
 
 // sourceImages returns a picture of the given size as each source type
@@ -170,15 +172,9 @@ func encodeOnce(src image.Image, o *Options) ([]byte, error) {
 // Encoder that was never released goes back to the pool once the Encoder
 // is unreachable.
 func TestCleanupRecyclesSnapshot(t *testing.T) {
-	if raceEnabled {
-		t.Skip("sync.Pool drops items at random under the race detector")
-	}
-	// With a single P, the pool slot the cleanup goroutine fills is the one
-	// this goroutine reads.
-	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
 	src := sourceImages(37, 29, 7)[2] // *image.Gray
-	for pixPool.Get() != nil {        // drain
-	}
+	n := 4 * 37 * 29
+	bufpool.Trim() // drain
 	func() {
 		e, err := NewEncoder(src, nil)
 		require.NoError(t, err)
@@ -188,12 +184,33 @@ func TestCleanupRecyclesSnapshot(t *testing.T) {
 	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
 		runtime.GC()
 		time.Sleep(10 * time.Millisecond) // let the cleanup goroutine run
-		if p, ok := pixPool.Get().(*[]byte); ok {
-			require.Equal(t, want, *p, "the pool holds another buffer than the snapshot")
+		// pixPool holds nothing but snapshots: before the cleanup ran, Get
+		// allocates a zeroed buffer.
+		if p := pixPool.Get(n); bytes.Equal(p, want) {
 			return
 		}
 	}
 	t.Fatal("the cleanup did not recycle the snapshot")
+}
+
+// scribble takes buffers of n bytes from the snapshot pool and overwrites
+// them with v, until stop is closed.
+func scribble(n int, v byte, stop <-chan struct{}, gc bool) {
+	for {
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		if gc {
+			runtime.GC()
+		}
+		p := pixPool.Get(n)
+		for i := range p {
+			p[i] = v
+		}
+		runtime.Gosched()
+	}
 }
 
 // TestCleanupNotEarly encodes while another goroutine forces garbage
@@ -203,21 +220,7 @@ func TestCleanupNotEarly(t *testing.T) {
 	srcs := sourceImages(64, 40, 8)
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
-	wg.Go(func() {
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			runtime.GC()
-			if p, ok := pixPool.Get().(*[]byte); ok {
-				for i := range *p {
-					(*p)[i] = 0xa5
-				}
-			}
-		}
-	})
+	wg.Go(func() { scribble(4*64*40, 0xa5, stop, true) })
 	defer func() {
 		close(stop)
 		wg.Wait()

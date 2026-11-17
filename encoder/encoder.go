@@ -76,7 +76,7 @@ type Encoder struct {
 // must not reference the Encoder: it is the argument of the Encoder's
 // cleanup.
 type snapshot struct {
-	pix *[]byte         // storage of Encoder.img, from pooledNRGBA
+	pix []byte          // storage of Encoder.img, from pooledNRGBA
 	pic *vp8enc.Picture // Encoder.pic, from vp8enc.FromYCbCr
 }
 
@@ -299,11 +299,16 @@ func (e *Encoder) encodeLossy(interrupt func() bool) ([]byte, error) {
 		alph    []byte
 		err     error
 	)
+	// Without alpha the file is a simple one: the VP8 payload is written
+	// after room for the RIFF and chunk headers, which are then filled in
+	// place instead of copying the payload into a new buffer.
+	headroom := container.LossyHeaderSize
 	if e.pic != nil {
-		payload, err = vp8Encode(e.pic, &cfg)
+		payload, err = vp8Encode(e.pic, &cfg, headroom)
 	} else {
 		var at *alphaTask
 		if hasTransparency(e.img) {
+			headroom = 0
 			if c.ThreadLevel {
 				// Like libwebp's alpha worker (thread_level > 0), code the
 				// alpha plane concurrently with the VP8 frame when a helper
@@ -319,7 +324,7 @@ func (e *Encoder) encodeLossy(interrupt func() bool) ([]byte, error) {
 		}
 		dithering := vp8enc.DitheringFor(&vp8enc.Config{Quality: c.Quality, Preprocessing: c.Preprocessing})
 		pic := vp8enc.FromNRGBADithered(e.img, c.UseSharpYUV || c.Preprocessing&4 != 0, c.Exact, dithering)
-		payload, err = vp8Encode(pic, &cfg)
+		payload, err = vp8Encode(pic, &cfg, headroom)
 		pic.Release()
 		if at != nil {
 			// The sequential order codes the alpha plane first, so its
@@ -334,6 +339,9 @@ func (e *Encoder) encodeLossy(interrupt func() bool) ([]byte, error) {
 	}
 	if err != nil {
 		return nil, err
+	}
+	if headroom > 0 {
+		return container.FrameLossy(payload)
 	}
 
 	sw := sliceWriter{b: make([]byte, 0, len(payload)+len(alph)+64)}

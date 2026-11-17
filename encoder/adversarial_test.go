@@ -13,6 +13,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/kolesa-team/go-webp/v2/internal/bufpool"
 	"github.com/kolesa-team/go-webp/v2/internal/workers"
 )
 
@@ -68,21 +69,7 @@ func TestReleaseWaitsForParallelAlpha(t *testing.T) {
 
 	stop := make(chan struct{})
 	var scribbler sync.WaitGroup
-	scribbler.Go(func() {
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			if p, ok := pixPool.Get().(*[]byte); ok {
-				for i := range *p {
-					(*p)[i] = 0x5a
-				}
-			}
-			runtime.Gosched()
-		}
-	})
+	scribbler.Go(func() { scribble(4*img.Rect.Dx()*img.Rect.Dy(), 0x5a, stop, false) })
 	defer func() {
 		close(stop)
 		scribbler.Wait()
@@ -190,34 +177,26 @@ func TestEncodeContextThreadsAll(t *testing.T) {
 	}
 }
 
-// TestPooledNRGBALargeSkipsPool checks that a snapshot too large to be
-// pooled neither takes nor returns pooled storage: taking a pooled buffer
-// would only discard it.
-func TestPooledNRGBALargeSkipsPool(t *testing.T) {
-	if raceEnabled {
-		t.Skip("sync.Pool drops items at random under the race detector")
-	}
-	// With a single P, Get returns what this goroutine Put.
-	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
-	for pixPool.Get() != nil { // drain
-	}
-	small := make([]byte, 64)
-	pixPool.Put(&small)
-	img, pp := pooledNRGBA(1449, 1449) // just above maxPooledPixels
-	require.Greater(t, 1449*1449, maxPooledPixels)
+// TestPooledNRGBAAnySize checks that snapshots of any size, 2 MP and more
+// included, go back to the pool and are reused, with the size and stride of
+// the request.
+func TestPooledNRGBAAnySize(t *testing.T) {
+	bufpool.Trim()
+	defer bufpool.Trim()
+	img, pix := pooledNRGBA(1449, 1449) // above v2.0's 2 MP pooling limit
 	require.Len(t, img.Pix, 4*1449*1449)
-	putPix(pp)
-	p, ok := pixPool.Get().(*[]byte)
-	require.True(t, ok, "the pooled buffer was taken")
-	require.Equal(t, &small, p)
-	require.Nil(t, pixPool.Get(), "the large buffer was pooled")
+	putPix(pix)
+	require.GreaterOrEqual(t, bufpool.Retained(), int64(4*1449*1449), "the large buffer was not pooled")
+	img2, pix2 := pooledNRGBA(1449, 1449)
+	require.Same(t, &pix[0], &pix2[0], "the pooled buffer was not reused")
+	require.Equal(t, 4*1449, img2.Stride)
+	putPix(pix2)
 
-	// A poolable size reuses a large enough pooled buffer.
-	big := make([]byte, 4*64*64)
-	pixPool.Put(&big)
-	img, pp = pooledNRGBA(63, 64)
-	require.Equal(t, &big, pp)
-	require.Len(t, img.Pix, 4*63*64)
-	require.Equal(t, 4*63, img.Stride)
-	putPix(pp)
+	// A smaller request reuses a large enough buffer of its size class.
+	small, pix3 := pooledNRGBA(63, 64)
+	require.Len(t, small.Pix, 4*63*64)
+	require.Equal(t, 4*63, small.Stride)
+	require.Equal(t, image.Rect(0, 0, 63, 64), small.Rect)
+	putPix(pix3)
+	putPix(nil) // no-op
 }

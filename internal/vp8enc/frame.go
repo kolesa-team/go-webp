@@ -481,7 +481,9 @@ func (e *encoder) write(headroom int) ([]byte, error) {
 		return nil, status.InvalidParam("vp8enc: partition #0 overflow (try a higher PartitionLimit)")
 	}
 	total += 10 + size0 + 3*(e.numParts-1)
-	out := make([]byte, headroom, headroom+total)
+	// One spare byte for the RIFF padding byte that a writer framing the
+	// payload in place (out[:headroom]) appends to an odd-sized payload.
+	out := make([]byte, headroom, headroom+total+1)
 	bits := uint32(0) | uint32(e.profile)<<1 | 1<<4 | uint32(size0)<<5
 	out = append(out, byte(bits), byte(bits>>8), byte(bits>>16), 0x9d, 0x01, 0x2a,
 		byte(e.pic.Width), byte(e.pic.Width>>8), byte(e.pic.Height), byte(e.pic.Height>>8))
