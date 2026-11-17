@@ -457,6 +457,9 @@ func encodeARGB(argb []uint32, w, h int, cfg *Config, useCache bool, prefix int,
 		sc = getScratch(n)
 		defer putScratch(sc)
 	}
+	// The helpers of the parallel stages end with the encode (before the
+	// scratch goes back to its pool).
+	defer sc.crew.stop()
 	if len(configs) == 1 {
 		// argb is private to the caller and not needed afterwards: let the
 		// transforms work in place (libwebp also transforms the picture's
@@ -1050,9 +1053,9 @@ func writeMainImage(bw *bitWriter, w, h int, p *params, c refsCandidate, sc *scr
 		bw.putBits(0, 1)
 	}
 	hb := p.histoBits
-	sc.clus.interrupt = p.interrupt
+	sc.clus.interrupt, sc.clus.crew = p.interrupt, &sc.crew
 	ng := sc.clus.buildHistoImage(w, h, c.refs, p.quality, p.lowEffort, hb, c.cacheBits, &sc.out, p.remapHelpers())
-	sc.clus.interrupt = nil
+	sc.clus.interrupt, sc.clus.crew = nil, nil
 	if p.interrupted() {
 		return
 	}

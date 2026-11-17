@@ -661,9 +661,18 @@ func (ps *predSearch) runPar(modes []uint32, helpers int) int {
 		}
 	}
 	batchTiles := func(b int) int { return min(batch, nt-b*batch) }
-	parallel(batchTiles(0), helpers, func(worker int, claim func() (int, bool)) {
-		compute(0, worker, claim)
-	})
+	// The caller chooses the modes of batch cur-1 (if any) while the
+	// helpers compute batch cur (into the other buffer), then joins them.
+	// (One closure for all the batches: the stages run on the crew of the
+	// scratch.)
+	cur := 0
+	stage := func(worker int, claim func() (int, bool)) {
+		if worker == 0 && cur > 0 {
+			consume(cur - 1)
+		}
+		compute(cur, worker, claim)
+	}
+	sc.crew.run(batchTiles(0), helpers, stage)
 	for b := 0; b < nb; b++ {
 		if sc.interrupted() {
 			break // the caller reports the interruption (modes are incomplete)
@@ -672,14 +681,8 @@ func (ps *predSearch) runPar(modes []uint32, helpers int) int {
 			consume(b)
 			break
 		}
-		// The caller chooses the modes of batch b while the helpers
-		// compute batch b+1 (into the other buffer), then joins them.
-		parallel(batchTiles(b+1), helpers, func(worker int, claim func() (int, bool)) {
-			if worker == 0 {
-				consume(b)
-			}
-			compute(b+1, worker, claim)
-		})
+		cur = b + 1
+		sc.crew.run(batchTiles(cur), helpers, stage)
 	}
 	return ps.finish(modes)
 }
