@@ -102,6 +102,12 @@ type decoder struct {
 	inTail  bool     // the 8-bit path switched to the tail bit reader
 	tr      tailReader
 
+	// Palette images decoded as bytes (idx8.go).
+	idx8   bool   // the level-0 pixels are the index bytes in d.ib
+	idxARB uint32 // alpha, red and blue of every level-0 pixel
+	cache8 *[1 << maxCacheBits]uint16
+	hash8  [256]uint16 // color cache slot of each index
+
 	useThreads bool       // Options.UseThreads
 	async      *asyncEmit // two-stage decode in progress (async.go)
 }
@@ -129,6 +135,7 @@ func getDecoder() *decoder {
 	d.md0 = metadata{}
 	d.buf = nil
 	d.use8b = false
+	d.idx8 = false
 	d.inTail = false
 	d.palReady = false
 	d.premulPal = false
@@ -461,13 +468,32 @@ func (d *decoder) decodeLevel0(w, h int) error {
 			d.premulPal = true
 		}
 	}
-	d.initBuffer32()
+	if arb, ok := d.idx8ARB(); ok {
+		d.initIdx8(arb)
+	} else {
+		d.initBuffer32()
+	}
 	if d.startAsync() {
 		// Stop the helper on every path; after a normal return finishAsync
 		// already did, and this is a no-op.
 		defer d.abortAsync()
-		err := d.decodePixels(&d.md0, d.buf, d.xsize, h, true, d.sliding, d.window, &d.px)
-		return d.finishAsync(d.buf, d.px.base, err)
+		return d.finishAsync(d.decodeLevel0Pixels(h))
+	}
+	return d.decodeLevel0Pixels(h)
+}
+
+// decodeLevel0Pixels decodes the level-0 pixels of an image of height h,
+// as index bytes when d.idx8 is set (switching to 32 bits if the stream
+// requires it, see idx8.go).
+func (d *decoder) decodeLevel0Pixels(h int) error {
+	if d.idx8 {
+		err := d.decodeIdx8(&d.md0, d.ib, d.xsize, h, d.sliding, d.window, &d.px)
+		if err != errWiden {
+			return err
+		}
+		if err := d.widenIdx8(); err != nil {
+			return err
+		}
 	}
 	return d.decodePixels(&d.md0, d.buf, d.xsize, h, true, d.sliding, d.window, &d.px)
 }
