@@ -320,6 +320,7 @@ type scaleSink struct {
 	base
 	flip    bool
 	premult bool
+	preDone bool // rows arrive premultiplied (see PremultipliedSink)
 	rs      resample.Rescaler
 	yuv     yuvScaler // YUV-domain path, see YUVSink
 }
@@ -339,7 +340,7 @@ func (s *scaleSink) Commit(y, n int) error {
 	for r := from; r < to; r++ {
 		o := (r-y)*s.srcStride + s.left4
 		row := src[o : o+s.w4]
-		if s.premult {
+		if s.premult && !s.preDone {
 			resample.PremultiplyRGBA(row)
 		}
 		s.rs.ImportRow(row)

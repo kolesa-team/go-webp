@@ -2,10 +2,14 @@ package vp8l
 
 import (
 	"image"
+	"image/draw"
+	"image/jpeg"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/kolesa-team/go-webp/v2/internal/pipeline"
+	"github.com/kolesa-team/go-webp/v2/internal/vp8lenc"
 )
 
 func benchDecode(b *testing.B, path string) {
@@ -13,7 +17,43 @@ func benchDecode(b *testing.B, path string) {
 	if err != nil {
 		b.Skip(err)
 	}
-	payload := findChunk(file, "VP8L")
+	benchDecodePayload(b, findChunk(file, "VP8L"))
+}
+
+// photoPayload is test_data/images/source.jpg (960x1280) encoded losslessly
+// (predictor, cross-color and subtract-green transforms, 10-bit color
+// cache), built once.
+var photoPayload = sync.OnceValues(func() ([]byte, error) {
+	f, err := os.Open("../../test_data/images/source.jpg")
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	src, err := jpeg.Decode(f)
+	if err != nil {
+		return nil, err
+	}
+	img := image.NewNRGBA(src.Bounds())
+	draw.Draw(img, img.Rect, src, src.Bounds().Min, draw.Src)
+	file, err := vp8lenc.Encode(img, &vp8lenc.Config{Quality: 75, Method: 4})
+	if err != nil {
+		return nil, err
+	}
+	if p := findChunk(file, "VP8L"); p != nil {
+		return p, nil
+	}
+	return file, nil
+})
+
+func BenchmarkDecodePhoto(b *testing.B) {
+	payload, err := photoPayload()
+	if err != nil {
+		b.Skip(err)
+	}
+	benchDecodePayload(b, payload)
+}
+
+func benchDecodePayload(b *testing.B, payload []byte) {
 	w, h, _, err := DecodeHeader(payload)
 	if err != nil {
 		b.Fatal(err)
