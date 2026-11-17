@@ -334,6 +334,13 @@ type lazyAlpha struct {
 	plane   []byte             // rows [0, rows) are final
 	rows    int
 	err     error
+
+	// helperOK lets the first get start a helper goroutine (UseThreads);
+	// while async is set the helper owns dec, pp, spare, plane and rows,
+	// and get reads the published rows from hp.
+	helperOK bool
+	async    bool
+	hp       *alphaHelper
 }
 
 // newLazyAlpha returns the alpha decoder of a w x h frame whose output
@@ -351,6 +358,9 @@ func newLazyAlpha(alph []byte, w, h int, crop image.Rectangle, c *Config) *lazyA
 		// pool. An error is kept for the first get, which keeps the VP8
 		// errors that come before the first emitted row first.
 		a.start()
+		// The first get may hand the plane to a helper goroutine
+		// (alpha_helper.go).
+		a.helperOK = true
 	}
 	return a
 }
@@ -367,8 +377,17 @@ func (a *lazyAlpha) get(rowEnd int) ([]byte, error) {
 		}
 	}
 	rowEnd = min(rowEnd, a.h)
+	if a.async {
+		return a.getAsync(rowEnd)
+	}
 	if rowEnd <= a.rows {
 		return a.plane, nil
+	}
+	if a.helperOK {
+		a.helperOK = false
+		if a.useHelper() && a.startHelper() {
+			return a.getAsync(rowEnd)
+		}
 	}
 	if a.hdr.PreProcessing == alpha.PreprocessingLevels && a.dithering > 0 {
 		rowEnd = a.h // dequantization smooths the whole plane at once
@@ -494,6 +513,7 @@ func (a *lazyAlpha) prefetch() {
 }
 
 func (a *lazyAlpha) release() {
+	a.stopHelper()
 	if a.spare != nil {
 		planePool.Put(a.spare)
 		a.spare = nil
