@@ -126,6 +126,12 @@ func (r *residual) setCoeffs(c *[16]int16) {
 	r.last = lastNonZero(c)
 }
 
+// setCoeffsInfo is setCoeffs with the levelInfoOf summary of c known.
+func (r *residual) setCoeffsInfo(c *[16]int16, info uint16) {
+	r.coeffs = c
+	r.last = infoLast(info)
+}
+
 // lastNonZero returns the index of the last non-zero coefficient, or -1.
 func lastNonZero(c *[16]int16) int {
 	n := 15
@@ -165,27 +171,33 @@ func (p *encProba) residualCost(ctx0 int, res *residual) int {
 	}
 	t := &costs[n][ctx0]
 	coeffs := res.coeffs
-	for ; n < res.last; n++ {
-		v := abs16(coeffs[n&15])
-		cost += levelCost(t, v)
-		ctx := v
-		if ctx > 2 {
-			ctx = 2
-		}
-		t = &costs[encBands[n+1]][ctx]
+	last := res.last
+	// The signs, magnitudes and contexts of the levels are data dependent:
+	// select with min() and masks rather than branch (levelCost, with the
+	// variable part clamped at maxVariableLevel, and ctx = min(level, 2)).
+	for ; n < last; n++ {
+		v := absLevel(coeffs[n&15])
+		cost += int(levelFixedCosts[v&maxLevel]) + int(t[min(v, maxVariableLevel)])
+		t = &costs[encBands[(n+1)&15]&7][min(v, 2)]
 	}
 	// Last coefficient is always non-zero
-	v := abs16(coeffs[n&15])
-	cost += levelCost(t, v)
+	v := absLevel(coeffs[n&15])
+	cost += int(levelFixedCosts[v&maxLevel]) + int(t[min(v, maxVariableLevel)])
 	if n < 15 {
-		b := encBands[n+1]
 		ctx := 2
 		if v == 1 {
 			ctx = 1
 		}
-		cost += bitCost(0, prob[b][ctx][0])
+		cost += bitCost(0, prob[encBands[n+1]&7][ctx][0])
 	}
 	return cost
+}
+
+// absLevel returns |v| (at most 32768) without a data-dependent branch.
+func absLevel(v int16) uint {
+	a := int32(v)
+	m := a >> 31
+	return uint((a ^ m) - m)
 }
 
 // recordStats records a bit event in the 16b+16b stats counter.

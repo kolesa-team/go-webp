@@ -204,7 +204,15 @@ func TestTrellisExact(t *testing.T) {
 		}
 		outGot = outRef
 		nzRef := it.trellisQuantizeBlockRef(&inRef, &outRef, ctx0, coeffType, &mtx, lambda)
-		nzGot := it.trellisQuantizeBlock(&inGot, &outGot, ctx0, coeffType, &mtx, lambda)
+		info := it.trellisQuantizeBlock(&inGot, &outGot, ctx0, coeffType, &mtx, lambda)
+		nzGot := info != 0
+		outDC := outGot
+		if coeffType == typeI16AC {
+			outDC[0] = 0 // the caller clears the DC position
+		}
+		if want := levelInfoOf(&outDC); info != want {
+			t.Fatalf("iter %d: level summary %#x, want %#x for %v", iter, info, want, outDC)
+		}
 		if nzRef != nzGot || inRef != inGot || outRef != outGot {
 			t.Fatalf("iter %d (q %d type %d ctx %d lambda %d, in %v): got %v %v %v, want %v %v %v",
 				iter, q, coeffType, ctx0, lambda, in, nzGot, inGot, outGot, nzRef, inRef, outRef)

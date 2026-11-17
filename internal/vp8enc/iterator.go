@@ -51,6 +51,8 @@ type iterator struct {
 	tmpLevels [1][16]int16
 	i4Levels  [16][16]int16
 	srcTT     [16]int32 // texture transform of the source luma blocks
+	tt16      [16]int32 // texture transform of a reconstructed macroblock
+	i4m       i4Modes   // the 10 intra4 candidates of the current sub-block
 	rdTmp     modeScore
 	rdUV      modeScore
 	rd        modeScore
