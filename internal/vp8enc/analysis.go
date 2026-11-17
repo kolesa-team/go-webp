@@ -295,11 +295,16 @@ func (e *encoder) analyze() {
 		e.uvAlpha = 0
 		return
 	}
+	e.analyzeInBands(e.analysisBands())
+}
+
+// analyzeInBands runs the analysis pass in nb (1..min(maxAnalysisBands,
+// mbH)) row bands and merges their results.
+func (e *encoder) analyzeInBands(nb int) {
 	totalMB := e.mbH * e.mbW
 	it := &e.it
 	it.init(e)
 	it.analysis = true
-	nb := e.analysisBands()
 	if nb == 1 {
 		job := &e.bands[0]
 		job.startRow, job.nRows = 0, e.mbH

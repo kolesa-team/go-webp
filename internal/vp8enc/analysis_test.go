@@ -91,6 +91,46 @@ func TestAnalysisBandsIdentical(t *testing.T) {
 	}
 }
 
+// FuzzAnalysisBands forces every band count on small pictures (bands of a
+// single macroblock row, uneven bands, more helpers than bands) and checks
+// that the analysis decides what the single-band pass decides.
+func FuzzAnalysisBands(f *testing.F) {
+	f.Add(uint8(15), uint8(120), uint8(7), uint8(4), uint8(3), uint8(1), []byte{1, 2, 3})
+	f.Add(uint8(0), uint8(0), uint8(0), uint8(0), uint8(0), uint8(0), []byte{})
+	f.Add(uint8(70), uint8(255), uint8(1), uint8(0), uint8(9), uint8(3), []byte{255, 0, 17})
+	f.Fuzz(func(t *testing.T, w8, h8, nb8, m8, limit8, seg8 uint8, pix []byte) {
+		w, h := 1+int(w8)%80, 1+int(h8)%160
+		mbH := (h + 15) >> 4
+		nb := 1 + int(nb8)%min(maxAnalysisBands, mbH)
+		if len(pix) == 0 {
+			pix = []byte{w8 ^ h8}
+		}
+		img := image.NewNRGBA(image.Rect(0, 0, w, h))
+		for i := range img.Pix {
+			img.Pix[i] = pix[i%len(pix)] + uint8(i*7>>5)
+		}
+		cfg := DefaultConfig()
+		cfg.Method = int(m8) % 7
+		cfg.Segments = 1 + int(seg8)%4
+		cfg.EmulateJPEGSize = seg8&0x80 != 0
+		analyzeWith := func(nb int) analysisResult {
+			pic := FromNRGBA(img, false, false)
+			defer pic.Release()
+			e := new(encoder)
+			e.setup(pic, &cfg)
+			e.analyzeInBands(nb)
+			return analysisResult{slices.Clone(e.mbInfo), slices.Clone(e.preds), e.alpha, e.uvAlpha, e.dqm}
+		}
+		want := analyzeWith(1)
+		defer workers.SetLimitForTest(workers.SetLimitForTest(1 + int(limit8)%9))
+		got := analyzeWith(nb)
+		if !slices.Equal(got.mbInfo, want.mbInfo) || !bytes.Equal(got.preds, want.preds) ||
+			got.alpha != want.alpha || got.uvAlpha != want.uvAlpha || got.dqm != want.dqm {
+			t.Fatalf("%dx%d m%d, %d bands: analysis differs from the single-band pass", w, h, cfg.Method, nb)
+		}
+	})
+}
+
 func TestAnalysisBandsCount(t *testing.T) {
 	for _, tc := range []struct {
 		w, h, method, want int
