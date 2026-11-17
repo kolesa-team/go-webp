@@ -215,7 +215,7 @@ func (d *Decoder) decodeLossless(parsed *container.Image) (*image.NRGBA, error) 
 	if err != nil {
 		return nil, err
 	}
-	if err := vp8l.Decode(parsed.VP8L, sink); err != nil {
+	if err := vp8l.DecodeWithOptions(parsed.VP8L, sink, &vp8l.Options{UseThreads: c.UseThreads}); err != nil {
 		return nil, err
 	}
 	return result(), nil
