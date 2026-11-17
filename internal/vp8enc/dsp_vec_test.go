@@ -927,3 +927,50 @@ func BenchmarkPredictors(b *testing.B) {
 		}
 	})
 }
+
+// TestQuantizeBlocksLimits quantizes every int16 value in every coefficient
+// position with matrices at the limits the vector quantizer accepts
+// (iq = 2^16-1, sharpen = 2^15-1, so |coeff|+sharpen reaches 65535 and the
+// 32-bit product plus bias wraps) and just past them (Go fallback), with
+// steps whose low 16 bits wrap the dequantized value.
+func TestQuantizeBlocksLimits(t *testing.T) {
+	var ms []matrix
+	for _, iq := range []uint32{0, 1, 0x7fff, 0xffff, 0x10000} {
+		for _, sh := range []uint32{0, 1, 0x7fff, 0x8000} {
+			for _, bias := range []uint32{0, 1<<17 - 1, 0xffffffff} {
+				var m matrix
+				for j := range m.q {
+					m.q[j] = [5]uint32{1, 3, 0xffff, 0x10001, 0xfffffff}[j%5]
+					m.iq[j] = iq
+					m.sharpen[j] = sh
+					m.bias[j] = bias - uint32(j)*0x1000
+				}
+				m.prepareVec()
+				ms = append(ms, m)
+			}
+		}
+	}
+	step := 1
+	if testing.Short() {
+		step = 7
+	}
+	var in, inRef, out, outRef [32][16]int16
+	var info, infoRef [32]uint16
+	for mi := range ms {
+		m := &ms[mi]
+		for v := 0; v < 1<<16; v += 32 * step {
+			for b := range in {
+				for j := range in[b] {
+					in[b][j] = int16(v + b*step + j*4099)
+				}
+			}
+			inRef = in
+			nz := quantizeBlocks(in[:], out[:], m, info[:])
+			nzRef := quantizeBlocksRef(inRef[:], outRef[:], m, infoRef[:])
+			if nz != nzRef || in != inRef || out != outRef || info != infoRef {
+				t.Fatalf("matrix %d (iq %#x sharpen %#x bias %#x vecOK %v), v %d: results differ",
+					mi, m.iq[0], m.sharpen[0], m.bias[0], m.vecOK, v)
+			}
+		}
+	}
+}
