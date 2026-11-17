@@ -45,17 +45,43 @@ func TestPaletteInPlace(t *testing.T) {
 	}
 }
 
-// TestRefsCapEstimate checks initRefsCap against its definition and that
-// applyPalette returns initRefsCap of the bundled image.
+// TestRefsCapEstimate checks initRefsCap against its definition (on the
+// sampled rows) and that applyPalette returns the estimate of the bundled
+// image on all its rows.
 func TestRefsCapEstimate(t *testing.T) {
+	newPixel := func(argb []uint32, w, i int) bool {
+		return i == 0 || argb[i] != argb[i-1] && (i < w || argb[i] != argb[i-w])
+	}
 	ref := func(argb []uint32, w, h int) int {
 		n := w * h
 		if n <= 4096 {
 			return n
 		}
-		est := 1
-		for i := 1; i < n; i++ {
-			if argb[i] != argb[i-1] && (i < w || argb[i] != argb[i-w]) {
+		est := 0
+		for i := 0; i < n; i++ {
+			if newPixel(argb, w, i) {
+				est++
+			}
+		}
+		return min(n, est+est/2+4096)
+	}
+	sampled := func(argb []uint32, w, h int) int {
+		n := w * h
+		if n <= 4096 || h < rleSampleMinRows {
+			return ref(argb, w, h)
+		}
+		est, rows := 0, 0
+		for y := rleSampleStep; y < h; y += rleSampleStep {
+			for i := y * w; i < (y+1)*w; i++ {
+				if newPixel(argb, w, i) {
+					est++
+				}
+			}
+			rows++
+		}
+		est = est * (h - 1) / rows
+		for i := 0; i < w; i++ {
+			if newPixel(argb, w, i) {
 				est++
 			}
 		}
@@ -80,8 +106,11 @@ func TestRefsCapEstimate(t *testing.T) {
 					argb[i] = pal[rng.Intn(colors)]
 				}
 			}
-			if got, want := initRefsCap(argb, w, h), ref(argb, w, h); got != want {
+			if got, want := initRefsCap(argb, w, h), sampled(argb, w, h); got != want {
 				t.Fatalf("%dx%d: initRefsCap %d, want %d", w, h, got, want)
+			}
+			if got, all := initRefsCap(argb, w, h), ref(argb, w, h); got < all-all/10 || got > all+all/10 {
+				t.Errorf("%dx%d: initRefsCap %d, %d from all the rows", w, h, got, all)
 			}
 			palette := collectPalette(argb, nil)
 			pw := subSampleSize(w, paletteXBits(len(palette)))

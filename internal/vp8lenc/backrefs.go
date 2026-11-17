@@ -32,16 +32,28 @@ func mkCopy(dist uint32, l int) pixOrCopy { return pixOrCopy{dist, uint32(l)<<2 
 // sized from a cheap estimate: the number of pixels that differ from both
 // their left and top neighbors (each such pixel starts a literal or a
 // copy), with 50% headroom. Photos thus get one allocation of about n
-// entries, flat images a small one; growRefs covers underestimates.
+// entries, flat images a small one; growRefs covers underestimates. The
+// pixels are counted in every rleSampleStep-th row only (all rows below
+// rleSampleMinRows): a full pass took 3% of a level 0 encode.
 func initRefsCap(argb []uint32, w, h int) int {
 	n := w * h
 	if n <= 4096 {
 		return n
 	}
-	est := 1 + newPixels(argb[1:w], nil, argb[0])
-	for y := 1; y < h; y++ {
-		est += newPixels(argb[y*w:(y+1)*w], argb[(y-1)*w:y*w], argb[y*w-1])
+	step := 1
+	if h >= rleSampleMinRows {
+		step = rleSampleStep
 	}
+	// (The first row, which has no row above, is counted apart.)
+	est, rows := 0, 0
+	for y := step; y < h; y += step {
+		est += newPixels(argb[y*w:(y+1)*w], argb[(y-1)*w:y*w], argb[y*w-1])
+		rows++
+	}
+	if step > 1 {
+		est = int(int64(est) * int64(h-1) / int64(rows))
+	}
+	est += 1 + newPixels(argb[1:w], nil, argb[0])
 	return refsCapFromEstimate(n, est)
 }
 
@@ -132,10 +144,11 @@ func backwardRefsLz77(n int, argb []uint32, hc *hashChain, refs []pixOrCopy) []p
 	return refs
 }
 
-// rleSampleStep is the row sampling of rleRefsEstimate for images of at
-// least rleSampleMinRows rows.
+// rleSampleStep is the row sampling of the estimates of the parse sizes
+// (initRefsCap, rleRefsEstimate) for images of at least rleSampleMinRows
+// rows.
 const (
-	rleSampleStep    = 8
+	rleSampleStep    = 16
 	rleSampleMinRows = 64
 )
 
@@ -152,12 +165,13 @@ func rleRefsEstimate(argb []uint32, w, h int) int {
 	if h < rleSampleMinRows {
 		return rleEntries(argb, w, 0, n)
 	}
+	// (The first row, which has no row above, is counted apart.)
 	count, rows := 0, 0
-	for y := 0; y < h; y += rleSampleStep {
+	for y := rleSampleStep; y < h; y += rleSampleStep {
 		count += rleEntries(argb, w, y*w, (y+1)*w)
 		rows++
 	}
-	return int(int64(count) * int64(h) / int64(rows))
+	return rleEntries(argb, w, 0, w) + int(int64(count)*int64(h-1)/int64(rows))
 }
 
 // rleEntries returns the number of entries of backwardRefsRle that start
