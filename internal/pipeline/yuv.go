@@ -218,7 +218,25 @@ func (s *scaleSink) exportYUV() {
 		dy = h - 1 - dy
 	}
 	out := dst.Pix[dy*dst.Stride : dy*dst.Stride+w*4]
-	yr, ur, vr := q.rowY[:w], q.rowU[:w], q.rowV[:w]
+	var ar []byte
+	if q.hasAlpha {
+		q.ra.ExportRow(q.rowA)
+		ar = q.rowA[:w]
+	}
+	yuvToRGBARow(q.rowY[:w], q.rowU[:w], q.rowV[:w], ar, out)
+}
+
+// yuvToRGBARowGo converts full resolution Y, U and V rows to RGBA
+// (libwebp's VP8YuvToRgba) into out[:4*len(yr)]. ar holds the alpha
+// values, or is nil for opaque output. This is the portable reference;
+// yuvToRGBARow (yuv_arm64.go, yuv_generic.go) is the entry point.
+func yuvToRGBARowGo(yr, ur, vr, ar, out []byte) {
+	w := len(yr)
+	ur, vr = ur[:w], vr[:w]
+	out = out[:4*w]
+	if ar != nil {
+		ar = ar[:w]
+	}
 	for x := range yr {
 		o := out[x*4 : x*4+4 : x*4+4]
 		yy, uu, vv := int(yr[x]), int(ur[x]), int(vr[x])
@@ -227,11 +245,8 @@ func (s *scaleSink) exportYUV() {
 		o[1] = clip8YUV(yh - (uu*6419)>>8 - (vv*13320)>>8 + 8708)
 		o[2] = clip8YUV(yh + (uu*33050)>>8 - 17685)
 		o[3] = 255
-	}
-	if q.hasAlpha {
-		q.ra.ExportRow(q.rowA)
-		for x, av := range q.rowA[:w] {
-			out[x*4+3] = av
+		if ar != nil {
+			o[3] = ar[x]
 		}
 	}
 }
