@@ -1,5 +1,7 @@
 package vp8enc
 
+import "encoding/binary"
+
 // DSP primitives: transforms, intra predictors, distortion metrics and
 // quantization. All blocks live in 32-byte-stride work buffers.
 // Algorithm adapted from libwebp (BSD-3-Clause).
@@ -231,11 +233,16 @@ func iTransform(ref []byte, in *[16]int16, dst []byte) {
 //------------------------------------------------------------------------------
 // Intra predictions
 
+// splat8 returns v in each byte of a uint64.
+func splat8(v byte) uint64 { return uint64(v) * 0x0101010101010101 }
+
+// fill sets a size x size block (size 8 or 16) to v, 8 bytes per store.
 func fill(dst []byte, v byte, size int) {
+	w := splat8(v)
 	for j := 0; j < size; j++ {
 		row := dst[j*bps : j*bps+size]
-		for i := range row {
-			row[i] = v
+		for i := 0; i < len(row); i += 8 {
+			binary.LittleEndian.PutUint64(row[i:], w)
 		}
 	}
 }
@@ -250,7 +257,8 @@ func verticalPred(dst []byte, top []byte, size int) {
 	}
 }
 
-// left[0] is the top-left sample, left[1..size] the left column.
+// left[0] is the top-left sample, left[1..size] the left column (size 8
+// or 16).
 func horizontalPred(dst []byte, left []byte, size int) {
 	if left == nil {
 		fill(dst, 129, size)
@@ -258,9 +266,9 @@ func horizontalPred(dst []byte, left []byte, size int) {
 	}
 	for j := 0; j < size; j++ {
 		row := dst[j*bps : j*bps+size]
-		v := left[1+j]
-		for i := range row {
-			row[i] = v
+		w := splat8(left[1+j])
+		for i := 0; i < len(row); i += 8 {
+			binary.LittleEndian.PutUint64(row[i:], w)
 		}
 	}
 }
