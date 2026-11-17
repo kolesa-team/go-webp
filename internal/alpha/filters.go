@@ -63,16 +63,20 @@ func UnfilterRow(filter int, prev, in, out []byte) {
 	out = out[:width]
 	switch filter {
 	case FilterHorizontal:
-		horizontalUnfilter(prev, in, out)
+		var pred byte
+		if prev != nil {
+			pred = prev[0]
+		}
+		unfilterHorizontal(pred, in, out)
 	case FilterVertical:
 		if prev == nil {
-			horizontalUnfilter(nil, in, out)
+			unfilterHorizontal(0, in, out)
 		} else {
-			addBytes(out, prev, in, width)
+			unfilterVertical(prev, in, out)
 		}
 	case FilterGradient:
 		if prev == nil {
-			horizontalUnfilter(nil, in, out)
+			unfilterHorizontal(0, in, out)
 		} else {
 			gradientUnfilter(prev[:width], in, out)
 		}
@@ -83,16 +87,22 @@ func UnfilterRow(filter int, prev, in, out []byte) {
 	}
 }
 
-func horizontalUnfilter(prev, in, out []byte) {
+// unfilterHorizontalGo is the reference of unfilterHorizontal
+// (unfilter_*.go): out[i] = pred + in[0] + ... + in[i] (mod 256), libwebp's
+// HorizontalUnfilter_C with pred the left prediction of the first pixel.
+// in may alias out.
+func unfilterHorizontalGo(pred byte, in, out []byte) {
 	out = out[:len(in)]
-	var pred byte
-	if prev != nil {
-		pred = prev[0]
-	}
 	for i, v := range in {
 		pred += v
 		out[i] = pred
 	}
+}
+
+// unfilterVerticalGo is the reference of unfilterVertical (unfilter_*.go):
+// out[i] = prev[i] + in[i] (mod 256) for i < len(in). in may alias out.
+func unfilterVerticalGo(prev, in, out []byte) {
+	addBytes(out, prev, in, len(in))
 }
 
 func gradientUnfilter(prev, in, out []byte) {
