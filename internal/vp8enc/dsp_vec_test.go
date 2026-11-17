@@ -1,0 +1,481 @@
+package vp8enc
+
+import (
+	"math/rand"
+	"testing"
+)
+
+// Differential tests of the batched DSP entry points (assembly on arm64,
+// the reference loops elsewhere) against the reference implementations of
+// dsp_batch.go, which are built on the single-block Go code of dsp.go.
+
+var vecTables = []struct {
+	name string
+	t    *pairTable
+}{
+	{"Y16", &tabY16}, {"UV", &tabUV}, {"I4Src", &tabI4Src}, {"I4Rec", &tabI4Rec},
+}
+
+// fillPixels fills b with a random pattern: uniform noise, extremes only,
+// or a narrow range around a random level (small residuals).
+func fillPixels(rng *rand.Rand, b []byte) {
+	switch rng.Intn(4) {
+	case 0:
+		for i := range b {
+			b[i] = byte(rng.Intn(256))
+		}
+	case 1:
+		for i := range b {
+			b[i] = byte(rng.Intn(2) * 255)
+		}
+	default:
+		base := rng.Intn(256)
+		spread := 1 + rng.Intn(16)
+		for i := range b {
+			b[i] = byte(min(max(base+rng.Intn(2*spread+1)-spread, 0), 255))
+		}
+	}
+}
+
+// fillCoeffs fills c with coefficients of a random magnitude class,
+// including the int16 extremes and DC-only blocks.
+func fillCoeffs(rng *rand.Rand, c []int16) {
+	scale := []int{2, 16, 300, 2400, 16384, 32768}[rng.Intn(6)]
+	dcOnly := rng.Intn(5) == 0
+	for i := range c {
+		switch {
+		case dcOnly && i%16 != 0:
+			c[i] = 0
+		case rng.Intn(4) == 0:
+			c[i] = 0
+		default:
+			c[i] = int16(rng.Intn(2*scale) - scale)
+		}
+		if rng.Intn(200) == 0 {
+			c[i] = [3]int16{-32768, 32767, -32767}[rng.Intn(3)]
+		}
+	}
+}
+
+func vecIters(t *testing.T, n int) int {
+	if testing.Short() {
+		return n / 10
+	}
+	return n
+}
+
+func TestFTransformPairsExact(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	src := make([]byte, 16*bps)
+	ref := make([]byte, 16*bps)
+	var got, want [16][16]int16
+	for iter := 0; iter < vecIters(t, 30000); iter++ {
+		fillPixels(rng, src)
+		fillPixels(rng, ref)
+		for _, tc := range vecTables {
+			fTransformPairs(src, ref, tc.t, got[:])
+			fTransformPairsRef(src, ref, tc.t, want[:])
+			if got != want {
+				t.Fatalf("%s iter %d: got %v, want %v", tc.name, iter, got, want)
+			}
+		}
+	}
+}
+
+// TestFTransformExtremes runs every block pair made of the corner values
+// 0 and 255 (2^16 src/ref sign patterns per 4x4 block for the largest
+// coefficients).
+func TestFTransformExtremes(t *testing.T) {
+	src := make([]byte, 16*bps)
+	ref := make([]byte, 16*bps)
+	var got, want [16][16]int16
+	tab := newPairTable([2]uint16{0, 0})
+	step := 1
+	if testing.Short() {
+		step = 7
+	}
+	for p := 0; p < 1<<16; p += step {
+		for i := 0; i < 16; i++ {
+			v := byte(0)
+			if p>>i&1 != 0 {
+				v = 255
+			}
+			src[(i>>2)*bps+i&3] = v
+			ref[(i>>2)*bps+i&3] = 255 - v
+			src[(i>>2)*bps+4+i&3] = 255 - v
+			ref[(i>>2)*bps+4+i&3] = byte(p)
+		}
+		fTransformPairs(src, ref, &tab, got[:])
+		fTransformPairsRef(src, ref, &tab, want[:])
+		if got[0] != want[0] || got[1] != want[1] {
+			t.Fatalf("pattern %#x: got %v, want %v", p, got[:2], want[:2])
+		}
+	}
+}
+
+func TestITransformPairsExact(t *testing.T) {
+	rng := rand.New(rand.NewSource(2))
+	ref := make([]byte, 16*bps)
+	got := make([]byte, 16*bps)
+	want := make([]byte, 16*bps)
+	var in [16][16]int16
+	for iter := 0; iter < vecIters(t, 30000); iter++ {
+		fillPixels(rng, ref)
+		fillPixels(rng, got)
+		copy(want, got)
+		for b := range in {
+			fillCoeffs(rng, in[b][:])
+		}
+		for _, tc := range vecTables {
+			iTransformPairs(ref, in[:], got, tc.t)
+			iTransformPairsRef(ref, in[:], want, tc.t)
+			if string(got) != string(want) {
+				t.Fatalf("%s iter %d: in %v\ngot  %v\nwant %v", tc.name, iter, in, got, want)
+			}
+		}
+	}
+}
+
+// testMatrices returns the quantizer matrices of every quality index and
+// coefficient type, plus some random ones (with vecOK both set and not).
+func testMatrices(rng *rand.Rand) []matrix {
+	var ms []matrix
+	for q := 0; q < 128; q++ {
+		for typ := 0; typ < 3; typ++ {
+			var m matrix
+			switch typ {
+			case 0:
+				m.q[0], m.q[1] = uint32(kDcTable[q]), uint32(kAcTable[q])
+			case 1:
+				m.q[0], m.q[1] = uint32(kDcTable[q])*2, uint32(kAcTable2[q])
+			default:
+				m.q[0], m.q[1] = uint32(kDcTable[min(q, 117)]), uint32(kAcTable[q])
+			}
+			expandMatrix(&m, typ)
+			ms = append(ms, m)
+		}
+	}
+	for i := 0; i < 64; i++ {
+		var m matrix
+		for j := range m.q {
+			m.q[j] = uint32(1 + rng.Intn(1<<uint(1+rng.Intn(17))))
+			m.iq[j] = uint32(rng.Intn(1 << uint(1+rng.Intn(18))))
+			m.bias[j] = rng.Uint32() >> uint(rng.Intn(32))
+			m.sharpen[j] = uint32(rng.Intn(1 << uint(1+rng.Intn(16))))
+		}
+		m.prepareVec()
+		ms = append(ms, m)
+	}
+	return ms
+}
+
+func TestQuantizeBlocksExact(t *testing.T) {
+	rng := rand.New(rand.NewSource(3))
+	ms := testMatrices(rng)
+	var in, inRef, out, outRef [16][16]int16
+	for iter := 0; iter < vecIters(t, 20000); iter++ {
+		m := &ms[rng.Intn(len(ms))]
+		n := 1 + rng.Intn(16)
+		for b := 0; b < n; b++ {
+			fillCoeffs(rng, in[b][:])
+		}
+		inRef = in
+		for b := range out {
+			for i := range out[b] {
+				out[b][i] = int16(rng.Intn(65536))
+			}
+		}
+		outRef = out
+		nz := quantizeBlocks(in[:n], out[:], m)
+		nzRef := quantizeBlocksRef(inRef[:n], outRef[:], m)
+		if nz != nzRef || in != inRef || out != outRef {
+			t.Fatalf("iter %d (n %d, matrix %+v): nz %#x/%#x\nin  %v\nwant %v\nout %v\nwant %v",
+				iter, n, *m, nz, nzRef, in, inRef, out, outRef)
+		}
+	}
+}
+
+func TestTTransformAndSSEPairsExact(t *testing.T) {
+	rng := rand.New(rand.NewSource(4))
+	a := make([]byte, 16*bps)
+	b := make([]byte, 16*bps)
+	var got, want [16]int32
+	for iter := 0; iter < vecIters(t, 30000); iter++ {
+		fillPixels(rng, a)
+		fillPixels(rng, b)
+		for _, tc := range vecTables {
+			tTransformPairs(a, tc.t, got[:])
+			tTransformPairsRef(a, tc.t, want[:])
+			if got != want {
+				t.Fatalf("tTransform %s iter %d: got %v, want %v", tc.name, iter, got, want)
+			}
+			sse4x4Pairs(a, b, tc.t, got[:])
+			sse4x4PairsRef(a, b, tc.t, want[:])
+			if got != want {
+				t.Fatalf("sse4x4 %s iter %d: got %v, want %v", tc.name, iter, got, want)
+			}
+		}
+		if g, w := sse16x16(a, b), sse16x16Ref(a, b); g != w {
+			t.Fatalf("sse16x16 iter %d: got %d, want %d", iter, g, w)
+		}
+		if g, w := sse16x8(a[bps:], b[3*bps:]), sse16x8Ref(a[bps:], b[3*bps:]); g != w {
+			t.Fatalf("sse16x8 iter %d: got %d, want %d", iter, g, w)
+		}
+	}
+}
+
+// TestVecBounds checks that the wrappers reject buffers that are one byte
+// (or one block) too short instead of letting the kernels overrun them.
+func TestVecBounds(t *testing.T) {
+	mustPanic := func(name string, f func()) {
+		t.Helper()
+		defer func() {
+			if recover() == nil {
+				t.Errorf("%s: no panic on a short buffer", name)
+			}
+		}()
+		f()
+	}
+	for _, tc := range vecTables {
+		tab := tc.t
+		long0 := make([]byte, tab.need[0])
+		long1 := make([]byte, tab.need[1])
+		short0 := long0[:tab.need[0]-1]
+		short1 := long1[:tab.need[1]-1]
+		blocks := make([][16]int16, 2*tab.n)
+		res := make([]int32, 2*tab.n)
+		// exact sizes work
+		fTransformPairs(long0, long1, tab, blocks)
+		iTransformPairs(long0, blocks, long1, tab)
+		tTransformPairs(long0, tab, res)
+		sse4x4Pairs(long0, long1, tab, res)
+		mustPanic(tc.name+" fTransform src", func() { fTransformPairs(short0, long1, tab, blocks) })
+		mustPanic(tc.name+" fTransform ref", func() { fTransformPairs(long0, short1, tab, blocks) })
+		mustPanic(tc.name+" fTransform out", func() { fTransformPairs(long0, long1, tab, blocks[:len(blocks)-1]) })
+		mustPanic(tc.name+" iTransform ref", func() { iTransformPairs(short0, blocks, long1, tab) })
+		mustPanic(tc.name+" iTransform dst", func() { iTransformPairs(long0, blocks, short1, tab) })
+		mustPanic(tc.name+" iTransform in", func() { iTransformPairs(long0, blocks[:len(blocks)-1], long1, tab) })
+		mustPanic(tc.name+" tTransform", func() { tTransformPairs(short0, tab, res) })
+		mustPanic(tc.name+" tTransform out", func() { tTransformPairs(long0, tab, res[:len(res)-1]) })
+		mustPanic(tc.name+" sse4x4 a", func() { sse4x4Pairs(short0, long1, tab, res) })
+		mustPanic(tc.name+" sse4x4 b", func() { sse4x4Pairs(long0, short1, tab, res) })
+		mustPanic(tc.name+" sse4x4 out", func() { sse4x4Pairs(long0, long1, tab, res[:len(res)-1]) })
+	}
+	full := make([]byte, 15*bps+16)
+	mustPanic("sse16x16", func() { sse16x16(full, full[1:]) })
+	mustPanic("sse16x8", func() { sse16x8(full[:7*bps+15], full) })
+	var m matrix
+	m.q[0], m.q[1] = 8, 8
+	expandMatrix(&m, 0)
+	in := make([][16]int16, 4)
+	mustPanic("quantizeBlocks", func() { quantizeBlocks(in, in[:3], &m) })
+}
+
+// fuzzTable builds a pair table from fuzz bytes: up to 8 pairs at offsets
+// inside a 16x32 work buffer.
+func fuzzTable(data []byte) (pairTable, []byte) {
+	if len(data) < 1 {
+		return pairTable{}, data
+	}
+	n := int(data[0]) % 9
+	data = data[1:]
+	var offs [][2]uint16
+	for k := 0; k < n && len(data) >= 2; k++ {
+		// rows 0..12, columns 0..24
+		o0 := uint16(int(data[0])%13*bps + int(data[0]>>4)%25)
+		o1 := uint16(int(data[1])%13*bps + int(data[1]>>4)%25)
+		offs = append(offs, [2]uint16{o0, o1})
+		data = data[2:]
+	}
+	return newPairTable(offs...), data
+}
+
+func FuzzFTransformPairs(f *testing.F) {
+	f.Add([]byte{8, 0, 0, 8, 8, 1, 2, 3, 4}, []byte{1, 2, 3}, []byte{200, 7})
+	f.Add([]byte{5, 0, 0, 0, 4}, []byte{255, 0}, []byte{0, 255})
+	f.Fuzz(func(t *testing.T, tab, src, ref []byte) {
+		tbl, _ := fuzzTable(tab)
+		if len(src) == 0 || len(ref) == 0 {
+			return
+		}
+		a := make([]byte, tbl.need[0])
+		b := make([]byte, tbl.need[1])
+		for i := range a {
+			a[i] = src[i%len(src)] + byte(i/len(src))
+		}
+		for i := range b {
+			b[i] = ref[i%len(ref)] ^ byte(i/len(ref))
+		}
+		got := make([][16]int16, 2*tbl.n)
+		want := make([][16]int16, 2*tbl.n)
+		fTransformPairs(a, b, &tbl, got)
+		fTransformPairsRef(a, b, &tbl, want)
+		for i := range got {
+			if got[i] != want[i] {
+				t.Fatalf("block %d: got %v, want %v", i, got[i], want[i])
+			}
+		}
+	})
+}
+
+func FuzzITransformPairs(f *testing.F) {
+	f.Add([]byte{8, 0, 0, 8, 8}, []byte{1, 2, 3}, []byte{0x80, 0, 0xff, 0x7f})
+	f.Add([]byte{1, 0, 0}, []byte{255}, []byte{0, 0x80, 1, 2, 3, 4})
+	f.Fuzz(func(t *testing.T, tab, ref, coeffs []byte) {
+		tbl, _ := fuzzTable(tab)
+		if len(ref) == 0 || len(coeffs) < 2 {
+			return
+		}
+		r := make([]byte, tbl.need[0])
+		for i := range r {
+			r[i] = ref[i%len(ref)] + byte(i/len(ref))
+		}
+		in := make([][16]int16, 2*tbl.n)
+		for b := range in {
+			for i := range in[b] {
+				k := (b*16 + i) * 2 % (len(coeffs) - 1)
+				in[b][i] = int16(uint16(coeffs[k]) | uint16(coeffs[k+1])<<8)
+			}
+		}
+		got := make([]byte, tbl.need[1])
+		want := make([]byte, tbl.need[1])
+		for i := range got {
+			got[i] = byte(i)
+			want[i] = byte(i)
+		}
+		iTransformPairs(r, in, got, &tbl)
+		iTransformPairsRef(r, in, want, &tbl)
+		if string(got) != string(want) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	})
+}
+
+func FuzzQuantizeBlocks(f *testing.F) {
+	f.Add(uint8(40), uint8(0), []byte{1, 2, 3, 0x80, 0, 0xff, 0x7f})
+	f.Add(uint8(127), uint8(1), []byte{0xff, 0xff, 0, 0x80})
+	f.Add(uint8(0), uint8(2), []byte{0x10, 0x27})
+	f.Fuzz(func(t *testing.T, q, typ uint8, coeffs []byte) {
+		if len(coeffs) < 2 {
+			return
+		}
+		var m matrix
+		qi := int(q) % 128
+		switch typ % 3 {
+		case 0:
+			m.q[0], m.q[1] = uint32(kDcTable[qi]), uint32(kAcTable[qi])
+		case 1:
+			m.q[0], m.q[1] = uint32(kDcTable[qi])*2, uint32(kAcTable2[qi])
+		default:
+			m.q[0], m.q[1] = uint32(kDcTable[min(qi, 117)]), uint32(kAcTable[qi])
+		}
+		expandMatrix(&m, int(typ%3))
+		n := 1 + len(coeffs)/32%16
+		in := make([][16]int16, n)
+		for b := range in {
+			for i := range in[b] {
+				k := (b*16 + i) * 2 % (len(coeffs) - 1)
+				in[b][i] = int16(uint16(coeffs[k]) | uint16(coeffs[k+1])<<8)
+			}
+		}
+		inRef := append([][16]int16(nil), in...)
+		out := make([][16]int16, n)
+		outRef := make([][16]int16, n)
+		nz := quantizeBlocks(in, out, &m)
+		nzRef := quantizeBlocksRef(inRef, outRef, &m)
+		if nz != nzRef {
+			t.Fatalf("nz %#x, want %#x", nz, nzRef)
+		}
+		for b := range in {
+			if in[b] != inRef[b] || out[b] != outRef[b] {
+				t.Fatalf("block %d: %v %v, want %v %v", b, in[b], out[b], inRef[b], outRef[b])
+			}
+		}
+	})
+}
+
+func FuzzMetricPairs(f *testing.F) {
+	f.Add([]byte{8, 0, 0, 8, 8, 1, 2}, []byte{1, 2, 3}, []byte{200, 7})
+	f.Fuzz(func(t *testing.T, tab, pa, pb []byte) {
+		tbl, _ := fuzzTable(tab)
+		if len(pa) == 0 || len(pb) == 0 {
+			return
+		}
+		a := make([]byte, max(tbl.need[0], 15*bps+16))
+		b := make([]byte, max(tbl.need[1], 15*bps+16))
+		for i := range a {
+			a[i] = pa[i%len(pa)] + byte(i/len(pa))
+		}
+		for i := range b {
+			b[i] = pb[i%len(pb)] ^ byte(i/len(pb))
+		}
+		got := make([]int32, 2*tbl.n)
+		want := make([]int32, 2*tbl.n)
+		tTransformPairs(a, &tbl, got)
+		tTransformPairsRef(a, &tbl, want)
+		for i := range got {
+			if got[i] != want[i] {
+				t.Fatalf("tTransform %d: got %d, want %d", i, got[i], want[i])
+			}
+		}
+		sse4x4Pairs(a, b, &tbl, got)
+		sse4x4PairsRef(a, b, &tbl, want)
+		for i := range got {
+			if got[i] != want[i] {
+				t.Fatalf("sse4x4 %d: got %d, want %d", i, got[i], want[i])
+			}
+		}
+		if g, w := sse16x16(a, b), sse16x16Ref(a, b); g != w {
+			t.Fatalf("sse16x16: got %d, want %d", g, w)
+		}
+		if g, w := sse16x8(a, b), sse16x8Ref(a, b); g != w {
+			t.Fatalf("sse16x8: got %d, want %d", g, w)
+		}
+	})
+}
+
+// Kernel benchmarks: the entry point (assembly on arm64) against the Go
+// reference, on a whole macroblock (Y16) or the 10 intra4 modes (I4).
+func BenchmarkVecKernels(b *testing.B) {
+	rng := rand.New(rand.NewSource(5))
+	src := make([]byte, 16*bps)
+	ref := make([]byte, 16*bps)
+	dst := make([]byte, 16*bps)
+	fillPixels(rng, src)
+	fillPixels(rng, ref)
+	var coeffs, levels [16][16]int16
+	var res [16]int32
+	var m matrix
+	m.q[0], m.q[1] = uint32(kDcTable[40]), uint32(kAcTable[40])
+	expandMatrix(&m, 0)
+	fTransformPairsRef(src, ref, &tabY16, coeffs[:])
+	run := func(name string, f func()) {
+		b.Run(name, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				f()
+			}
+		})
+	}
+	run("FTransformY16/vec", func() { fTransformPairs(src, ref, &tabY16, coeffs[:]) })
+	run("FTransformY16/go", func() { fTransformPairsRef(src, ref, &tabY16, coeffs[:]) })
+	run("FTransformI4/vec", func() { fTransformPairs(src, ref, &tabI4Src, coeffs[:]) })
+	run("FTransformI4/go", func() { fTransformPairsRef(src, ref, &tabI4Src, coeffs[:]) })
+	run("QuantizeY16/vec", func() {
+		c := coeffs
+		quantizeBlocks(c[:], levels[:], &m)
+	})
+	run("QuantizeY16/go", func() {
+		c := coeffs
+		quantizeBlocksRef(c[:], levels[:], &m)
+	})
+	c := coeffs
+	quantizeBlocksRef(c[:], levels[:], &m)
+	run("ITransformY16/vec", func() { iTransformPairs(ref, c[:], dst, &tabY16) })
+	run("ITransformY16/go", func() { iTransformPairsRef(ref, c[:], dst, &tabY16) })
+	run("TTransformY16/vec", func() { tTransformPairs(src, &tabY16, res[:]) })
+	run("TTransformY16/go", func() { tTransformPairsRef(src, &tabY16, res[:]) })
+	run("SSE4x4I4/vec", func() { sse4x4Pairs(src, ref, &tabI4Src, res[:]) })
+	run("SSE4x4I4/go", func() { sse4x4PairsRef(src, ref, &tabI4Src, res[:]) })
+	run("SSE16x16/vec", func() { sse16x16(src, ref) })
+	run("SSE16x16/go", func() { sse16x16Ref(src, ref) })
+}
