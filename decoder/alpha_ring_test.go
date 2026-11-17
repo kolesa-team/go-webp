@@ -1,6 +1,7 @@
 package decoder
 
 import (
+	"bytes"
 	"fmt"
 	"image"
 	"testing"
@@ -173,4 +174,48 @@ func TestAlphaRingSize(t *testing.T) {
 	a.alloc(false)
 	assert.Equal(t, w*h, len(a.buf))
 	a.release()
+}
+
+// FuzzAlphaRing compares decoding an arbitrary ALPH payload (on a valid VP8
+// frame, possibly truncated) through a small ring, sequentially and with
+// the alpha helper, with the whole-plane decode: pixels and errors must be
+// identical.
+func FuzzAlphaRing(f *testing.F) {
+	const w, h = 31, 140
+	files := alphaFiles(f, w, h)
+	base := files[fmt.Sprintf("%dx%d comp1 filter1", w, h)]
+	for _, data := range files {
+		f.Add(chunkData(f, data, "ALPH"), uint16(0), uint8(0))
+		f.Add(chunkData(f, data, "ALPH"), uint16(500), uint8(0x5a))
+	}
+	vp8 := chunkData(f, base, "VP8 ")
+	f.Fuzz(func(t *testing.T, alph []byte, vp8cut uint16, flags uint8) {
+		data := modifyChunk(t, base, "ALPH", func([]byte) []byte { return alph })
+		if cut := int(vp8cut); cut > 0 && cut < len(vp8) {
+			data = modifyChunk(t, data, "VP8 ", func(p []byte) []byte { return p[:cut] })
+		}
+		o := &Options{NoFancyUpsampling: flags&4 != 0, AlphaDitheringStrength: int(flags>>3&1) * 60}
+		switch flags >> 5 & 3 {
+		case 1:
+			o.Crop = cropRect(0, h/3, w, h/2+1)
+		case 2:
+			o.Scale = image.Rect(0, 0, w/2+1, h/3+1)
+		case 3:
+			o.Crop = cropRect(1, h-int(flags&3)*5-3, w-1, int(flags&3)*5+3)
+		}
+		setRing(t, 0)
+		want := decodeOutcome(t, data, o)
+		setRing(t, 26+int(flags&3)*3)
+		smallBands(t, 1+int(flags&3), w)
+		got := decodeOutcome(t, data, o)
+		o.UseThreads = true
+		restore := budgets[2].set()
+		gotHelper := decodeOutcome(t, data, o)
+		restore()
+		for _, g := range []outcome{got, gotHelper} {
+			if want.err != g.err || !bytes.Equal(want.pix, g.pix) {
+				t.Fatalf("ring %q, plane %q (pixels equal: %v)", g.err, want.err, bytes.Equal(want.pix, g.pix))
+			}
+		}
+	})
 }

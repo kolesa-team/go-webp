@@ -50,6 +50,7 @@ func FuzzDecode(f *testing.F) {
 			f.Add(ri.vp8, uint8(16|4|2))
 			f.Add(ri.vp8, uint8(4))
 			f.Add(ri.vp8, uint8(32|8|4))
+			f.Add(ri.vp8, uint8(64|32|4))
 		}
 	}
 	f.Fuzz(func(t *testing.T, data []byte, mode uint8) {
@@ -93,6 +94,7 @@ func FuzzDecode(f *testing.F) {
 			// the sequential one, also with small batches, so that small
 			// inputs use the helper too.
 			setBatch(t, 1+47*int(mode>>5&1))
+			setEmit(t, []int{mtEmitWaits, 0}[mode>>6&1]) // the emit helper from the first batch
 			small := run(opts)
 			opts.UseThreads = false
 			if want := run(opts); got != want || small != want {
