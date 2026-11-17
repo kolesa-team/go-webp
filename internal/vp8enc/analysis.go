@@ -143,7 +143,7 @@ func (it *iterator) mbAnalyzeBestIntra16Mode() int {
 	bestMode := 0
 	it.makeLuma16Preds()
 	for mode := 0; mode < 2; mode++ {
-		maxValue, lastNonZero := collectHistogram(it.yuvIn[yOff:], it.yuvP[vp8I16ModeOffsets[mode]:], vp8Scan[:])
+		maxValue, lastNonZero := collectHistogram(it.yuvIn[yOff:], it.yuvP[vp8I16ModeOffsets[mode]:], &tabY16)
 		alpha := 0
 		if maxValue > 1 {
 			alpha = alphaScale * lastNonZero / maxValue
@@ -191,7 +191,7 @@ func (it *iterator) mbAnalyzeBestUVMode() int {
 	bestMode := 0
 	it.makeChroma8Preds()
 	for mode := 0; mode < 2; mode++ {
-		maxValue, lastNonZero := collectHistogram(it.yuvIn[uOff:], it.yuvP[vp8UVModeOffsets[mode]:], vp8ScanUV[:])
+		maxValue, lastNonZero := collectHistogram(it.yuvIn[uOff:], it.yuvP[vp8UVModeOffsets[mode]:], &tabUV)
 		alpha := 0
 		if maxValue > 1 {
 			alpha = alphaScale * lastNonZero / maxValue

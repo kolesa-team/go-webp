@@ -166,6 +166,7 @@ func expandMatrix(m *matrix, typ int) int {
 		}
 		sum += m.q[i]
 	}
+	m.prepareVec()
 	return int((sum + 8) >> 4)
 }
 
@@ -576,16 +577,12 @@ func (it *iterator) reconstructIntra16(dcLevels *[16]int16, acLevels *[16][16]in
 	dqm := &e.dqm[it.mb().segment&3]
 	nz := uint32(0)
 	tmp := &it.tmp16
-	var dcTmp [16]int16
+	var dcTmp, dcLev [1][16]int16
 
-	for n := 0; n < 16; n++ {
-		off := vp8Scan[n]
-		fTransform(src[off:], ref[off:], &tmp[n])
-	}
-	fTransformWHT(tmp, &dcTmp)
-	if quantizeBlock(&dcTmp, dcLevels, &dqm.y2) {
-		nz |= 1 << 24
-	}
+	fTransformPairs(src, ref, &tabY16, tmp[:])
+	fTransformWHT(tmp, &dcTmp[0])
+	nz |= quantizeBlocks(dcTmp[:], dcLev[:], &dqm.y2) << 24
+	*dcLevels = dcLev[0]
 
 	if it.doTrellis {
 		it.nzToBytes()
@@ -603,18 +600,116 @@ func (it *iterator) reconstructIntra16(dcLevels *[16]int16, acLevels *[16][16]in
 	} else {
 		for n := 0; n < 16; n++ {
 			tmp[n][0] = 0
-			if quantizeBlock(&tmp[n], &acLevels[n], &dqm.y1) {
-				nz |= 1 << uint(n)
-			}
 		}
+		nz |= quantizeBlocks(tmp[:], acLevels[:], &dqm.y1)
 	}
 
-	iTransformWHT(&dcTmp, tmp)
-	for n := 0; n < 16; n++ {
-		off := vp8Scan[n]
-		iTransform(ref[off:], &tmp[n], yuvOut[off:])
+	iTransformWHT(&dcTmp[0], tmp)
+	iTransformPairs(ref, tmp[:], yuvOut, &tabY16)
+	return nz
+}
+
+// i4Modes holds the 10 intra4 candidates of one sub-block, reconstructed in
+// one batch by reconstructI4Modes.
+type i4Modes struct {
+	src    [3*bps + 8]byte // the source sub-block, twice side by side (tabI4Src)
+	rec    [8 * bps]byte   // reconstructions, laid out as the predictions (tabI4Rec)
+	coeffs [numBModes][16]int16
+	levels [numBModes][16]int16 // quantized levels, zigzag order
+	d      [numBModes]int32     // sse4x4(source, reconstruction)
+	tt     [numBModes]int32     // tTransform(reconstruction), if requested
+	srcTT  [2]int32             // tTransform(source), if requested
+}
+
+// tabI4Self is the duplicated intra4 source block alone.
+var tabI4Self = newPairTable([2]uint16{0, 0})
+
+// setI4Source copies the source sub-block twice side by side into
+// it.i4m.src, the layout the intra4 pair tables expect.
+func (it *iterator) setI4Source(src []byte) {
+	s := &it.i4m.src
+	for y := 0; y < 4; y++ {
+		row := src[y*bps : y*bps+4]
+		copy(s[y*bps:y*bps+4], row)
+		copy(s[y*bps+4:y*bps+8], row)
+	}
+}
+
+// reconstructI4Modes does what reconstructIntra4 does for one mode for all
+// 10 intra4 predictions (makeIntra4Preds) of the current sub-block src,
+// then measures each reconstruction against the source (and the texture
+// transforms when withTT is set) into it.i4m. Bit m of the result is set
+// if mode m has a non-zero level.
+//
+// With vector kernels each step runs on the 10 modes in one call; the
+// portable build keeps the mode-by-mode loop, which is faster in plain Go
+// (the data stays in registers between the steps).
+func (it *iterator) reconstructI4Modes(src []byte, withTT bool) uint32 {
+	s := &it.i4m
+	preds := it.yuvP[i4DC4:]
+	dqm := &it.enc.dqm[it.mb().segment&3]
+	x, y := it.i4&3, it.i4>>2
+	ctx := it.topNz[x] + it.leftNz[y]
+	var nz uint32
+	if !vecKernels {
+		for m := 0; m < numBModes; m++ {
+			ref := preds[predOffI4(m):]
+			rec := s.rec[predOffI4(m):]
+			c := &s.coeffs[m]
+			fTransform(src, ref, c)
+			var nzm bool
+			if it.doTrellis {
+				nzm = it.trellisQuantizeBlock(c, &s.levels[m], ctx, typeI4AC, &dqm.y1, dqm.lambdaTrellisI4)
+			} else {
+				nzm = quantizeBlock(c, &s.levels[m], &dqm.y1)
+			}
+			if nzm {
+				nz |= 1 << uint(m)
+			}
+			iTransform(ref, c, rec)
+			s.d[m] = int32(sse4x4(src, rec))
+			if withTT {
+				s.tt[m] = tTransform(rec, &kWeightY)
+			}
+		}
+		if withTT {
+			s.srcTT[0] = tTransform(src, &kWeightY)
+		}
+		return nz
+	}
+	it.setI4Source(src)
+	fTransformPairs(s.src[:], preds, &tabI4Src, s.coeffs[:])
+	if it.doTrellis {
+		for m := 0; m < numBModes; m++ {
+			if it.trellisQuantizeBlock(&s.coeffs[m], &s.levels[m], ctx, typeI4AC, &dqm.y1, dqm.lambdaTrellisI4) {
+				nz |= 1 << uint(m)
+			}
+		}
+	} else {
+		nz = quantizeBlocks(s.coeffs[:], s.levels[:], &dqm.y1)
+	}
+	iTransformPairs(preds, s.coeffs[:], s.rec[:], &tabI4Rec)
+	sse4x4Pairs(s.src[:], s.rec[:], &tabI4Src, s.d[:])
+	if withTT {
+		tTransformPairs(s.rec[:], &tabI4Rec, s.tt[:])
+		tTransformPairs(s.src[:], &tabI4Self, s.srcTT[:])
 	}
 	return nz
+}
+
+// sseI4Modes computes the distortion of the 10 intra4 predictions of the
+// current sub-block src into it.i4m.d.
+func (it *iterator) sseI4Modes(src []byte) {
+	preds := it.yuvP[i4DC4:]
+	d := &it.i4m.d
+	if !vecKernels {
+		for m := 0; m < numBModes; m++ {
+			d[m] = int32(sse4x4(src, preds[predOffI4(m):]))
+		}
+		return
+	}
+	it.setI4Source(src)
+	sse4x4Pairs(it.i4m.src[:], preds, &tabI4Src, d[:])
 }
 
 func (it *iterator) reconstructIntra4(levels *[16]int16, src, yuvOut []byte, mode int) bool {
@@ -700,24 +795,13 @@ func (it *iterator) reconstructUV(levels *[8][16]int16, derr *[2][3]int8, yuvOut
 	ref := it.yuvP[vp8UVModeOffsets[mode&3]:]
 	src := it.yuvIn[uOff:]
 	dqm := &e.dqm[it.mb().segment&3]
-	nz := uint32(0)
 	tmp := &it.tmpUV
-	for n := 0; n < 8; n++ {
-		off := vp8ScanUV[n]
-		fTransform(src[off:], ref[off:], &tmp[n])
-	}
+	fTransformPairs(src, ref, &tabUV, tmp[:])
 	if e.topDerr != nil {
 		it.correctDCValues(&dqm.uv, tmp, derr)
 	}
-	for n := 0; n < 8; n++ {
-		if quantizeBlock(&tmp[n], &levels[n], &dqm.uv) {
-			nz |= 1 << uint(n)
-		}
-	}
-	for n := 0; n < 8; n++ {
-		off := vp8ScanUV[n]
-		iTransform(ref[off:], &tmp[n], yuvOut[off:])
-	}
+	nz := quantizeBlocks(tmp[:], levels[:], &dqm.uv)
+	iTransformPairs(ref, tmp[:], yuvOut, &tabUV)
 	return nz << 16
 }
 
@@ -755,9 +839,7 @@ func (it *iterator) pickBestIntra16(rd *modeScore) {
 	isFlatSrc := isFlatSource16(src)
 
 	if tlambda != 0 { // the source part of the texture distortion is constant
-		for n := 0; n < 16; n++ {
-			it.srcTT[n] = tTransform(src[vp8Scan[n]:], &kWeightY)
-		}
+		tTransformPairs(src, &tabY16, it.srcTT[:])
 	}
 	rd.modeI16 = -1
 	for mode := 0; mode < numPredModes; mode++ {
@@ -767,9 +849,10 @@ func (it *iterator) pickBestIntra16(rd *modeScore) {
 
 		rdCur.D = int64(sse16x16(src, tmpDst))
 		if tlambda != 0 {
+			tTransformPairs(tmpDst, &tabY16, it.tt16[:])
 			d := 0
 			for n := 0; n < 16; n++ {
-				d += int(iabs(tTransform(tmpDst[vp8Scan[n]:], &kWeightY)-it.srcTT[n]) >> 5)
+				d += int(iabs(it.tt16[n]-it.srcTT[n]) >> 5)
 			}
 			rdCur.SD = mult8b(tlambda, d)
 		} else {
@@ -836,34 +919,31 @@ func (it *iterator) pickBestIntra4(rd *modeScore) bool {
 	rdBest.H = 211 // '211' is the value of VP8BitCost(0, 145)
 	rdBest.setRDScore(dqm.lambdaMode)
 	it.startI4()
+	cand := &it.i4m
 	for {
 		var rdI4 scoreT
 		rdI4.score = maxCost
 		bestMode := -1
-		src := src0[vp8Scan[it.i4]:]
 		modeCosts := it.getCostModeI4(&rd.modesI4)
-		bestBlock := bestBlocks[vp8Scan[it.i4]:]
-		tmpDst := it.yuvP[i4TMP:]
-		bestInPlace := true // whether bestBlock points into bestBlocks
-		var srcTT int32
-		if tlambda != 0 {
-			srcTT = tTransform(src, &kWeightY)
-		}
 
+		// Reconstruct and measure the 10 modes in one batch (each mode only
+		// depends on the source and its prediction), then score them in
+		// order as libwebp does.
 		it.makeIntra4Preds()
+		nzModes := it.reconstructI4Modes(src0[vp8Scan[it.i4]:], tlambda != 0)
 		for mode := 0; mode < numBModes; mode++ {
 			var rdTmp scoreT
-			tmpLevels := &it.tmpLevels
-			nz := it.reconstructIntra4(&tmpLevels[0], src, tmpDst, mode)
+			levels := cand.levels[mode : mode+1 : mode+1]
+			nz := nzModes>>uint(mode)&1 != 0
 			if nz {
 				rdTmp.nz = 1 << uint(it.i4)
 			}
-			rdTmp.D = int64(sse4x4(src, tmpDst))
+			rdTmp.D = int64(cand.d[mode])
 			if tlambda != 0 {
-				rdTmp.SD = mult8b(tlambda, int(iabs(tTransform(tmpDst, &kWeightY)-srcTT)>>5))
+				rdTmp.SD = mult8b(tlambda, int(iabs(cand.tt[mode]-cand.srcTT[0])>>5))
 			}
 			rdTmp.H = int64(modeCosts[mode])
-			if mode > 0 && (!nz || isFlat(tmpLevels[:], flatnessLimitI4)) {
+			if mode > 0 && (!nz || isFlat(levels, flatnessLimitI4)) {
 				rdTmp.R = flatnessPenalty
 			} else {
 				rdTmp.R = 0
@@ -873,16 +953,14 @@ func (it *iterator) pickBestIntra4(rd *modeScore) bool {
 			if bestMode >= 0 && rdTmp.score >= rdI4.score {
 				continue
 			}
-			rdTmp.R += int64(it.getCostLuma4(&tmpLevels[0], nz))
+			rdTmp.R += int64(it.getCostLuma4(&levels[0], nz))
 			rdTmp.setRDScore(lambda)
 			if bestMode < 0 || rdTmp.score < rdI4.score {
 				rdI4 = rdTmp
 				bestMode = mode
-				tmpDst, bestBlock = bestBlock, tmpDst
-				bestInPlace = !bestInPlace
-				bestLevels[it.i4] = tmpLevels[0]
 			}
 		}
+		bestLevels[it.i4] = cand.levels[bestMode]
 		rdI4.setRDScore(dqm.lambdaMode)
 		rdBest.D += rdI4.D
 		rdBest.SD += rdI4.SD
@@ -897,9 +975,7 @@ func (it *iterator) pickBestIntra4(rd *modeScore) bool {
 		if totalHeaderBits > e.maxI4HeaderBits {
 			return false
 		}
-		if !bestInPlace {
-			copy4x4(bestBlock, bestBlocks[vp8Scan[it.i4]:])
-		}
+		copy4x4(cand.rec[predOffI4(bestMode):], bestBlocks[vp8Scan[it.i4]:])
 		rd.modesI4[it.i4] = uint8(bestMode)
 		v := 0
 		if rdI4.nz != 0 {
@@ -1082,9 +1158,10 @@ func (it *iterator) refineUsingDistortion(tryBothModes, refineUVMode bool, rd *m
 			src := it.yuvIn[yOff+vp8Scan[it.i4]:]
 			modeCosts := it.getCostModeI4(&rd.modesI4)
 			it.makeIntra4Preds()
+			it.sseI4Modes(src)
+			dist := &it.i4m.d
 			for mode := 0; mode < numBModes; mode++ {
-				ref := it.yuvP[vp8I4ModeOffsets[mode]:]
-				score := int64(sse4x4(src, ref))*rdDistoMult + int64(modeCosts[mode])*lambdaDI4
+				score := int64(dist[mode])*rdDistoMult + int64(modeCosts[mode])*lambdaDI4
 				if score < bestI4Score {
 					bestI4Mode = mode
 					bestI4Score = score

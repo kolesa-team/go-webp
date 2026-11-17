@@ -532,7 +532,7 @@ func sseRow4(a, b []byte) int {
 	return d0*d0 + d1*d1 + d2*d2 + d3*d3
 }
 
-func sse16x16(a, b []byte) int {
+func sse16x16Ref(a, b []byte) int {
 	s := 0
 	for y := 0; y < 16; y++ {
 		s += sseRow16(a[y*bps:], b[y*bps:])
@@ -540,7 +540,7 @@ func sse16x16(a, b []byte) int {
 	return s
 }
 
-func sse16x8(a, b []byte) int {
+func sse16x8Ref(a, b []byte) int {
 	s := 0
 	for y := 0; y < 8; y++ {
 		s += sseRow16(a[y*bps:], b[y*bps:])
@@ -607,6 +607,30 @@ type matrix struct {
 	bias    [16]uint32 // rounding bias
 	zthresh [16]uint32 // value below which a coefficient is zeroed
 	sharpen [16]uint32 // frequency boosters for slight sharpening
+
+	// 16-bit copies of q, iq and sharpen for the vector quantizer, valid
+	// when vecOK is set (see prepareVec).
+	q16, iq16, sharpen16 [16]uint16
+	vecOK                bool
+}
+
+// prepareVec fills the 16-bit copies of the quantizer parameters. A vector
+// quantizer working on 16-bit lanes (|coeff| <= 32768, then
+// coeff+sharpen and (coeff+sharpen)*iq computed exactly in 16 and 32 bits)
+// matches quantizeBlock bit for bit when iq < 2^16 and sharpen < 2^15; only
+// the low 16 bits of q matter, since the dequantized value is truncated to
+// int16. The encoder's quantizers (q >= 4, so iq <= 32768, and sharpen <=
+// 12) always qualify; vecOK records it for any other matrix.
+func (m *matrix) prepareVec() {
+	m.vecOK = true
+	for i := range m.q {
+		m.q16[i] = uint16(m.q[i])
+		m.iq16[i] = uint16(m.iq[i])
+		m.sharpen16[i] = uint16(m.sharpen[i])
+		if m.iq[i] > 0xffff || m.sharpen[i] > 0x7fff {
+			m.vecOK = false
+		}
+	}
 }
 
 // kInvZigzag maps a natural-order coefficient index to its zigzag position.
@@ -677,12 +701,12 @@ func copy16x8(src, dst []byte) {
 const maxCoeffThresh = 31
 
 // collectHistogram returns the (maxValue, lastNonZero) of the histogram of
-// DCT coefficients of ref-pred over the given blocks.
-func collectHistogram(ref, pred []byte, scan []int) (int, int) {
+// DCT coefficients of ref-pred over the blocks of t (tabY16 or tabUV).
+func collectHistogram(ref, pred []byte, t *pairTable) (int, int) {
 	var distribution [maxCoeffThresh + 1]int
-	var out [16]int16
-	for _, off := range scan {
-		fTransform(ref[off:], pred[off:], &out)
+	var coeffs [16][16]int16
+	fTransformPairs(ref, pred, t, coeffs[:])
+	for _, out := range coeffs[:2*t.n] {
 		for k := 0; k < 16; k++ {
 			v := int32(out[k])
 			s := v >> 31
