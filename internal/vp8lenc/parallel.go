@@ -165,7 +165,7 @@ func encodeConfigs(argb []uint32, w, h int, p *params, configs []crunchConfig, p
 	parallel(len(configs), helpers, func(worker int, claim func() (int, bool)) {
 		s, buf := sc, spare
 		if worker > 0 {
-			s, buf = getScratch(), nil
+			s, buf = getScratch(w*h), nil
 			defer putScratch(s)
 		}
 		r := &res[worker]

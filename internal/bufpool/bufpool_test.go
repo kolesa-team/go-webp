@@ -1,9 +1,11 @@
 package bufpool
 
 import (
+	"math"
 	"math/bits"
 	"math/rand"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"testing"
@@ -101,11 +103,20 @@ func TestGetPutReuse(t *testing.T) {
 }
 
 func TestBudget(t *testing.T) {
-	fresh(t, 1<<20, time.Hour) // 1 MiB, at most 128 KiB per buffer
+	fresh(t, 1<<20, time.Hour) // 1 MiB
 	var p Pool[byte]
-	p.Put(make([]byte, 128<<10+1))
+	p.Put(make([]byte, 1<<20+1))
 	if Retained() != 0 {
-		t.Fatal("buffer above limit/8 retained")
+		t.Fatal("buffer above the budget retained")
+	}
+	// A single buffer may take the whole budget.
+	whole := make([]byte, 1<<20)
+	p.Put(whole)
+	if Retained() != 1<<20 {
+		t.Fatal("buffer of the size of the budget not retained")
+	}
+	if b := p.Get(1 << 20); &b[0] != &whole[0] {
+		t.Fatal("buffer of the size of the budget not reused")
 	}
 	for i := 0; i < 10; i++ {
 		p.Put(make([]byte, 100<<10))
@@ -241,6 +252,154 @@ func TestConcurrent(t *testing.T) {
 	Trim()
 	if r := Retained(); r != 0 {
 		t.Fatalf("Retained after Trim = %d (accounting drift)", r)
+	}
+}
+
+type obj struct {
+	size int
+	buf  []byte
+}
+
+func TestList(t *testing.T) {
+	fresh(t, 1<<20, time.Hour)
+	var l List[*obj]
+	if _, ok := l.Get(nil); ok {
+		t.Fatal("Get on an empty list")
+	}
+	a, b, c := &obj{size: 1}, &obj{size: 2}, &obj{size: 1}
+	for _, o := range []*obj{a, b, c} {
+		if !l.Put(o, 100<<10) {
+			t.Fatal("Put within the budget refused")
+		}
+	}
+	if r := Retained(); r != 300<<10 || l.Len() != 3 {
+		t.Fatalf("Retained = %d, Len = %d", r, l.Len())
+	}
+	// The most recent object that fits.
+	if o, ok := l.Get(func(o *obj) bool { return o.size == 2 }); !ok || o != b {
+		t.Fatal("fit not honored")
+	}
+	if o, ok := l.Get(nil); !ok || o != c {
+		t.Fatal("not LIFO")
+	}
+	if _, ok := l.Get(func(o *obj) bool { return o.size == 3 }); ok {
+		t.Fatal("object that does not fit returned")
+	}
+	if r := Retained(); r != 100<<10 {
+		t.Fatalf("Retained after Gets = %d", r)
+	}
+	// Lists and pools share the budget; one object may take all of it.
+	var p Pool[byte]
+	p.Put(make([]byte, 924<<10)) // with a: the whole budget
+	if l.Put(&obj{}, 1) {
+		t.Fatal("Put over the budget kept")
+	}
+	Trim()
+	if r := Retained(); r != 0 || l.Len() != 0 {
+		t.Fatalf("Retained after Trim = %d, Len = %d", r, l.Len())
+	}
+	if !l.Put(&obj{}, 1<<20) || l.Put(&obj{}, 1) {
+		t.Fatal("an object of the size of the budget must fill it")
+	}
+	// Idle trimming.
+	Trim()
+	old := &obj{}
+	l.Put(old, 10)
+	time.Sleep(time.Millisecond)
+	cut := now()
+	time.Sleep(time.Millisecond)
+	young := &obj{}
+	l.Put(young, 20)
+	trimAll(cut)
+	if r := Retained(); r != 20 || l.Len() != 1 {
+		t.Fatalf("Retained = %d, Len = %d after the idle trim", r, l.Len())
+	}
+	if o, _ := l.Get(nil); o != young {
+		t.Fatal("young object dropped")
+	}
+}
+
+// TestListTrimOnGC checks that garbage collections drop idle list objects.
+func TestListTrimOnGC(t *testing.T) {
+	fresh(t, DefaultLimit, time.Hour)
+	var l List[*obj]
+	l.Put(&obj{buf: make([]byte, 1<<20)}, 1<<20)
+	SetMaxIdle(0)
+	deadline := time.Now().Add(10 * time.Second)
+	for Retained() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("still %d bytes retained after GCs", Retained())
+		}
+		runtime.GC()
+		time.Sleep(time.Millisecond)
+	}
+	SetMaxIdle(time.Hour)
+	// A recent object survives the collections.
+	o := &obj{}
+	l.Put(o, 1)
+	runtime.GC()
+	runtime.GC()
+	time.Sleep(10 * time.Millisecond)
+	if g, ok := l.Get(nil); !ok || g != o {
+		t.Fatal("recent object dropped")
+	}
+}
+
+// TestMemoryLimit checks that the default budget follows the Go memory
+// limit (an eighth of it, when lower than DefaultLimit), read again after
+// limitRefresh, and that an explicit limit does not.
+func TestMemoryLimit(t *testing.T) {
+	fresh(t, -1, time.Hour)
+	prevML := debug.SetMemoryLimit(-1)
+	defer debug.SetMemoryLimit(prevML)
+	if prevML == math.MaxInt64 && Limit() != DefaultLimit {
+		t.Fatalf("Limit = %d without a memory limit, want %d", Limit(), int64(DefaultLimit))
+	}
+	debug.SetMemoryLimit(64 << 20)
+	SetLimit(-1) // recomputed at once
+	if Limit() != 8<<20 {
+		t.Fatalf("Limit = %d with a 64 MiB memory limit, want 8 MiB", Limit())
+	}
+	var p Pool[byte]
+	p.Put(make([]byte, 6<<20))
+	if Retained() != 6<<20 {
+		t.Fatal("buffer within the budget not kept")
+	}
+	// A lower memory limit is followed after limitRefresh: the pools are
+	// emptied when they hold more than the new budget.
+	debug.SetMemoryLimit(32 << 20)
+	if Limit() != 8<<20 {
+		t.Fatal("memory limit read again before limitRefresh")
+	}
+	limitAt.Store(now() - limitRefresh)
+	p.Put(make([]byte, 1))
+	if Limit() != 4<<20 || Retained() != 1 {
+		t.Fatalf("after the refresh: Limit = %d, Retained = %d", Limit(), Retained())
+	}
+	// A high memory limit does not raise the budget above DefaultLimit.
+	debug.SetMemoryLimit(1 << 40)
+	SetLimit(-1)
+	if Limit() != DefaultLimit {
+		t.Fatalf("Limit = %d with a 1 TiB memory limit", Limit())
+	}
+	// An explicit limit ignores the memory limit, and SetLimit returns the
+	// setting so that it can be restored.
+	debug.SetMemoryLimit(64 << 20)
+	if prev := SetLimit(100 << 20); prev != -1 {
+		t.Fatalf("SetLimit returned %d for the default, want -1", prev)
+	}
+	limitAt.Store(now() - limitRefresh)
+	p.Put(make([]byte, 1))
+	if Limit() != 100<<20 {
+		t.Fatalf("explicit Limit changed to %d", Limit())
+	}
+	SetLimit(SetLimit(5))
+	if Limit() != 100<<20 {
+		t.Fatal("SetLimit(SetLimit(n)) did not restore the explicit limit")
+	}
+	SetLimit(-1)
+	if Limit() != 8<<20 {
+		t.Fatalf("default not restored: Limit = %d", Limit())
 	}
 }
 

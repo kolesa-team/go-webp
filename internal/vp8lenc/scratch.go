@@ -56,17 +56,25 @@ type scratch struct {
 
 func (s *scratch) interrupted() bool { return s.interrupt != nil && s.interrupt() }
 
-// maxPooledPixels bounds the image size whose buffers are kept in the
-// sync.Pools (the free lists, see freelist.go, have their own budget): the
-// buffers of a large encode (hundreds of MB for 12 MP) are left to the
-// garbage collector instead of being retained until the next collections.
+// maxPooledPixels bounds the image size whose scratch is kept in the
+// sync.Pool when the free list (see freelist.go), which has a budget, does
+// not take it: the buffers of a large encode (hundreds of MB for 12 MP) are
+// left to the garbage collector instead of being retained until the next
+// collections.
 const maxPooledPixels = 2 << 20
+
+// minScratchFit is the image size (in pixels) up to which a scratch from
+// the free list serves an image of any size.
+const minScratchFit = 1 << 20
 
 var scratchPool = sync.Pool{New: func() any { return new(scratch) }}
 
-// getScratch returns a scratch from the free list, or from the pool.
-func getScratch() *scratch {
-	if s, ok := scratchFree.get(nil); ok {
+// getScratch returns a scratch for an image of n pixels: the most recently
+// returned one of the free list not sized for an image more than 4 times
+// larger (whose buffers an encode of that size could reuse), else one from
+// the pool.
+func getScratch(n int) *scratch {
+	if s, ok := scratchFree.Get(func(s *scratch) bool { return s.pixels <= max(4*n, minScratchFit) }); ok {
 		return s
 	}
 	return scratchPool.Get().(*scratch)
@@ -77,7 +85,7 @@ func getScratch() *scratch {
 // bounds the memory retained by the pool).
 func putScratch(s *scratch) {
 	s.interrupt = nil // do not retain the caller's closure in the free list or pool
-	if scratchFree.put(s, s.bytes()) || s.pixels > maxPooledPixels {
+	if scratchFree.Put(s, s.bytes()) || s.pixels > maxPooledPixels {
 		return
 	}
 	scratchPool.Put(s)

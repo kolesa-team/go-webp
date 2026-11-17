@@ -272,7 +272,7 @@ func (a *AlphaEncoder) Encode(plane []byte, width, height, stride int, method in
 		}
 	}
 	if a.sc == nil {
-		a.sc = getScratch()
+		a.sc = getScratch(n)
 	}
 	cfg := &Config{Quality: q, Method: method, Exact: true, NearLossless: 100, Interrupt: a.Interrupt}
 	out, spare := encodeARGB(argb, width, height, cfg, true, 0, a.sc, a.spare, &info)
@@ -454,7 +454,7 @@ func encodeARGB(argb []uint32, w, h int, cfg *Config, useCache bool, prefix int,
 	}
 
 	if sc == nil {
-		sc = getScratch()
+		sc = getScratch(n)
 		defer putScratch(sc)
 	}
 	if len(configs) == 1 {
