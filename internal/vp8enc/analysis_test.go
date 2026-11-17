@@ -62,14 +62,16 @@ func TestAnalysisBandsIdentical(t *testing.T) {
 		"300x1":   synthImage(300, 1, 1, 3),
 		"17x33":   synthImage(17, 33, 3, 4),
 		"100x75":  synthImage(100, 75, 2, 5),
-		"640x481": synthImage(640, 481, 3, 6),
-		"16x4100": synthImage(16, 4100, 1, 7),
+		"640x481": synthImage(640, 481, 3, 6), // 6 bands
 	}
+	methods := []int{0, 4}
 	if !testing.Short() {
+		imgs["16x4100"] = synthImage(16, 4100, 1, 7)
 		imgs["source"] = loadTestImage(t, "source.jpg")
+		methods = []int{0, 2, 4, 6}
 	}
 	for name, img := range imgs {
-		for _, m := range []int{0, 2, 4, 6} {
+		for _, m := range methods {
 			cfg := DefaultConfig()
 			cfg.Method = m
 			want := analyzeOnly(img, cfg)

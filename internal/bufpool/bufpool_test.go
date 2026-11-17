@@ -1,6 +1,7 @@
 package bufpool
 
 import (
+	"math/bits"
 	"math/rand"
 	"runtime"
 	"sync"
@@ -31,7 +32,7 @@ func TestClassOf(t *testing.T) {
 		prev = c
 	}
 	// four classes per power of two
-	for b := 3; b < 62; b++ {
+	for b := 3; b < bits.UintSize-2; b++ {
 		lo := 1 << b
 		for k := 0; k < 4; k++ {
 			n := lo + k*(lo/4)
