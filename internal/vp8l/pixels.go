@@ -463,9 +463,10 @@ func toRGBA(c uint32) uint32 {
 	return c&0xff00ff00 | c>>16&0xff | (c&0xff)<<16
 }
 
-// emitRGBA converts the ARGB pixels src to RGBA bytes in dst (as many
-// pixels as fit), two pixels per 64-bit word.
-func emitRGBA(src []uint32, dst []byte) {
+// emitRGBAGo is the reference of emitRGBA (dsp_*.go): it converts the ARGB
+// pixels src to RGBA bytes in dst (as many pixels as fit), two pixels per
+// 64-bit word.
+func emitRGBAGo(src []uint32, dst []byte) {
 	for len(src) >= 2 && len(dst) >= 8 {
 		c := uint64(src[0]) | uint64(src[1])<<32
 		binary.LittleEndian.PutUint64(dst, swapRB2(c))
@@ -481,8 +482,9 @@ func swapRB2(c uint64) uint64 {
 	return c&0xff00ff00ff00ff00 | c>>16&0x000000ff000000ff | c&0x000000ff000000ff<<16
 }
 
-// emitAddGreen fuses the inverse subtract-green transform with emitRGBA.
-func emitAddGreen(src []uint32, dst []byte) {
+// emitAddGreenGo is the reference of emitAddGreen (dsp_*.go), which fuses
+// the inverse subtract-green transform with emitRGBA.
+func emitAddGreenGo(src []uint32, dst []byte) {
 	for len(src) >= 2 && len(dst) >= 8 {
 		c := uint64(src[0]) | uint64(src[1])<<32
 		g := c & 0x0000ff000000ff00
