@@ -25,13 +25,17 @@ import "image"
 // dst must not be used by other goroutines during the call. A nil dst
 // makes DecodeInto behave like Decode (a new image is allocated).
 func (d *Decoder) DecodeInto(dst *image.NRGBA) (*image.NRGBA, error) {
-	img, err := d.decode(call{dst: dst})
+	return d.decodeInto(call{dst: dst})
+}
+
+func (d *Decoder) decodeInto(c call) (*image.NRGBA, error) {
+	img, err := d.decode(c)
 	if err != nil {
 		return nil, &statusError{prefix: "cannot decode picture", err: err}
 	}
-	if dst == nil {
+	if c.dst == nil {
 		return img, nil
 	}
-	dst.Pix, dst.Stride, dst.Rect = img.Pix, img.Stride, img.Rect
-	return dst, nil
+	c.dst.Pix, c.dst.Stride, c.dst.Rect = img.Pix, img.Stride, img.Rect
+	return c.dst, nil
 }

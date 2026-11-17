@@ -24,6 +24,7 @@
 package decoder
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"image"
@@ -57,7 +58,14 @@ type statusError struct {
 	err    error
 }
 
-func (e *statusError) Error() string { return e.prefix + ": " + status.CodeOf(e.err).String() }
+func (e *statusError) Error() string {
+	code := status.CodeOf(e.err)
+	if code == utils.Vp8StatusUserAbort {
+		// Cancelled through a context: say why.
+		return e.prefix + ": " + code.String() + ": " + e.err.Error()
+	}
+	return e.prefix + ": " + code.String()
+}
 
 func (e *statusError) Unwrap() error { return e.err }
 
@@ -177,9 +185,15 @@ type call struct {
 	// dst lends its pixel memory to the output image (DecodeInto); nil
 	// allocates a new image.
 	dst *image.NRGBA
+	// ctx cancels the decode (DecodeContext); nil if it cannot be
+	// cancelled.
+	ctx context.Context
 }
 
 func (d *Decoder) decode(c call) (*image.NRGBA, error) {
+	if err := canceled(c.ctx); err != nil {
+		return nil, err
+	}
 	parsed, err := container.Parse(d.data)
 	if err != nil {
 		return nil, err
@@ -223,7 +237,7 @@ func (d *Decoder) decodeLossless(parsed *container.Image, cl call) (*image.NRGBA
 	if err != nil {
 		return nil, err
 	}
-	if err := vp8l.Decode(parsed.VP8L, sink); err != nil {
+	if err := vp8l.Decode(parsed.VP8L, cl.wrap(sink)); err != nil {
 		return nil, err
 	}
 	return result(), nil
@@ -286,13 +300,13 @@ func (d *Decoder) decodeLossy(parsed *container.Image, cl call) (*image.NRGBA, e
 		if !ok {
 			return nil, status.InvalidParam("scaling sink does not accept YUV")
 		}
-		ad := &yuvAdapter{sink: ys, alpha: la, top: crop.Min.Y, left: crop.Min.X, alphaStride: w}
+		ad := &yuvAdapter{sink: ys, alpha: la, top: crop.Min.Y, left: crop.Min.X, alphaStride: w, ctx: cl.ctx}
 		opts.Alpha = nil
 		err = vp8.DecodeYUV(parsed.VP8, &opts, &crop, ad)
 	case cw == w && ch == h:
-		err = vp8.Decode(parsed.VP8, nil, &opts, sink)
+		err = vp8.Decode(parsed.VP8, nil, &opts, cl.wrap(sink))
 	default:
-		err = vp8.DecodeRegion(parsed.VP8, nil, &opts, crop, sink)
+		err = vp8.DecodeRegion(parsed.VP8, nil, &opts, crop, cl.wrap(sink))
 	}
 	if err != nil {
 		return nil, err
@@ -509,9 +523,13 @@ type yuvAdapter struct {
 	alpha       *lazyAlpha // nil for opaque images
 	top, left   int        // crop origin in the alpha plane
 	alphaStride int
+	ctx         context.Context // DecodeContext, may be nil
 }
 
 func (a *yuvAdapter) PutYUV(y, n int, ys []byte, yStride int, us, vs []byte, uvStride int) error {
+	if err := canceled(a.ctx); err != nil {
+		return err
+	}
 	var ap []byte
 	if a.alpha != nil {
 		plane, err := a.alpha.get(a.top + y + n)

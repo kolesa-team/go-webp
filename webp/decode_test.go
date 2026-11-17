@@ -2,9 +2,12 @@ package webp
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"image"
+	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -75,4 +78,34 @@ func TestDecodeIntoOddSizes(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestDecodeContext(t *testing.T) {
+	data, err := os.ReadFile("../test_data/images/m4_q75.webp")
+	require.NoError(t, err)
+	want, err := Decode(bytes.NewReader(data), nil)
+	require.NoError(t, err)
+	got, err := DecodeContext(context.Background(), bytes.NewReader(data), nil)
+	require.NoError(t, err)
+	require.Equal(t, want, got)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r := &countingReader{r: bytes.NewReader(data)}
+	_, err = DecodeContext(ctx, r, nil)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Zero(t, r.n, "the reader must not be read once cancelled")
+
+	dctx, dcancel := context.WithTimeout(context.Background(), -time.Second)
+	defer dcancel()
+	dec, err := decoder.NewDecoder(bytes.NewReader(data), &decoder.Options{UseThreads: true})
+	require.NoError(t, err)
+	dst := &image.NRGBA{}
+	_, err = dec.DecodeIntoContext(dctx, dst)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Equal(t, &image.NRGBA{}, dst)
+	img, err := dec.DecodeIntoContext(context.Background(), dst)
+	require.NoError(t, err)
+	require.Same(t, dst, img)
+	require.Equal(t, want, img)
 }
