@@ -237,6 +237,81 @@ func residualRowNL(mode int, cur, up []uint32, y, width, height, x0, x1 int, md 
 	}
 }
 
+// cleanFastPath enables cleanMask (a variable for the tests).
+var cleanFastPath = true
+
+// cleanMask sets mask[i] to 1 for the pixels of argb whose residual
+// depends on libwebp's exact=0 cleaning (residualRowNL with clean and no
+// near-lossless), and to 0 for the others: with clean, only the fully
+// transparent pixels are changed (to their prediction), so the residual of
+// a pixel only differs from residualRow's when the pixel or one of its
+// prediction neighbors (left, top-left, top, top-right) is fully
+// transparent. The top-right neighbor of the last column is the first
+// pixel of the row (up[width]).
+func cleanMask(argb []uint32, width, height int, mask []uint8) {
+	// mask first receives the transparency of the pixels, then is
+	// dilated in place row by row from the bottom (row y-1 is still the
+	// plain transparency when row y is dilated).
+	for i, p := range argb[:width*height] {
+		mask[i] = b2u8(p < 0x01000000)
+	}
+	for y := height - 1; y >= 0; y-- {
+		row := mask[y*width : (y+1)*width]
+		first := row[0]
+		// Left neighbor (in place, right to left).
+		for x := width - 1; x >= 1; x-- {
+			row[x] |= row[x-1]
+		}
+		if y == 0 {
+			break
+		}
+		up := mask[(y-1)*width : y*width]
+		row[0] |= up[0]
+		if width > 1 {
+			row[0] |= up[1]
+		}
+		for x := 1; x < width-1; x++ {
+			row[x] |= up[x-1] | up[x] | up[x+1]
+		}
+		if width > 1 {
+			row[width-1] |= up[width-2] | up[width-1] | first
+		} else {
+			row[0] |= first
+		}
+	}
+}
+
+func b2u8(b bool) uint8 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// residualRowClean is residualRowNL with clean and no near-lossless
+// (maxQuant 1): the pixels whose mask is 0 (see cleanMask) take the fast
+// residualRow path, in runs. The pixels are processed in order, so the
+// cleaned pixels the slow runs depend on are up to date.
+func residualRowClean(mode int, cur, up []uint32, y, width, height, x0, x1 int, mask []uint8, out []uint32) {
+	mask = mask[:x1]
+	for x := x0; x < x1; {
+		s := x
+		for x < x1 && mask[x] != 0 {
+			x++
+		}
+		if x > s {
+			residualRowNL(mode, cur, up, y, width, height, s, x, nil, 1, false, true, out[s-x0:x-x0])
+		}
+		s = x
+		for x < x1 && mask[x] == 0 {
+			x++
+		}
+		if x > s {
+			residualRow(mode, cur, up, y, s, x, out[s-x0:x-x0])
+		}
+	}
+}
+
 type histo4 [4][256]int32
 
 func (h *histo4) add(p uint32) {
@@ -296,6 +371,14 @@ func predictorImage(width, height, minBits, maxBits int, lowEffort bool, maxQuan
 		md = sc.maxDiffs(n)
 		computeMaxDiffs(width, height, argb, usedSubGreen, md)
 	}
+	// Without near-lossless, the clean path only changes the pixels next to
+	// fully transparent ones: the others take the fast path (cleanMask). The
+	// mask uses the buffer of the max diffs (only used with near-lossless).
+	var mask []uint8
+	if clean && !nl && cleanFastPath {
+		mask = sc.maxDiffs(n)
+		cleanMask(argb[:n], width, height, mask)
+	}
 	var bits int
 	if lowEffort {
 		bits = maxBits
@@ -304,7 +387,7 @@ func predictorImage(width, height, minBits, maxBits int, lowEffort bool, maxQuan
 		}
 	} else {
 		ps := predSearch{width: width, height: height, minBits: minBits, maxBits: maxBits,
-			maxQuant: maxQuant, md: md, usedSubGreen: usedSubGreen, clean: clean, slow: slow, argb: argb, sc: sc}
+			maxQuant: maxQuant, md: md, mask: mask, usedSubGreen: usedSubGreen, clean: clean, slow: slow, argb: argb, sc: sc}
 		if helpers > 0 && minBits == maxBits {
 			bits = ps.runPar(modes, helpers)
 		} else {
@@ -328,13 +411,16 @@ func predictorImage(width, height, minBits, maxBits int, lowEffort bool, maxQuan
 		for x := 0; x < width; x += tile {
 			x1 := min(x+tile, width)
 			mode := int(mrow[x>>uint(bits)]>>8) & 0xff
-			if slow {
+			switch {
+			case mask != nil:
+				residualRowClean(mode, curCopy, prev, y, width, height, x, x1, mask[y*width:(y+1)*width], out[x:x1])
+			case slow:
 				var mdRow []uint8
 				if nl {
 					mdRow = md[y*width : (y+1)*width]
 				}
 				residualRowNL(mode, curCopy, prev, y, width, height, x, x1, mdRow, maxQuant, usedSubGreen, clean, out[x:x1])
-			} else {
+			default:
 				residualRow(mode, curCopy, prev, y, x, x1, out[x:x1])
 			}
 		}
@@ -365,6 +451,7 @@ type predSearch struct {
 	minBits, maxBits int
 	maxQuant         int
 	md               []uint8
+	mask             []uint8 // see cleanMask (nil: every pixel takes the slow path)
 	usedSubGreen     bool
 	clean, slow      bool
 	argb             []uint32
@@ -424,9 +511,10 @@ func (ps *predSearch) run(modes []uint32) int {
 		sx, sy := tileX<<uint(minBits), tileY<<uint(minBits)
 		maxX := min(tile, width-sx)
 		maxY := min(tile, height-sy)
+		slow := ps.tileSlow(sx, sy, maxX, maxY)
 		for mode := 0; mode < numPredModes; mode++ {
 			r := resid[:maxX*maxY]
-			ps.tileResiduals(mode, sx, sy, maxX, maxY, r, rowCur, rowUp)
+			ps.tileResiduals(mode, sx, sy, maxX, maxY, slow, r, rowCur, rowUp)
 			for l := 0; l <= updateUpTo; l++ {
 				h := &ps.hist[l*numPredModes+mode]
 				for _, p := range r {
@@ -549,8 +637,9 @@ func (ps *predSearch) runPar(modes []uint32, helpers int) int {
 			hs := buf[k*numPredModes : (k+1)*numPredModes]
 			clear(hs)
 			r := w.resid[:maxX*maxY]
+			slow := ps.tileSlow(sx, sy, maxX, maxY)
 			for mode := range hs {
-				ps.tileResiduals(mode, sx, sy, maxX, maxY, r, w.rowCur, w.rowUp)
+				ps.tileResiduals(mode, sx, sy, maxX, maxY, slow, r, w.rowCur, w.rowUp)
 				h := &hs[mode]
 				for _, p := range r {
 					h.add(p)
@@ -647,12 +736,29 @@ func shannonEntropy(x []int32) float64 {
 	return r + slog2(sum)
 }
 
-// tileResiduals computes into out the residuals of one tile for mode. cur
-// and up (width+1 entries each) are working rows (for the slow path).
-func (ps *predSearch) tileResiduals(mode, sx, sy, maxX, maxY int, out, cur, up []uint32) {
+// tileSlow reports whether the residuals of a tile need the slow path
+// (residualRowNL): with near-lossless, or with clean when a pixel of the
+// tile depends on a fully transparent one (see cleanMask).
+func (ps *predSearch) tileSlow(sx, sy, maxX, maxY int) bool {
+	if !ps.slow || ps.mask == nil {
+		return ps.slow
+	}
+	var acc uint8
+	for y := sy; y < sy+maxY; y++ {
+		for _, m := range ps.mask[y*ps.width+sx : y*ps.width+sx+maxX] {
+			acc |= m
+		}
+	}
+	return acc != 0
+}
+
+// tileResiduals computes into out the residuals of one tile for mode. slow
+// is tileSlow of the tile. cur and up (width+1 entries each) are working
+// rows (for the slow path).
+func (ps *predSearch) tileResiduals(mode, sx, sy, maxX, maxY int, slow bool, out, cur, up []uint32) {
 	width := ps.width
 	argb := ps.argb
-	if !ps.slow {
+	if !slow {
 		for ry := 0; ry < maxY; ry++ {
 			y := sy + ry
 			row := argb[y*width : (y+1)*width]
@@ -684,6 +790,10 @@ func (ps *predSearch) tileResiduals(mode, sx, sy, maxX, maxY int, out, cur, up [
 		}
 		e := min(y*width+hi, n)
 		copy(cur[lo:], argb[y*width+lo:e])
+		if ps.mask != nil {
+			residualRowClean(mode, cur, up, y, width, ps.height, sx, sx+maxX, ps.mask[y*width:(y+1)*width], out[ry*maxX:(ry+1)*maxX])
+			continue
+		}
 		var mdRow []uint8
 		if ps.md != nil {
 			mdRow = ps.md[y*width : (y+1)*width]

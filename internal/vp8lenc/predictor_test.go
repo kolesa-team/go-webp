@@ -51,6 +51,87 @@ func predInputs() []struct {
 	return out
 }
 
+// TestCleanFastPath checks that the exact=0 cleaning with the fast path for
+// the pixels away from transparency gives the residuals and modes of the
+// all-slow path, on random transparency masks (isolated pixels, first and
+// last columns, whole rows), for every tile size and with each single mode.
+func TestCleanFastPath(t *testing.T) {
+	defer func(v bool) { cleanFastPath = v }(cleanFastPath)
+	rng := rand.New(rand.NewSource(17))
+	type in struct {
+		name string
+		w, h int
+		tr   func(x, y int) bool
+	}
+	ins := []in{
+		{"sparse", 67, 41, func(x, y int) bool { return rng.Intn(20) == 0 }},
+		{"dense", 50, 33, func(x, y int) bool { return rng.Intn(2) == 0 }},
+		{"edges", 45, 30, func(x, y int) bool { return x == 0 || x == 44 || y == 29 }},
+		{"firstcol", 40, 20, func(x, y int) bool { return x == 0 && y%2 == 1 }},
+		{"blocks", 70, 70, func(x, y int) bool { return (x/9+y/7)%3 == 0 }},
+		{"1xN", 1, 50, func(x, y int) bool { return y%3 == 0 }},
+		{"Nx1", 50, 1, func(x, y int) bool { return x%4 == 1 }},
+		{"2x2", 2, 2, func(x, y int) bool { return x == y }},
+	}
+	for _, c := range ins {
+		src := make([]uint32, c.w*c.h)
+		for y := 0; y < c.h; y++ {
+			for x := 0; x < c.w; x++ {
+				p := 0xff000000 | uint32(x*5+rng.Intn(3))&0xff<<16 | uint32(y*3)&0xff<<8 | uint32(x+y)&0xff
+				if c.tr(x, y) {
+					p = rng.Uint32() & 0x00ffffff
+				} else if rng.Intn(10) == 0 {
+					p = p&0x00ffffff | uint32(1+rng.Intn(254))<<24
+				}
+				src[y*c.w+x] = p
+			}
+		}
+		for _, bits := range []int{2, 3, 4, 5} {
+			for _, maxBits := range []int{bits, min(bits+2, maxTransformBits)} {
+				run := func(fast bool, helpers int) ([]uint32, []uint32, int) {
+					cleanFastPath = fast
+					argb := slices.Clone(src)
+					modes := make([]uint32, subSampleSize(c.w, bits)*subSampleSize(c.h, bits))
+					b := predictorImage(c.w, c.h, bits, maxBits, false, 1, true, true, argb, modes, new(scratch), helpers)
+					return argb, modes, b
+				}
+				wantArgb, wantModes, wantBits := run(false, 0)
+				for _, helpers := range []int{0, 3} {
+					argb, modes, b := run(true, helpers)
+					if b != wantBits || !slices.Equal(modes, wantModes) || !slices.Equal(argb, wantArgb) {
+						t.Fatalf("%s bits %d..%d helpers %d: fast clean path differs", c.name, bits, maxBits, helpers)
+					}
+				}
+			}
+		}
+		// Every mode on full rows (the final residual pass).
+		for mode := 0; mode < numPredModes; mode++ {
+			rows := func(fast bool) []uint32 {
+				prev, cur := make([]uint32, c.w+1), make([]uint32, c.w+1)
+				out := make([]uint32, c.w*c.h)
+				mask := make([]uint8, c.w*c.h)
+				cleanMask(src, c.w, c.h, mask)
+				for y := 0; y < c.h; y++ {
+					copy(cur, src[y*c.w:(y+1)*c.w])
+					if y > 0 {
+						prev[c.w] = cur[0]
+					}
+					if fast {
+						residualRowClean(mode, cur, prev, y, c.w, c.h, 0, c.w, mask[y*c.w:(y+1)*c.w], out[y*c.w:(y+1)*c.w])
+					} else {
+						residualRowNL(mode, cur, prev, y, c.w, c.h, 0, c.w, nil, 1, false, true, out[y*c.w:(y+1)*c.w])
+					}
+					prev, cur = cur, prev
+				}
+				return out
+			}
+			if !slices.Equal(rows(true), rows(false)) {
+				t.Fatalf("%s mode %d: fast clean rows differ", c.name, mode)
+			}
+		}
+	}
+}
+
 // TestPredictorParallel checks that the parallel mode search gives the same
 // modes and residuals as the sequential one, for opaque and transparent
 // images (clean), near-lossless quantization and every budget.
