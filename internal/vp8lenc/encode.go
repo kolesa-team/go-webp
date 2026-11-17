@@ -552,16 +552,23 @@ func analyzeEntropy(argb []uint32, w, h int, usePalette bool, paletteSize, trans
 	return best, rb
 }
 
+// streamHeadroom is the initial output capacity of a stream (beyond the
+// prefix): room for the transforms and their sub-images.
+const streamHeadroom = 16 << 10
+
 // encodeStream encodes src with one crunch configuration and returns a
 // byte slice with prefix zero bytes followed by the image stream (with one
 // spare byte of capacity for a RIFF padding byte). The stream is written
-// into buf if its capacity is at least the initial estimate, else into a
-// new buffer. src is modified only if mutable is set.
+// into buf if its capacity is at least prefix+streamHeadroom (growing it
+// when needed), else into a new buffer. src is modified only if mutable is
+// set.
 func encodeStream(src []uint32, mutable bool, w, h int, p *params, cc crunchConfig, prefix int, sc *scratch, buf []byte) []byte {
 	sc.noteSize(w * h)
 	// The output is written straight into the returned buffer (no final
-	// copy), presized from a rough estimate of 1.5 bytes per pixel.
-	if need := prefix + w*h*3/2 + 4096; cap(buf) >= need {
+	// copy). It is first sized for the transforms (small sub-images), then
+	// grown once to the size estimate of the main image before writing it
+	// (encodeImageInternal).
+	if need := prefix + streamHeadroom; cap(buf) >= need {
 		buf = buf[:prefix]
 		clear(buf)
 	} else {
@@ -583,7 +590,14 @@ func encodeStream(src []uint32, mutable bool, w, h int, p *params, cc crunchConf
 		pal := p.paletteSorts[cc.paletteSort]
 		xbits := paletteXBits(len(pal))
 		width = subSampleSize(w, xbits)
-		cur = sc.curBuf(width * h)
+		if mutable {
+			// In place: row y is read entirely before the (at most as wide)
+			// bundled row y is written at y*width <= y*w, so no row is
+			// overwritten before it has been read.
+			cur = src[:width*h]
+		} else {
+			cur = sc.curBuf(width * h)
+		}
 		applyPalette(src, w, h, pal, cur, sc.idx(w))
 		// Write the palette transform.
 		bw.putBits(1, 1)
@@ -656,6 +670,10 @@ func encodeStream(src []uint32, mutable bool, w, h int, p *params, cc crunchConf
 type refsCandidate struct {
 	refs      []pixOrCopy
 	cacheBits int
+	// bits estimates the coded size of the parse with a single histogram
+	// (see histoCost); the clustered meta-Huffman coding is usually
+	// smaller.
+	bits float64
 }
 
 // histoCost estimates the size of a parse. With raw set, distances are
@@ -772,9 +790,11 @@ func getBackwardRefs(argb []uint32, w, h int, quality int, lowEffort, box bool, 
 			break
 		}
 	}
-	cands = append(cands[:0], refsCandidate{sc.refs[best[0]], bestCB})
+	// (A cost-based parse only replaces a candidate when cheaper, so
+	// bestCost bounds the estimate of the returned parses.)
+	cands = append(cands[:0], refsCandidate{sc.refs[best[0]], bestCB, bestCost[0]})
 	if tryNoCache && bestCB > 0 {
-		cands = append(cands, refsCandidate{sc.refs[best[1]], 0})
+		cands = append(cands, refsCandidate{sc.refs[best[1]], 0, bestCost[1]})
 	}
 	return cands
 }
@@ -855,6 +875,7 @@ func encodeImageInternal(bw *bitWriter, argb []uint32, w, h int, p *params, cach
 	var candBuf [2]refsCandidate
 	cands := getBackwardRefs(argb, w, h, p.quality, p.lowEffort, false, cacheBitsMax, p.tryNoCache, sc, candBuf[:0])
 	if len(cands) == 1 && !p.tryBox {
+		bw.reserve(mainImageReserve(cands[0].bits))
 		writeMainImage(bw, w, h, p, cands[0], sc)
 		return
 	}
@@ -881,7 +902,23 @@ func encodeImageInternal(bw *bitWriter, argb []uint32, w, h int, p *params, cach
 			try(c)
 		}
 	}
+	// Exact size (plus a RIFF padding byte).
+	bw.reserve(len(sc.bwTmp[bestIdx].buf) + 9)
 	bw.appendWriter(&sc.bwTmp[bestIdx])
+}
+
+// mainImageReserve returns the number of bytes to reserve in the output for
+// the main image of a parse whose single-histogram size estimate is bits:
+// the estimate plus a 1/8 margin. The clustered stream is usually 0-30%
+// smaller than the estimate, up to 8% larger for low-effort encodes of
+// images with transparency; when it does not fit, the writer grows by
+// append.
+func mainImageReserve(bits float64) int {
+	b := bits / 8
+	if !(b < 1<<30) { // also NaN
+		b = 1 << 30
+	}
+	return int(b+b/8) + 4096
 }
 
 func writeMainImage(bw *bitWriter, w, h int, p *params, c refsCandidate, sc *scratch) {

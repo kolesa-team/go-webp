@@ -1,6 +1,9 @@
 package vp8lenc
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"slices"
+)
 
 // bitWriter writes VP8L bits LSB-first using a 64-bit accumulator.
 type bitWriter struct {
@@ -17,6 +20,13 @@ func (w *bitWriter) putBits(v uint32, n uint) {
 		w.buf = binary.LittleEndian.AppendUint32(w.buf, uint32(w.acc))
 		w.acc >>= 32
 		w.nbits -= 32
+	}
+}
+
+// reserve makes room for at least n more bytes in the buffer.
+func (w *bitWriter) reserve(n int) {
+	if n > 0 && cap(w.buf)-len(w.buf) < n {
+		w.buf = slices.Grow(w.buf, n)
 	}
 }
 
