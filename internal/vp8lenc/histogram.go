@@ -23,7 +23,7 @@ type histo struct {
 	used    bool // the histogram is not empty
 	// shared marks a tile histogram of the clusterer (clusterer.orig) used
 	// as is in the working set: its populations and costs must not change
-	// (the working set copies it on write, see clusterer.writable).
+	// (the working set copies it on write, see clusterer.mergeInto).
 	shared bool
 }
 
