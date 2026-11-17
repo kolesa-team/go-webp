@@ -82,5 +82,27 @@ func FuzzDecode(f *testing.F) {
 		if err == nil && img.Bounds().Empty() {
 			t.Fatal("empty image without error")
 		}
+
+		// DecodeInto a dirty buffer that is just large enough must give the
+		// same pixels (every output byte is written) and the same error.
+		n := 64
+		if err == nil {
+			n = len(img.(*image.NRGBA).Pix)
+		}
+		dst := dirty(n)
+		got, err2 := newDec(t, data, o).DecodeInto(dst)
+		switch {
+		case (err == nil) != (err2 == nil):
+			t.Fatalf("Decode: %v, DecodeInto: %v", err, err2)
+		case err != nil && err.Error() != err2.Error():
+			t.Fatalf("Decode: %v, DecodeInto: %v", err, err2)
+		case err == nil && !bytes.Equal(img.(*image.NRGBA).Pix, got.Pix):
+			t.Fatal("DecodeInto pixels differ from Decode")
+		}
+
+		// The Y'CbCr output must not panic either.
+		if ycc, err := newDec(t, data, o).DecodeNYCbCrA(); err == nil && ycc.Rect.Empty() {
+			t.Fatal("empty Y'CbCr image without error")
+		}
 	})
 }
