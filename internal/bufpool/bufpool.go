@@ -8,7 +8,7 @@
 //     the element count). Get returns a buffer of the class that is large
 //     enough, or of the next class, or allocates one of the exact size.
 //   - All pools of the process share one budget (Limit, 256 MiB by
-//     default): Put drops the buffer, leaving it to the garbage collector,
+//     default, 64 MiB on 32-bit platforms): Put drops the buffer, leaving it to the garbage collector,
 //     when keeping it would exceed the budget or when it alone is larger
 //     than an eighth of the budget.
 //   - Buffers that stay unused for MaxIdle (15 s by default) are dropped at
@@ -30,8 +30,10 @@ import (
 )
 
 const (
-	// DefaultLimit is the default budget of retained bytes.
-	DefaultLimit = 256 << 20
+	// DefaultLimit is the default budget of retained bytes: 256 MiB, or
+	// 64 MiB on 32-bit platforms (as the lossless encoder's free lists),
+	// where the address space is much smaller.
+	DefaultLimit = 64 << 20 << (^uintptr(0) >> 63 * 2)
 	// DefaultMaxIdle is the default time after which an unused buffer is
 	// dropped.
 	DefaultMaxIdle = 15 * time.Second
