@@ -139,7 +139,7 @@ func TestAlphaSetUpOnCaller(t *testing.T) {
 	bad := append([]byte{0xc1}, alph[1:]...)
 	a = newLazyAlpha(bad, 3000, 2000, frame, &Config{UseThreads: true})
 	assert.True(t, a.started)
-	_, err := a.get(16)
+	_, _, err := a.get(0, 16)
 	assert.Equal(t, utils.Vp8StatusOutOfMemory, status.CodeOf(err))
 	a.release()
 }

@@ -593,16 +593,26 @@ func TestThreadedAlphaCallback(t *testing.T) {
 		plane[i] = byte(i*7 + i/w)
 	}
 	run := func(threads bool, crop *image.Rectangle, failAt int, opaque bool) (string, map[uint64]bool) {
-		var calls []int
-		opts := Options{UseThreads: threads, Alpha: func(rowEnd int) ([]byte, error) {
-			calls = append(calls, rowEnd)
+		var calls [][2]int
+		var win []byte
+		opts := Options{UseThreads: threads, Alpha: func(rowStart, rowEnd int) ([]byte, int, error) {
+			calls = append(calls, [2]int{rowStart, rowEnd})
 			switch {
 			case len(calls) == failAt:
-				return nil, errAlpha
+				return nil, 0, errAlpha
 			case opaque:
-				return nil, nil
+				return nil, 0, nil
 			}
-			return plane[:rowEnd*w], nil
+			// A window of just the rows asked for; the previous one is
+			// overwritten, so reading it after this call shows.
+			for i := range win {
+				win[i] = 0x5a
+			}
+			if len(calls)%2 == 0 {
+				return plane[:rowEnd*w], 0, nil // a whole plane is a window too
+			}
+			win = append(win[:0], plane[rowStart*w:rowEnd*w]...)
+			return win, rowStart, nil
 		}}
 		r := runDecode(vp8, opts, crop, 0, 0)
 		return fmt.Sprintf("calls %v err %q log %s pix %x", calls, r.err, r.log, sha256.Sum256(r.pix)), r.gids

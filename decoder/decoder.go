@@ -30,9 +30,7 @@ import (
 	"image"
 	"io"
 	"os"
-	"sync"
 
-	"github.com/kolesa-team/go-webp/v2/internal/alpha"
 	"github.com/kolesa-team/go-webp/v2/internal/container"
 	"github.com/kolesa-team/go-webp/v2/internal/pipeline"
 	"github.com/kolesa-team/go-webp/v2/internal/resample"
@@ -314,227 +312,6 @@ func (d *Decoder) decodeLossy(parsed *container.Image, cl call) (*image.NRGBA, e
 	return result(), nil
 }
 
-// lazyAlpha decodes an ALPH chunk incrementally, up to the rows the VP8
-// decoder is about to emit (libwebp's VP8DecompressAlphaRows): rows are
-// decoded (lossless streams through vp8l.AlphaDecoder) and unfiltered in
-// batches. Alpha dithering needs the whole plane, so with it the plane is
-// decoded in one pass, as libwebp does.
-type lazyAlpha struct {
-	alph      []byte
-	w, h      int
-	crop      image.Rectangle
-	dithering int
-
-	started bool
-	hdr     alpha.Header
-	data    []byte             // payload after the header byte
-	dec     *vp8l.AlphaDecoder // nil for uncompressed alpha
-	pp      *[]byte            // pooled plane, if any
-	spare   *[]byte            // pooled plane taken by prefetch, not yet used
-	plane   []byte             // rows [0, rows) are final
-	rows    int
-	err     error
-
-	// helperOK lets the first get start a helper goroutine (UseThreads);
-	// while async is set the helper owns dec, pp, spare, plane and rows,
-	// and get reads the published rows from hp.
-	helperOK bool
-	async    bool
-	hp       *alphaHelper
-}
-
-// newLazyAlpha returns the alpha decoder of a w x h frame whose output
-// region is crop. It must be released (on the calling goroutine).
-func newLazyAlpha(alph []byte, w, h int, crop image.Rectangle, c *Config) *lazyAlpha {
-	a := &lazyAlpha{alph: alph, w: w, h: h, crop: crop, dithering: c.AlphaDitheringStrength}
-	// With UseThreads the plane is first needed on the worker goroutine,
-	// while release runs on this one: a sync.Pool Get on another P misses
-	// the plane put back by the previous decode. Take a pooled plane here
-	// (without allocating one: the allocation stays lazy, see grow).
-	a.prefetch()
-	if c.UseThreads {
-		// Likewise the lossless alpha decoder (vp8l pools its state): set
-		// it up here, so that it comes from and returns to this goroutine's
-		// pool. An error is kept for the first get, which keeps the VP8
-		// errors that come before the first emitted row first.
-		a.start()
-		// The first get may hand the plane to a helper goroutine
-		// (alpha_helper.go).
-		a.helperOK = true
-	}
-	return a
-}
-
-// get returns the alpha plane with at least its first rowEnd rows decoded
-// (the slice may change between calls).
-func (a *lazyAlpha) get(rowEnd int) ([]byte, error) {
-	if a.err != nil {
-		return nil, a.err
-	}
-	if !a.started {
-		if a.start(); a.err != nil {
-			return nil, a.err
-		}
-	}
-	rowEnd = min(rowEnd, a.h)
-	if a.async {
-		return a.getAsync(rowEnd)
-	}
-	if rowEnd <= a.rows {
-		return a.plane, nil
-	}
-	if a.helperOK {
-		a.helperOK = false
-		if a.useHelper() && a.startHelper() {
-			return a.getAsync(rowEnd)
-		}
-	}
-	if a.hdr.PreProcessing == alpha.PreprocessingLevels && a.dithering > 0 {
-		rowEnd = a.h // dequantization smooths the whole plane at once
-	}
-	if a.err = a.decodeRows(rowEnd); a.err != nil {
-		return nil, a.err
-	}
-	return a.plane, nil
-}
-
-// start initializes the alpha decoder, keeping a failure in a.err.
-func (a *lazyAlpha) start() {
-	a.started = true
-	a.err = a.init()
-}
-
-// init validates the ALPH header like libwebp's ALPHInit, which
-// VP8DecompressAlphaRows reports as VP8_STATUS_OUT_OF_MEMORY on failure.
-func (a *lazyAlpha) init() error {
-	if len(a.alph) <= 1 {
-		return status.New(utils.Vp8StatusOutOfMemory, "alpha decoder initialization failed: alpha chunk too short")
-	}
-	hdr, err := alpha.ParseHeader(a.alph[0])
-	if err != nil {
-		return status.New(utils.Vp8StatusOutOfMemory, "alpha decoder initialization failed: invalid ALPH header")
-	}
-	a.hdr = hdr
-	a.data = a.alph[1:]
-	if hdr.Compression == alpha.CompressionNone {
-		if len(a.data) < a.w*a.h {
-			return status.New(utils.Vp8StatusOutOfMemory, "alpha decoder initialization failed: alpha chunk too short")
-		}
-		return nil
-	}
-	a.dec, err = vp8l.NewAlphaDecoder(a.data, a.w, a.h)
-	return err
-}
-
-// decodeRows decodes and unfilters rows [a.rows, rowEnd).
-func (a *lazyAlpha) decodeRows(rowEnd int) error {
-	w := a.w
-	a.grow(rowEnd)
-	y0 := a.rows
-	if a.dec == nil {
-		copy(a.plane[y0*w:rowEnd*w], a.data[y0*w:rowEnd*w])
-	} else if err := a.dec.DecodeRows(a.plane[:rowEnd*w], rowEnd); err != nil {
-		if status.CodeOf(err) == utils.Vp8StatusOutOfMemory {
-			return err
-		}
-		return status.Bitstream("could not decode alpha data: " + err.Error())
-	}
-	if a.hdr.Filter != alpha.FilterNone {
-		var prev []byte
-		if y0 > 0 {
-			prev = a.plane[(y0-1)*w : y0*w]
-		}
-		for y := y0; y < rowEnd; y++ {
-			row := a.plane[y*w : (y+1)*w]
-			alpha.UnfilterRow(a.hdr.Filter, prev, row, row)
-			prev = row
-		}
-	}
-	a.rows = rowEnd
-	if rowEnd == a.h && a.hdr.PreProcessing == alpha.PreprocessingLevels && a.dithering > 0 {
-		crop := a.crop
-		win := a.plane[crop.Min.Y*w+crop.Min.X:]
-		if err := alpha.Dequantize(win, crop.Dx(), crop.Dy(), w, min(a.dithering, 100)); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// minAlphaBand is the smallest allocation (in bytes) of a growing alpha
-// plane.
-const minAlphaBand = 4 << 20
-
-// grow makes the plane hold at least rowEnd rows. Planes up to
-// maxPooledPlane bytes are taken whole from planePool. Bigger ones start
-// with minAlphaBand bytes and grow by 4x (straight to the full plane once
-// that is at least half of it), so that a huge frame whose VP8 data ends
-// early (or a crop near the top) does not allocate the full plane, while
-// a complete decode allocates little more than the plane itself.
-func (a *lazyAlpha) grow(rowEnd int) {
-	w, h := a.w, a.h
-	if len(a.plane) >= rowEnd*w {
-		return
-	}
-	if w*h <= maxPooledPlane {
-		if a.spare != nil {
-			a.pp, a.spare = a.spare, nil
-			*a.pp = (*a.pp)[:w*h]
-		} else {
-			a.pp = getPlane(w * h)
-		}
-		a.plane = *a.pp
-		return
-	}
-	rows := max(rowEnd, 4*len(a.plane)/w, minAlphaBand/w)
-	if 2*rows >= h {
-		rows = h
-	}
-	np := make([]byte, rows*w)
-	copy(np, a.plane[:a.rows*w])
-	a.plane = np
-}
-
-// prefetch takes a plane big enough for the whole alpha plane from
-// planePool, if the plane is poolable and the pool has one; it allocates
-// nothing.
-func (a *lazyAlpha) prefetch() {
-	n := a.w * a.h
-	if n > maxPooledPlane {
-		return
-	}
-	if p, ok := planePool.Get().(*[]byte); ok {
-		if cap(*p) >= n {
-			a.spare = p
-		} else {
-			planePool.Put(p)
-		}
-	}
-}
-
-func (a *lazyAlpha) release() {
-	a.stopHelper()
-	if a.spare != nil {
-		planePool.Put(a.spare)
-		a.spare = nil
-	}
-	if a.dec != nil {
-		a.dec.Close()
-		a.dec = nil
-	}
-	if a.pp != nil {
-		if cap(*a.pp) <= maxPooledPlane {
-			planePool.Put(a.pp)
-		}
-		a.pp = nil
-	}
-	a.plane = nil
-}
-
-// maxPooledPlane bounds the alpha planes kept in planePool, so that one huge
-// image does not pin its alpha plane in memory.
-const maxPooledPlane = 16 << 20
-
 // yuvAdapter forwards the Y'CbCr rows of the VP8 decoder (and the matching
 // alpha rows) to a scaling sink, which rescales the planes separately like
 // libwebp.
@@ -552,24 +329,13 @@ func (a *yuvAdapter) PutYUV(y, n int, ys []byte, yStride int, us, vs []byte, uvS
 	}
 	var ap []byte
 	if a.alpha != nil {
-		plane, err := a.alpha.get(a.top + y + n)
+		plane, base, err := a.alpha.get(a.top+y, a.top+y+n)
 		if err != nil {
 			return err
 		}
-		ap = plane[(a.top+y)*a.alphaStride+a.left:]
+		ap = plane[(a.top+y-base)*a.alphaStride+a.left:]
 	}
 	return a.sink.CommitYUV(y, n, ys, yStride, us, vs, uvStride, ap, a.alphaStride)
 }
 
 func (a *yuvAdapter) NeedRows() int { return a.sink.NeedRows() }
-
-var planePool sync.Pool // of *[]byte
-
-func getPlane(n int) *[]byte {
-	if p, ok := planePool.Get().(*[]byte); ok && cap(*p) >= n {
-		*p = (*p)[:n]
-		return p
-	}
-	b := make([]byte, n)
-	return &b
-}

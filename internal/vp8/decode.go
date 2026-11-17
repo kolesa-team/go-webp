@@ -41,15 +41,18 @@ type Options struct {
 	UseThreads bool
 	// Alpha, if not nil and no alpha plane is passed to Decode or
 	// DecodeRegion, is called before each batch of output rows is emitted
-	// to obtain the alpha plane (same layout as the alpha argument, rows
-	// counted from the top of the frame; a nil plane means opaque). rowEnd
-	// is the number of frame rows whose alpha is needed: only the first
-	// rowEnd*width bytes of the returned plane are read, and the plane may
-	// be a different (longer) slice on each call. Like libwebp, which
-	// decodes the ALPH chunk while emitting rows (VP8DecompressAlphaRows),
-	// this lets the caller decode alpha only as far as the VP8 data goes.
-	// An error it returns aborts decoding.
-	Alpha func(rowEnd int) ([]byte, error)
+	// to obtain the alpha samples of frame rows [rowStart, rowEnd) (rows
+	// counted from the top of the frame). It returns a window of the alpha
+	// plane (stride width) and the frame row it starts at: frame row y is
+	// plane[(y-base)*width:][:width], base <= rowStart (a whole plane has
+	// base 0). The window is only read until the next call, and rowStart
+	// never decreases, so the caller may keep just the rows still needed
+	// instead of the whole plane. A nil plane means opaque. rowEnd is
+	// also the number of frame rows whose alpha has to be decoded: like
+	// libwebp, which decodes the ALPH chunk while emitting rows
+	// (VP8DecompressAlphaRows), this lets the caller decode alpha only as
+	// far as the VP8 data goes. An error it returns aborts decoding.
+	Alpha func(rowStart, rowEnd int) (plane []byte, base int, err error)
 }
 
 // kFilterExtraRows is the number of rows the loop filter may still modify
@@ -142,7 +145,8 @@ type decoder struct {
 	sink             pipeline.Sink
 	ysink            YUVSink // non-nil for DecodeYUV
 	alpha            []byte
-	alphaFn          func(rowEnd int) ([]byte, error)
+	alphaBase        int // the frame row alpha starts at
+	alphaFn          func(rowStart, rowEnd int) ([]byte, int, error)
 	fancy            bool
 	tmpY, tmpU, tmpV []byte
 	uvT, uvB         []uint32 // upsampled chroma scratch rows
@@ -273,7 +277,7 @@ func (d *decoder) decode(data, alpha []byte, o *Options, crop *image.Rectangle, 
 	if ya, ok := sink.(yuvAdapter); ok {
 		d.ysink = ya.YUVSink
 	}
-	d.alpha = alpha
+	d.alpha, d.alphaBase = alpha, 0
 	d.fancy = !o.NoFancyUpsampling
 	d.rowsOut = 0
 	d.initFrame()
@@ -514,23 +518,23 @@ func (d *decoder) emitRow(mbY int, cy, cu, cv []byte) error {
 	return nil
 }
 
-// loadAlpha obtains the deferred alpha plane (Options.Alpha) for output
-// rows [0, yEnd).
-func (d *decoder) loadAlpha(yEnd int) error {
+// loadAlpha obtains the deferred alpha samples (Options.Alpha) of output
+// rows [yStart, yEnd).
+func (d *decoder) loadAlpha(yStart, yEnd int) error {
 	if d.alphaFn == nil {
 		return nil
 	}
-	rowEnd := min(d.cropTop+yEnd, d.height)
-	a, err := d.alphaFn(rowEnd)
+	rowStart, rowEnd := d.cropTop+yStart, min(d.cropTop+yEnd, d.height)
+	a, base, err := d.alphaFn(rowStart, rowEnd)
 	if err != nil {
 		return err
 	}
 	if a == nil {
 		d.alphaFn = nil // opaque
-	} else if len(a) < rowEnd*d.width {
+	} else if base < 0 || base > rowStart || len(a) < (rowEnd-base)*d.width {
 		return status.InvalidParam("alpha plane too small")
 	}
-	d.alpha = a
+	d.alpha, d.alphaBase = a, base
 	return nil
 }
 
@@ -540,14 +544,14 @@ func (d *decoder) alphaRow(y int) []byte {
 	if d.alpha == nil {
 		return nil
 	}
-	o := (d.cropTop+y)*d.width + d.cropLeft
+	o := (d.cropTop+y-d.alphaBase)*d.width + d.cropLeft
 	return d.alpha[o : o+d.outW]
 }
 
 // emitSampled converts rows [yStart, yEnd) with point-sampled chroma.
 func (d *decoder) emitSampled(ys, us, vs []byte, yStart, yEnd int) error {
 	n := yEnd - yStart
-	if err := d.loadAlpha(yEnd); err != nil {
+	if err := d.loadAlpha(yStart, yEnd); err != nil {
 		return err
 	}
 	dst := d.sink.Buffer(yStart, n)
@@ -580,7 +584,7 @@ func (d *decoder) emitFancy(ys, us, vs []byte, yStart, yEnd int, isLast bool) er
 	if n <= 0 {
 		return nil
 	}
-	if err := d.loadAlpha(yEnd); err != nil {
+	if err := d.loadAlpha(outStart, yEnd); err != nil {
 		return err
 	}
 	dst := d.sink.Buffer(outStart, n)
