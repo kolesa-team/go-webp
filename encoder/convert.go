@@ -3,23 +3,69 @@ package encoder
 import (
 	"image"
 	"image/color"
+	"sync"
 )
 
 // toNRGBA returns src as an *image.NRGBA. An *image.NRGBA is returned as is
-// (shared, as in v1); every other image is copied, so that the result is a
-// snapshot of src. The common standard library image types are converted
-// with dedicated loops (the results equal draw.Draw(dst, r, src, r.Min,
-// draw.Src), i.e. color.NRGBAModel conversion, but without its per-pixel
-// interface calls); an opaque *image.RGBA, whose bytes are the same
-// premultiplied or not (png.Decode returns those for RGB files), is copied
-// row by row.
+// (shared, as in v1); every other image is copied (see convertNRGBA), so
+// that the result is a snapshot of src.
 func toNRGBA(src image.Image) *image.NRGBA {
 	if v, ok := src.(*image.NRGBA); ok {
 		return v
 	}
 	b := src.Bounds()
+	dst := image.NewNRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
+	convertNRGBA(dst, src)
+	return dst
+}
+
+// maxPooledPixels bounds the size of the snapshots whose storage is pooled
+// (as in the internal encoders): the buffers of larger pictures are left to
+// the garbage collector instead of being retained between calls.
+const maxPooledPixels = 2 << 20
+
+var pixPool sync.Pool // of *[]byte, NRGBA snapshot storage
+
+// pooledNRGBA returns a w x h *image.NRGBA whose pixels (unspecified, to be
+// overwritten) may come from a pool, and the storage to hand back to
+// putPix when the image is no longer used.
+func pooledNRGBA(w, h int) (*image.NRGBA, *[]byte) {
+	n := 4 * w * h
+	var pp *[]byte
+	// A picture too large to be pooled leaves the pooled buffers alone
+	// (taking one would discard it).
+	if n <= 4*maxPooledPixels {
+		if p, ok := pixPool.Get().(*[]byte); ok && cap(*p) >= n {
+			pp = p
+		}
+	}
+	if pp == nil {
+		b := make([]byte, n)
+		pp = &b
+	}
+	*pp = (*pp)[:n]
+	return &image.NRGBA{Pix: *pp, Stride: 4 * w, Rect: image.Rect(0, 0, w, h)}, pp
+}
+
+// putPix returns storage obtained from pooledNRGBA to the pool (unless it
+// is too large to be retained).
+func putPix(pp *[]byte) {
+	if pp == nil || cap(*pp) > 4*maxPooledPixels {
+		return
+	}
+	pixPool.Put(pp)
+}
+
+// convertNRGBA overwrites every pixel of dst (whose size is that of src's
+// bounds, origin at 0,0) with src converted to non-premultiplied RGBA. The
+// common standard library image types are converted with dedicated loops
+// (the results equal draw.Draw(dst, r, src, r.Min, draw.Src), i.e.
+// color.NRGBAModel conversion, but without its per-pixel interface calls);
+// an opaque *image.RGBA, whose bytes are the same premultiplied or not
+// (png.Decode returns those for RGB files), is copied row by row.
+func convertNRGBA(dst *image.NRGBA, src image.Image) {
+	b := src.Bounds()
 	w, h := b.Dx(), b.Dy()
-	dst := image.NewNRGBA(image.Rect(0, 0, w, h))
 
 	switch v := src.(type) {
 	case *image.RGBA:
@@ -94,7 +140,6 @@ func toNRGBA(src image.Image) *image.NRGBA {
 			}
 		}
 	}
-	return dst
 }
 
 // unpremultiplyRow converts alpha-premultiplied RGBA samples to

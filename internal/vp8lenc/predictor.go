@@ -397,6 +397,9 @@ func predictorImage(width, height, minBits, maxBits int, lowEffort bool, maxQuan
 		} else {
 			bits = ps.run(modes)
 		}
+		if sc.interrupted() { // the modes may be incomplete
+			return bits
+		}
 	}
 	// Replace the image by residuals, row by row, keeping the original (or,
 	// with near-lossless, reconstructed) previous row.
@@ -552,6 +555,9 @@ func (ps *predSearch) run(modes []uint32) int {
 			if tileX == tilesPerRow-1 {
 				maxTileX = 0
 				maxTileY++
+				if sc.interrupted() {
+					break
+				}
 			} else {
 				maxTileX++
 			}
@@ -659,6 +665,9 @@ func (ps *predSearch) runPar(modes []uint32, helpers int) int {
 		compute(0, worker, claim)
 	})
 	for b := 0; b < nb; b++ {
+		if sc.interrupted() {
+			break // the caller reports the interruption (modes are incomplete)
+		}
 		if b+1 == nb {
 			consume(b)
 			break

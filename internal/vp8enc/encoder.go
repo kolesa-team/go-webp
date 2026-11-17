@@ -71,6 +71,9 @@ type encoder struct {
 	// analysis pass row bands (analysis.go)
 	bands    [maxAnalysisBands]segmentJob
 	nextBand atomic.Int32
+	// stopped is set once Config.Interrupt fired during the analysis
+	// pass: the other bands then stop without polling it again.
+	stopped atomic.Bool
 }
 
 // encoderPool holds encoder structs (a few tens of KB, whatever the picture
@@ -98,6 +101,7 @@ func getCleared[T any](pool *bufpool.Pool[T], n int) []T {
 // output size to their pools.
 func (e *encoder) release() {
 	e.pic = nil
+	e.cfg.Interrupt = nil // do not retain the caller's closure in the pool
 	e.tokens.release()
 	mbInfoPool.Put(e.mbInfo)
 	bytePool.Put(e.preds)
@@ -150,7 +154,9 @@ func EncodeWithHeadroom(pic *Picture, cfg *Config, headroom int) ([]byte, error)
 		encoderPool.Put(e)
 	}()
 	e.setup(pic, &c)
-	e.analyze()
+	if e.analyze() || c.interrupted() {
+		return nil, ErrInterrupted
+	}
 	if err := e.tokenLoop(); err != nil {
 		return nil, err
 	}
