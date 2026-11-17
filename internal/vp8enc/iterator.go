@@ -58,7 +58,16 @@ type iterator struct {
 	yuvMem [3*yuvSize + predSize]byte
 }
 
+// init resets the iterator and the encoder's top context for a pass over
+// the frame.
 func (it *iterator) init(e *encoder) {
+	it.reset(e)
+	e.initTop()
+}
+
+// reset resets the iterator only (helper iterators of the analysis pass,
+// which does not use the encoder's top context).
+func (it *iterator) reset(e *encoder) {
 	it.enc = e
 	it.yuvIn = it.yuvMem[0:yuvSize:yuvSize]
 	it.yuvOut = it.yuvMem[yuvSize : 2*yuvSize : 2*yuvSize]
@@ -68,7 +77,6 @@ func (it *iterator) init(e *encoder) {
 	it.doTrellis = false
 	it.setRow(0)
 	it.countDown = e.mbW * e.mbH
-	e.initTop()
 }
 
 func (e *encoder) initTop() {
