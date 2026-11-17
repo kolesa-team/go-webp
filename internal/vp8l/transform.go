@@ -3,6 +3,8 @@ package vp8l
 // Algorithm adapted from libwebp (BSD-3-Clause): inverse transforms
 // (src/dsp/lossless.c).
 
+import "encoding/binary"
+
 const (
 	predictorTransform     = 0
 	crossColorTransform    = 1
@@ -295,42 +297,101 @@ func inverseColorIndex(t *transform, y0, y1 int, in, out []uint32) {
 	}
 }
 
-// inverseColorIndexAlpha is the 8-bit variant of inverseColorIndex used for
-// alpha planes: in holds the green (index) bytes, out receives the green
-// channel of the palette color. out may start at the same position as in, or
-// before it as arranged by decodeAlpha8.
-func inverseColorIndexAlpha(t *transform, height int, in, out []byte) {
-	width := t.xsize
-	var pal8 [256]byte
+// alphaTables holds the lookup tables of the 8-bit alpha path: the green
+// channel of each palette color, and, for bundled indices, the output bytes
+// of each packed index byte.
+type alphaTables struct {
+	pal8   [256]byte
+	bundle [256]uint64 // byte k: pal8 of the k-th index of the packed byte
+}
+
+// init builds the tables of the color-indexing transform t.
+func (a *alphaTables) init(t *transform) {
+	clear(a.pal8[:])
 	for i, c := range t.data {
-		pal8[i] = byte(c >> 8)
+		a.pal8[i] = byte(c >> 8)
 	}
 	if t.bits == 0 {
-		n := width * height
-		in = in[:n]
-		out = out[:n]
-		for i, p := range in {
-			out[i] = pal8[p]
-		}
 		return
 	}
 	bpp := uint(8 >> t.bits)
 	ppb := 1 << t.bits
-	mask := byte(1)<<bpp - 1
-	pw := subSampleSize(width, t.bits)
-	i, o := 0, 0
-	for y := 0; y < height; y++ {
-		x := 0
-		for k := 0; k < pw; k++ {
-			packed := in[i+k]
-			n := min(ppb, width-x)
-			for j := 0; j < n; j++ {
-				out[o+x] = pal8[packed&mask]
-				packed >>= bpp
-				x++
-			}
+	mask := 1<<bpp - 1
+	for v := range a.bundle {
+		var e uint64
+		for k := 0; k < ppb; k++ {
+			e |= uint64(a.pal8[v>>(uint(k)*bpp)&mask]) << (8 * k)
 		}
-		i += pw
-		o += width
+		a.bundle[v] = e
+	}
+}
+
+// inverseColorIndexAlpha is the 8-bit variant of inverseColorIndex used for
+// alpha planes: in holds the green (index) bytes of height rows (possibly
+// bundled), out receives the green channel of their palette colors. in and
+// out must not overlap.
+func inverseColorIndexAlpha(t *transform, tab *alphaTables, height int, in, out []byte) {
+	width := t.xsize
+	if t.bits == 0 {
+		n := width * height
+		lookupBytes(&tab.pal8, in[:n], out[:n])
+		return
+	}
+	pw := subSampleSize(width, t.bits)
+	in = in[:pw*height]
+	out = out[:width*height]
+	for y := 0; y < height; y++ {
+		expandBundledRow(&tab.bundle, t.bits, in[y*pw:(y+1)*pw], out[y*width:(y+1)*width])
+	}
+}
+
+// lookupBytes sets out[i] = pal[in[i]] (len(out) >= len(in)), 8 bytes per
+// step.
+func lookupBytes(pal *[256]byte, in, out []byte) {
+	out = out[:len(in)]
+	i := 0
+	for ; i+8 <= len(in); i += 8 {
+		v := binary.LittleEndian.Uint64(in[i:])
+		r := uint64(pal[byte(v)]) | uint64(pal[byte(v>>8)])<<8 |
+			uint64(pal[byte(v>>16)])<<16 | uint64(pal[byte(v>>24)])<<24 |
+			uint64(pal[byte(v>>32)])<<32 | uint64(pal[byte(v>>40)])<<40 |
+			uint64(pal[byte(v>>48)])<<48 | uint64(pal[v>>56])<<56
+		binary.LittleEndian.PutUint64(out[i:], r)
+	}
+	for ; i < len(in); i++ {
+		out[i] = pal[in[i]]
+	}
+}
+
+// expandBundledRow expands one row of bundled indices (each byte of src
+// holds 1<<bits of them) into the output bytes dst, with one 2-, 4- or
+// 8-byte store per packed byte.
+func expandBundledRow(tab *[256]uint64, bits int, src, dst []byte) {
+	ppb := 1 << bits
+	full := min(len(dst)>>bits, len(src)) // packed bytes expanded whole
+	switch bits {
+	case 1:
+		d := dst[:2*full]
+		for k, b := range src[:full] {
+			binary.LittleEndian.PutUint16(d[2*k:], uint16(tab[b]))
+		}
+	case 2:
+		d := dst[:4*full]
+		for k, b := range src[:full] {
+			binary.LittleEndian.PutUint32(d[4*k:], uint32(tab[b]))
+		}
+	default:
+		d := dst[:8*full]
+		for k, b := range src[:full] {
+			binary.LittleEndian.PutUint64(d[8*k:], tab[b])
+		}
+	}
+	if x := full * ppb; x < len(dst) && full < len(src) {
+		// The last packed byte of the row holds fewer pixels.
+		e := tab[src[full]]
+		for ; x < len(dst); x++ {
+			dst[x] = byte(e)
+			e >>= 8
+		}
 	}
 }

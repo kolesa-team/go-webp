@@ -76,6 +76,7 @@ type decoder struct {
 	premulPal   bool   // pal is alpha-premultiplied (pipeline.PremultipliedSink)
 	bundle      []byte // RGBA bytes of the pixels of each bundled index byte
 	bundleReady bool
+	alphaTab    *alphaTables // 8-bit alpha path tables (built once per decode)
 
 	// Level-0 output state.
 	out      int
@@ -320,6 +321,10 @@ func (a *AlphaDecoder) init(data []byte, width, height int) error {
 	d.use8b = d.nTransforms == 1 && d.transforms[0].kind == colorIndexingTransform && is8bOptimizable(&d.md0)
 	if d.use8b {
 		d.initBuffer8()
+		if d.alphaTab == nil {
+			d.alphaTab = new(alphaTables)
+		}
+		d.alphaTab.init(&d.transforms[0])
 	} else {
 		d.initBuffer32()
 	}
