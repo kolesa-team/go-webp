@@ -427,7 +427,11 @@ func trellisLevelCost(table *levelCostTable, level int) int64 {
 // it keeps two nodes, for levels level0 and level0+1; their state (best
 // score so far and the level cost table of the context they leave) is held
 // in scalars rather than arrays, so that it stays in registers.
-func (it *iterator) trellisQuantizeBlock(in *[16]int16, out *[16]int16, ctx0 int, coeffType int, mtx *matrix, lambda int) bool {
+//
+// It returns the levelInfoOf summary of out (zero if no level is
+// non-zero), out[0] counting as zero for typeI16AC: callers clear that DC
+// position, which trellis quantization leaves untouched.
+func (it *iterator) trellisQuantizeBlock(in *[16]int16, out *[16]int16, ctx0 int, coeffType int, mtx *matrix, lambda int) uint16 {
 	e := it.enc
 	probas := &e.proba.coeffs[coeffType]
 	costs := &e.proba.levelCost[coeffType]
@@ -562,9 +566,11 @@ func (it *iterator) trellisQuantizeBlock(in *[16]int16, out *[16]int16, ctx0 int
 		*out = [16]int16{}
 	}
 	if bestPath[0] == -1 {
-		return false
+		return 0
 	}
-	nz := 0
+	// The block ends with a non-zero level (bestPath only records such
+	// nodes), at bestPath[0].
+	nzAC := 0
 	bestNode := bestPath[1]
 	n := bestPath[0]
 	nodes[n][bestNode].prev = int8(bestPath[2])
@@ -576,11 +582,11 @@ func (it *iterator) trellisQuantizeBlock(in *[16]int16, out *[16]int16, ctx0 int
 			l = -l
 		}
 		out[n] = l
-		nz |= int(node.level)
+		nzAC += b2i(l != 0 && n > 0)
 		in[j] = int16(int32(l) * int32(mtx.q[j]))
 		bestNode = int(node.prev)
 	}
-	return nz != 0
+	return uint16(bestPath[0]+1) | uint16(nzAC)<<8
 }
 
 //------------------------------------------------------------------------------
@@ -613,14 +619,14 @@ func (it *iterator) reconstructIntra16(rd *modeScore, yuvOut []byte, mode int, w
 		for y, n := 0, 0; y < 4; y++ {
 			for x := 0; x < 4; x, n = x+1, n+1 {
 				ctx := it.topNz[x] + it.leftNz[y]
-				nonZero := it.trellisQuantizeBlock(&tmp[n], &acLevels[n], ctx, typeI16AC, &dqm.y1, dqm.lambdaTrellisI16)
-				v := b2i(nonZero)
+				info := it.trellisQuantizeBlock(&tmp[n], &acLevels[n], ctx, typeI16AC, &dqm.y1, dqm.lambdaTrellisI16)
+				v := b2i(info != 0)
 				it.topNz[x] = v
 				it.leftNz[y] = v
 				acLevels[n][0] = 0
 				nz |= uint32(v) << uint(n)
 				if withInfo {
-					acInfo[n] = levelInfoOf(&acLevels[n])
+					acInfo[n] = info
 				}
 			}
 		}
@@ -685,16 +691,15 @@ func (it *iterator) reconstructI4Modes(src []byte, withTT bool) uint32 {
 			rec := s.rec[predOffI4(m):]
 			c := &s.coeffs[m]
 			fTransform(src, ref, c)
-			var nzm bool
 			if it.doTrellis {
-				nzm = it.trellisQuantizeBlock(c, &s.levels[m], ctx, typeI4AC, &dqm.y1, dqm.lambdaTrellisI4)
+				s.info[m] = it.trellisQuantizeBlock(c, &s.levels[m], ctx, typeI4AC, &dqm.y1, dqm.lambdaTrellisI4)
 			} else {
-				nzm = quantizeBlock(c, &s.levels[m], &dqm.y1)
+				quantizeBlock(c, &s.levels[m], &dqm.y1)
+				s.info[m] = levelInfoOf(&s.levels[m])
 			}
-			if nzm {
+			if s.info[m] != 0 {
 				nz |= 1 << uint(m)
 			}
-			s.info[m] = levelInfoOf(&s.levels[m])
 			iTransform(ref, c, rec)
 			s.d[m] = int32(sse4x4(src, rec))
 			if withTT {
@@ -710,10 +715,10 @@ func (it *iterator) reconstructI4Modes(src []byte, withTT bool) uint32 {
 	fTransformPairs(s.src[:], preds, &tabI4Src, s.coeffs[:])
 	if it.doTrellis {
 		for m := 0; m < numBModes; m++ {
-			if it.trellisQuantizeBlock(&s.coeffs[m], &s.levels[m], ctx, typeI4AC, &dqm.y1, dqm.lambdaTrellisI4) {
+			s.info[m] = it.trellisQuantizeBlock(&s.coeffs[m], &s.levels[m], ctx, typeI4AC, &dqm.y1, dqm.lambdaTrellisI4)
+			if s.info[m] != 0 {
 				nz |= 1 << uint(m)
 			}
-			s.info[m] = levelInfoOf(&s.levels[m])
 		}
 	} else {
 		nz = quantizeBlocks(s.coeffs[:], s.levels[:], &dqm.y1, s.info[:])
@@ -751,7 +756,7 @@ func (it *iterator) reconstructIntra4(levels *[16]int16, src, yuvOut []byte, mod
 	if it.doTrellis {
 		x, y := it.i4&3, it.i4>>2
 		ctx := it.topNz[x] + it.leftNz[y]
-		nz = it.trellisQuantizeBlock(&tmp, levels, ctx, typeI4AC, &dqm.y1, dqm.lambdaTrellisI4)
+		nz = it.trellisQuantizeBlock(&tmp, levels, ctx, typeI4AC, &dqm.y1, dqm.lambdaTrellisI4) != 0
 	} else {
 		nz = quantizeBlock(&tmp, levels, &dqm.y1)
 	}

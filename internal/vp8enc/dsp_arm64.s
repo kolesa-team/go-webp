@@ -723,3 +723,276 @@ edone:
 	VMOV	V16.S[0], R0
 	MOVD	R0, ret+24(FP)
 	RET
+
+// ---------------------------------------------------------------------------
+// func predLuma16NEON(p, left, top *byte)
+//
+// predLuma16 (dsp.go) of a macroblock with both neighbours: the DC, TM, VE
+// and HE 16x16 predictions at p+i16DC16 (= p), p+i16TM16, p+i16VE16 and
+// p+i16HE16. left[0] is the top-left sample, left[1..16] the left column,
+// top[0..15] the row above. libwebp's DC16, TM16, VE16 and HE16 (NEON):
+//   DC: (sum(top) + sum(left) + 16) >> 5     (UADDLV)
+//   TM: clip8(left[y] - tl + top[x]): top - tl as int16, plus the row's
+//       left sample, SQXTUN (the sum is in [-255, 510]: exact)
+//   VE: top on every row; HE: DUP of left[y] on row y.
+//
+// Registers: R10-R13 the four output row pointers (DC, TM, VE, HE),
+// R7 = bps, V0 top, V1 left[1..16], V2/V3 top-tl (int16), V4 DC,
+// V5/V6 left[1..16] as int16.
+#define PRED16_ROW(lane, lreg, lh) \
+	VST1.P	[V4.B16], (R10)(R7) \
+	VDUP	lreg.H[lh], V7.H8 \
+	VADD	V7.H8, V2.H8, V8.H8 \
+	VADD	V7.H8, V3.H8, V9.H8 \
+	VSQXTUN	V8.H8, V10.B8 \
+	VSQXTUN2	V9.H8, V10.B16 \
+	VST1.P	[V10.B16], (R11)(R7) \
+	VST1.P	[V0.B16], (R12)(R7) \
+	VDUP	V1.B[lane], V11.B16 \
+	VST1.P	[V11.B16], (R13)(R7)
+
+TEXT ·predLuma16NEON(SB), NOSPLIT, $0-24
+	MOVD	p+0(FP), R0
+	MOVD	left+8(FP), R1
+	MOVD	top+16(FP), R2
+	MOVD	$32, R7
+	VLD1	(R2), [V0.B16]
+	ADD	$1, R1, R3
+	VLD1	(R3), [V1.B16]
+	MOVBU	(R1), R4
+	VUADDLV	V0.B16, V2
+	VUADDLV	V1.B16, V3
+	VMOV	V2.H[0], R5
+	VMOV	V3.H[0], R6
+	ADD	R6, R5, R5
+	ADD	$16, R5, R5
+	LSR	$5, R5, R5
+	VDUP	R5, V4.B16
+	VUXTL	V0.B8, V2.H8
+	VUXTL2	V0.B16, V3.H8
+	VDUP	R4, V7.H8
+	VSUB	V7.H8, V2.H8, V2.H8
+	VSUB	V7.H8, V3.H8, V3.H8
+	VUXTL	V1.B8, V5.H8
+	VUXTL2	V1.B16, V6.H8
+	MOVD	R0, R10
+	ADD	$16, R0, R11
+	ADD	$(16*32), R0, R12
+	ADD	$(16*32+16), R0, R13
+	PRED16_ROW(0, V5, 0)
+	PRED16_ROW(1, V5, 1)
+	PRED16_ROW(2, V5, 2)
+	PRED16_ROW(3, V5, 3)
+	PRED16_ROW(4, V5, 4)
+	PRED16_ROW(5, V5, 5)
+	PRED16_ROW(6, V5, 6)
+	PRED16_ROW(7, V5, 7)
+	PRED16_ROW(8, V6, 0)
+	PRED16_ROW(9, V6, 1)
+	PRED16_ROW(10, V6, 2)
+	PRED16_ROW(11, V6, 3)
+	PRED16_ROW(12, V6, 4)
+	PRED16_ROW(13, V6, 5)
+	PRED16_ROW(14, V6, 6)
+	PRED16_ROW(15, V6, 7)
+	RET
+
+// ---------------------------------------------------------------------------
+// func predChroma8NEON(p, uLeft, vLeft, uvTop *byte)
+//
+// predChroma8 (dsp.go) of a macroblock with both neighbours, U and V side
+// by side: the DC, TM, VE and HE 8x8 predictions at p (= c8DC8), p+16,
+// p+8*bps and p+8*bps+16, each row being [U 8 | V 8]. uLeft/vLeft hold the
+// top-left sample then the 8 left samples, uvTop the 8 U then 8 V samples
+// above. Same formulas as predLuma16NEON with DC = (sum + 8) >> 4 per
+// plane.
+//
+// Registers: R10-R13 the output row pointers, R7 = bps, V0 uvTop,
+// V1 uLeft[1..8] | vLeft[1..8], V2/V3 top-tl (int16, U and V), V4 DC row,
+// V5/V6 left samples of U and V as int16.
+#define PRED8_ROW(lane, lane8) \
+	VST1.P	[V4.B16], (R10)(R7) \
+	VDUP	V5.H[lane], V7.H8 \
+	VDUP	V6.H[lane], V8.H8 \
+	VADD	V7.H8, V2.H8, V7.H8 \
+	VADD	V8.H8, V3.H8, V8.H8 \
+	VSQXTUN	V7.H8, V10.B8 \
+	VSQXTUN2	V8.H8, V10.B16 \
+	VST1.P	[V10.B16], (R11)(R7) \
+	VST1.P	[V0.B16], (R12)(R7) \
+	VDUP	V1.B[lane], V11.B8 \
+	VDUP	V1.B[lane8], V12.B8 \
+	VZIP1	V12.D2, V11.D2, V11.D2 \
+	VST1.P	[V11.B16], (R13)(R7)
+
+TEXT ·predChroma8NEON(SB), NOSPLIT, $0-32
+	MOVD	p+0(FP), R0
+	MOVD	uLeft+8(FP), R1
+	MOVD	vLeft+16(FP), R2
+	MOVD	uvTop+24(FP), R3
+	MOVD	$32, R7
+	VLD1	(R3), [V0.B16]
+	ADD	$1, R1, R4
+	VLD1	(R4), V1.D[0]
+	ADD	$1, R2, R4
+	VLD1	(R4), V1.D[1]
+	// DC of U and V
+	VUADDLV	V0.B8, V2      // sum of the U top
+	VEXT	$8, V0.B16, V0.B16, V3.B16
+	VUADDLV	V3.B8, V3      // sum of the V top
+	VUADDLV	V1.B8, V4      // sum of the U left
+	VEXT	$8, V1.B16, V1.B16, V5.B16
+	VUADDLV	V5.B8, V5      // sum of the V left
+	VMOV	V2.H[0], R5
+	VMOV	V4.H[0], R6
+	ADD	R6, R5, R5
+	ADD	$8, R5, R5
+	LSR	$4, R5, R5
+	VMOV	V3.H[0], R6
+	VMOV	V5.H[0], R8
+	ADD	R8, R6, R6
+	ADD	$8, R6, R6
+	LSR	$4, R6, R6
+	VDUP	R5, V4.B8
+	VDUP	R6, V5.B8
+	VZIP1	V5.D2, V4.D2, V4.D2
+	// top - tl as int16, per plane
+	MOVBU	(R1), R5
+	MOVBU	(R2), R6
+	VUXTL	V0.B8, V2.H8
+	VUXTL2	V0.B16, V3.H8
+	VDUP	R5, V7.H8
+	VDUP	R6, V8.H8
+	VSUB	V7.H8, V2.H8, V2.H8
+	VSUB	V8.H8, V3.H8, V3.H8
+	VUXTL	V1.B8, V5.H8
+	VUXTL2	V1.B16, V6.H8
+	MOVD	R0, R10
+	ADD	$16, R0, R11
+	ADD	$(8*32), R0, R12
+	ADD	$(8*32+16), R0, R13
+	PRED8_ROW(0, 8)
+	PRED8_ROW(1, 9)
+	PRED8_ROW(2, 10)
+	PRED8_ROW(3, 11)
+	PRED8_ROW(4, 12)
+	PRED8_ROW(5, 13)
+	PRED8_ROW(6, 14)
+	PRED8_ROW(7, 15)
+	RET
+
+// Shuffles of predLuma4NEON (generated from a per-mode model of predLuma4):
+// i4SrcIdx: the extended samples S' from the 16 loaded bytes, the TM left
+// rows and top columns, and the 8 samples summed for DC; i4OutIdx: the 4
+// rows of modes 0-3 and of modes 4-7 (16 bytes each, alternating), then
+// modes 8-9 for rows 0-1 and 2-3, as indexes into the table [S', A3, P, TM].
+DATA ·i4SrcIdx+0(SB)/8, $0x0605040302010000
+DATA ·i4SrcIdx+8(SB)/8, $0xff0c0c0b0a090807
+DATA ·i4SrcIdx+16(SB)/8, $0x0303030304040404
+DATA ·i4SrcIdx+24(SB)/8, $0x0101010102020202
+DATA ·i4SrcIdx+32(SB)/8, $0x0908070609080706
+DATA ·i4SrcIdx+40(SB)/8, $0x0908070609080706
+DATA ·i4SrcIdx+48(SB)/8, $0x0908070604030201
+DATA ·i4SrcIdx+56(SB)/8, $0xffffffffffffffff
+GLOBL ·i4SrcIdx(SB), RODATA|NOPTR, $64
+DATA ·i4OutIdx+0(SB)/8, $0x333231300f0f0f0f
+DATA ·i4OutIdx+8(SB)/8, $0x1414141419181716
+DATA ·i4OutIdx+16(SB)/8, $0x2827262518171615
+DATA ·i4OutIdx+24(SB)/8, $0x292827261a191817
+DATA ·i4OutIdx+32(SB)/8, $0x373635340f0f0f0f
+DATA ·i4OutIdx+40(SB)/8, $0x1313131319181716
+DATA ·i4OutIdx+48(SB)/8, $0x1817161517161514
+DATA ·i4OutIdx+56(SB)/8, $0x1a1918171b1a1918
+DATA ·i4OutIdx+64(SB)/8, $0x3b3a39380f0f0f0f
+DATA ·i4OutIdx+72(SB)/8, $0x1212121219181716
+DATA ·i4OutIdx+80(SB)/8, $0x2726251416151413
+DATA ·i4OutIdx+88(SB)/8, $0x1b2928271c1b1a19
+DATA ·i4OutIdx+96(SB)/8, $0x3f3e3d3c0f0f0f0f
+DATA ·i4OutIdx+104(SB)/8, $0x1111111119181716
+DATA ·i4OutIdx+112(SB)/8, $0x1716151315141312
+DATA ·i4OutIdx+120(SB)/8, $0x1c1a19181d1c1b1a
+DATA ·i4OutIdx+128(SB)/8, $0x1222132317161524
+DATA ·i4OutIdx+136(SB)/8, $0x1121122215241423
+DATA ·i4OutIdx+144(SB)/8, $0x0101112114231322
+DATA ·i4OutIdx+152(SB)/8, $0x0101010113221221
+GLOBL ·i4OutIdx(SB), RODATA|NOPTR, $160
+
+// ---------------------------------------------------------------------------
+// func predLuma4NEON(p, s *byte)
+//
+// predLuma4 (dsp.go): the 10 intra4 predictions of a sub-block, written at
+// p = i4DC4 in the prediction buffer (modes 0-7 side by side on rows 0-3,
+// modes 8-9 on rows 4-7). s points to the 13 boundary samples
+// L K J I X A B C D E F G H (16 bytes are loaded). Every output byte is a
+// table lookup (one TBL per 16 output bytes) into
+//   S'  = L, the 13 samples, H, DC     (edges replicated, as kll and ghh
+//                                       need)
+//   A3  = avg3 of each sample with its neighbours = URHADD(UHADD(prev,
+//         next), cur), exact: ((a+c)>>1 + b + 1) >> 1 = (a + 2b + c + 2) >> 2
+//   P   = avg2 of each sample and the next one (URHADD)
+//   TM  = clip8(left - X + top) on 16-bit lanes (SQXTUN; exact)
+// and DC = (sum of A..D and I..L + 4) >> 3 (UADDLV). As in libwebp's
+// intra4 predictors (dec_neon.c), but all modes from one set of vectors.
+//
+// Registers: R0 p, R1 s, R2 tables, V16-V19 the lookup table [S', A3, P,
+// TM] (consecutive for the 4-register TBL).
+TEXT ·predLuma4NEON(SB), NOSPLIT, $0-16
+	MOVD	p+0(FP), R0
+	MOVD	s+8(FP), R1
+	MOVD	$32, R7
+	VLD1	(R1), [V0.B16]
+	MOVD	$·i4SrcIdx(SB), R2
+	VLD1	(R2), [V1.B16, V2.B16, V3.B16, V4.B16]
+	VTBL	V1.B16, [V0.B16], V16.B16 // S'
+	VEOR	V20.B16, V20.B16, V20.B16
+	VEXT	$15, V16.B16, V20.B16, V21.B16 // previous sample
+	VEXT	$1, V20.B16, V16.B16, V22.B16  // next sample
+	VUHADD	V22.B16, V21.B16, V23.B16
+	VURHADD	V16.B16, V23.B16, V17.B16 // A3
+	VURHADD	V22.B16, V16.B16, V18.B16 // P
+
+	// TM: left rows and top columns as 16-bit, minus X, clipped
+	VTBL	V2.B16, [V16.B16], V24.B16
+	VTBL	V3.B16, [V16.B16], V25.B16
+	VDUP	V16.B[5], V26.B8
+	VUXTL	V25.B8, V27.H8
+	VUXTL2	V25.B16, V28.H8
+	VUXTL	V26.B8, V26.H8
+	VSUB	V26.H8, V27.H8, V27.H8
+	VSUB	V26.H8, V28.H8, V28.H8
+	VUADDW	V24.B8, V27.H8, V27.H8
+	VUADDW2	V24.B16, V28.H8, V28.H8
+	VSQXTUN	V27.H8, V19.B8
+	VSQXTUN2	V28.H8, V19.B16
+
+	// DC into S'[15]
+	VTBL	V4.B16, [V16.B16], V29.B16
+	VUADDLV	V29.B16, V29
+	VMOV	V29.H[0], R3
+	ADD	$4, R3, R3
+	LSR	$3, R3, R3
+	VMOV	R3, V16.B[15]
+
+	MOVD	$·i4OutIdx(SB), R2
+	VLD1.P	64(R2), [V0.B16, V1.B16, V2.B16, V3.B16]
+	VLD1.P	64(R2), [V4.B16, V5.B16, V6.B16, V7.B16]
+	VLD1	(R2), [V8.B16, V9.B16]
+	VTBL	V0.B16, [V16.B16, V17.B16, V18.B16, V19.B16], V10.B16
+	VTBL	V1.B16, [V16.B16, V17.B16, V18.B16, V19.B16], V11.B16
+	VTBL	V2.B16, [V16.B16, V17.B16, V18.B16, V19.B16], V12.B16
+	VTBL	V3.B16, [V16.B16, V17.B16, V18.B16, V19.B16], V13.B16
+	VTBL	V4.B16, [V16.B16, V17.B16, V18.B16, V19.B16], V20.B16
+	VTBL	V5.B16, [V16.B16, V17.B16, V18.B16, V19.B16], V21.B16
+	VTBL	V6.B16, [V16.B16, V17.B16, V18.B16, V19.B16], V22.B16
+	VTBL	V7.B16, [V16.B16, V17.B16, V18.B16, V19.B16], V23.B16
+	VTBL	V8.B16, [V16.B16, V17.B16, V18.B16, V19.B16], V24.B16
+	VTBL	V9.B16, [V16.B16, V17.B16, V18.B16, V19.B16], V25.B16
+	VST1.P	[V10.B16, V11.B16], (R0)(R7)
+	VST1.P	[V12.B16, V13.B16], (R0)(R7)
+	VST1.P	[V20.B16, V21.B16], (R0)(R7)
+	VST1.P	[V22.B16, V23.B16], (R0)(R7)
+	VST1.P	V24.D[0], (R0)(R7)
+	VST1.P	V24.D[1], (R0)(R7)
+	VST1.P	V25.D[0], (R0)(R7)
+	VST1	V25.D[1], (R0)
+	RET

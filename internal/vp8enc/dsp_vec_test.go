@@ -749,3 +749,154 @@ func BenchmarkResidualCost(b *testing.B) {
 		_ = s
 	})
 }
+
+// checkPredictors compares predLuma16 and predChroma8 with the Go
+// reference on whole prediction buffers (pre-filled with the same garbage,
+// so that writes outside the predictions are caught too).
+func checkPredictors(t *testing.T, fill byte, yLeft, yTop, uLeft, vLeft, uvTop []byte) {
+	t.Helper()
+	got := make([]byte, predSize)
+	want := make([]byte, predSize)
+	for i := range got {
+		got[i] = fill + byte(i)
+		want[i] = got[i]
+	}
+	predLuma16(got, yLeft, yTop)
+	predLuma16Ref(want, yLeft, yTop)
+	predChroma8(got, uLeft, vLeft, uvTop)
+	predChroma8Ref(want, uLeft, vLeft, uvTop)
+	if string(got) != string(want) {
+		for i := range got {
+			if got[i] != want[i] {
+				t.Fatalf("first difference at %d (row %d col %d): %d, want %d (left %v top %v uLeft %v vLeft %v uvTop %v)",
+					i, i/bps, i%bps, got[i], want[i], yLeft, yTop, uLeft, vLeft, uvTop)
+			}
+		}
+	}
+}
+
+func TestPredictorsExact(t *testing.T) {
+	rng := rand.New(rand.NewSource(13))
+	yLeft := make([]byte, 17)
+	yTop := make([]byte, 32)
+	uLeft := make([]byte, 9)
+	vLeft := make([]byte, 9)
+	uvTop := make([]byte, 16)
+	for iter := 0; iter < vecIters(t, 20000); iter++ {
+		for _, b := range [][]byte{yLeft, yTop, uLeft, vLeft, uvTop} {
+			fillPixels(rng, b)
+		}
+		checkPredictors(t, byte(iter), yLeft, yTop, uLeft, vLeft, uvTop)
+		switch iter % 4 { // picture edges
+		case 1:
+			checkPredictors(t, byte(iter), nil, yTop, nil, nil, uvTop)
+		case 2:
+			checkPredictors(t, byte(iter), yLeft, nil, uLeft, vLeft, nil)
+		case 3:
+			checkPredictors(t, byte(iter), nil, nil, nil, nil, nil)
+		}
+	}
+}
+
+func FuzzPredictors(f *testing.F) {
+	f.Add([]byte{1, 2, 3, 255, 0, 128})
+	f.Add([]byte{255})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) == 0 {
+			return
+		}
+		b := make([]byte, 17+16+9+9+16)
+		for i := range b {
+			b[i] = data[i%len(data)] + byte(i/len(data))*data[0]
+		}
+		checkPredictors(t, data[0], b[0:17], b[17:33], b[33:42], b[42:51], b[51:67])
+	})
+}
+
+// checkPredLuma4 compares predLuma4 with the Go reference on whole
+// prediction buffers pre-filled with the same garbage.
+func checkPredLuma4(t *testing.T, fill byte, b []byte, top int) {
+	t.Helper()
+	got := make([]byte, predSize)
+	want := make([]byte, predSize)
+	for i := range got {
+		got[i] = fill ^ byte(i*7)
+		want[i] = got[i]
+	}
+	predLuma4(got, b, top)
+	predLuma4Ref(want, b, top)
+	if string(got) != string(want) {
+		for i := range got {
+			if got[i] != want[i] {
+				t.Fatalf("t=%d: first difference at %d (row %d col %d): %d, want %d (samples %v)",
+					top, i, (i-i4DC4)/bps, i%bps, got[i], want[i], b[top-5:top+8])
+			}
+		}
+	}
+}
+
+func TestPredLuma4Exact(t *testing.T) {
+	rng := rand.New(rand.NewSource(15))
+	var b [40]byte
+	for iter := 0; iter < vecIters(t, 50000); iter++ {
+		fillPixels(rng, b[:])
+		top := vp8TopLeftI4[iter&15]
+		if iter%5 == 0 {
+			top = 5 + rng.Intn(25)
+		}
+		checkPredLuma4(t, byte(iter), b[:], top)
+		// a boundary slice too short for the 16-byte load takes the Go code
+		checkPredLuma4(t, byte(iter), b[:top+8], top)
+	}
+}
+
+func FuzzPredLuma4(f *testing.F) {
+	f.Add([]byte{0, 255, 128, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, uint8(0))
+	f.Fuzz(func(t *testing.T, data []byte, pos uint8) {
+		if len(data) == 0 {
+			return
+		}
+		var b [40]byte
+		for i := range b {
+			b[i] = data[i%len(data)] ^ byte(i/len(data))
+		}
+		checkPredLuma4(t, byte(pos), b[:], 5+int(pos)%25)
+	})
+}
+
+func BenchmarkPredLuma4(b *testing.B) {
+	rng := rand.New(rand.NewSource(16))
+	p := make([]byte, predSize)
+	var bnd [40]byte
+	fillPixels(rng, bnd[:])
+	b.Run("vec", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			predLuma4(p, bnd[:], 17)
+		}
+	})
+	b.Run("go", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			predLuma4Ref(p, bnd[:], 17)
+		}
+	})
+}
+
+func BenchmarkPredictors(b *testing.B) {
+	rng := rand.New(rand.NewSource(14))
+	p := make([]byte, predSize)
+	edge := make([]byte, 17+16+9+9+16)
+	fillPixels(rng, edge)
+	yLeft, yTop, uLeft, vLeft, uvTop := edge[0:17], edge[17:33], edge[33:42], edge[42:51], edge[51:67]
+	b.Run("vec", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			predLuma16(p, yLeft, yTop)
+			predChroma8(p, uLeft, vLeft, uvTop)
+		}
+	})
+	b.Run("go", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			predLuma16Ref(p, yLeft, yTop)
+			predChroma8Ref(p, uLeft, vLeft, uvTop)
+		}
+	})
+}
