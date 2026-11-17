@@ -1,6 +1,7 @@
 package decoder
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"image"
@@ -107,6 +108,28 @@ func TestDecodeContextCancel(t *testing.T) {
 		}
 	}
 	waitGoroutines(t, g)
+}
+
+// BenchmarkDecodeContext is BenchmarkDecode with a cancellable context (the
+// cost of the cancellation checks).
+func BenchmarkDecodeContext(b *testing.B) {
+	for _, file := range []string{"m4_q75.webp", "webp-logo-lossy.webp", "webp-logo-lossless.webp"} {
+		data := readFile(b, file)
+		b.Run(file, func(b *testing.B) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				d, err := NewDecoder(bytes.NewReader(data), nil)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if _, err := d.DecodeContext(ctx); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
 }
 
 // TestDecodeContextStopsEarly checks that a cancelled decode does not run to
