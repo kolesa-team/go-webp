@@ -222,14 +222,13 @@ func (tb *tokenBuffer) recordStatsRange(start, end int, stats *[numTypes]statsAr
 
 // tokenProba returns the probability a token is coded with: its constant
 // probability, or its slot in probas. For a constant token t&0x3fff is the
-// probability itself (< 256), so the table load is always in range and the
-// selection compiles to a conditional move instead of a branch.
+// probability itself (< 256), so the table load is always in range, and
+// the two are selected with a mask rather than a branch (constant and slot
+// tokens alternate unpredictably).
 func tokenProba(t uint16, probas *[numProbaSlots]uint8) uint8 {
 	p := probas[int(t&0x3fff)%numProbaSlots]
-	if t&tokenFixedProba != 0 {
-		p = uint8(t)
-	}
-	return p
+	m := -uint8(t >> 14 & 1) // 0xff for a constant-probability token
+	return p&^m | uint8(t)&m
 }
 
 // kNorm256 and kNewRange256 extend kNorm and kNewRange to every value of
