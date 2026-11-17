@@ -29,3 +29,9 @@ func sse4x4Pairs(a, b []byte, t *pairTable, out []int32) { sse4x4PairsRef(a, b, 
 func sse16x16(a, b []byte) int { return sse16x16Ref(a, b) }
 
 func sse16x8(a, b []byte) int { return sse16x8Ref(a, b) }
+
+func predLuma16(p []byte, left, top []byte) { predLuma16Ref(p, left, top) }
+
+func predChroma8(p []byte, uLeft, vLeft, uvTop []byte) { predChroma8Ref(p, uLeft, vLeft, uvTop) }
+
+func predLuma4(p []byte, b []byte, t int) { predLuma4Ref(p, b, t) }

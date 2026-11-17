@@ -315,17 +315,18 @@ func dcMode(dst []byte, left, top []byte, size int, round int, shift uint) {
 	fill(dst, byte(dc), size)
 }
 
-// predLuma16 computes the 4 intra16 predictions into p.
-func predLuma16(p []byte, left, top []byte) {
+// predLuma16Ref computes the 4 intra16 predictions into p (nil left or top:
+// not available).
+func predLuma16Ref(p []byte, left, top []byte) {
 	dcMode(p[i16DC16:], left, top, 16, 16, 5)
 	verticalPred(p[i16VE16:], top, 16)
 	horizontalPred(p[i16HE16:], left, 16)
 	trueMotion(p[i16TM16:], left, top, 16)
 }
 
-// predChroma8 computes the 4 chroma predictions (U and V side by side).
+// predChroma8Ref computes the 4 chroma predictions (U and V side by side).
 // uvTop holds 8 U then 8 V samples.
-func predChroma8(p []byte, uLeft, vLeft, uvTop []byte) {
+func predChroma8Ref(p []byte, uLeft, vLeft, uvTop []byte) {
 	var top []byte
 	if uvTop != nil {
 		top = uvTop[0:8]
@@ -351,11 +352,11 @@ func put4(dst []byte, a, b, c, d byte) {
 	dst[0], dst[1], dst[2], dst[3] = a, b, c, d
 }
 
-// predLuma4 computes the 10 intra4 predictions. 'b' is the boundary array
+// predLuma4Ref computes the 10 intra4 predictions. 'b' is the boundary array
 // and 't' the index of the top sample: left samples are b[t-5..t-2]
 // (bottom to top), top-left is b[t-1], top is b[t..t+3] and top-right is
 // b[t+4..t+7].
-func predLuma4(p []byte, b []byte, t int) {
+func predLuma4Ref(p []byte, b []byte, t int) {
 	s := b[t-5 : t+8]
 	_ = s[12]
 	L := uint32(s[0])

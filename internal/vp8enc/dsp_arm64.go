@@ -35,6 +35,57 @@ func sse4x4PairsNEON(a, b *byte, off *[8][2]uint16, n int, out *int32)
 //go:noescape
 func sse16xNNEON(a, b *byte, rows int) int
 
+//go:noescape
+func predLuma16NEON(p, left, top *byte)
+
+//go:noescape
+func predChroma8NEON(p, uLeft, vLeft, uvTop *byte)
+
+//go:noescape
+func predLuma4NEON(p, s *byte)
+
+// predLuma4 computes the 10 intra4 predictions into p from the boundary
+// samples b[t-5..t+7] (see predLuma4Ref). The kernel loads 16 bytes from
+// b[t-5]; the iterator's boundary array always has them.
+func predLuma4(p []byte, b []byte, t int) {
+	if !neonEnabled || t < 5 || t+11 > len(b) {
+		predLuma4Ref(p, b, t)
+		return
+	}
+	if len(p) < i4DC4+7*bps+8 {
+		panic("vp8enc: predLuma4: buffer too small")
+	}
+	predLuma4NEON(&p[i4DC4], &b[t-5])
+}
+
+// predLuma16 computes the 4 intra16 predictions into p; left (top-left
+// then 16 samples) and top (16 samples) are nil when not available, which
+// only happens on the picture edges and takes the Go code.
+func predLuma16(p []byte, left, top []byte) {
+	if !neonEnabled || left == nil || top == nil {
+		predLuma16Ref(p, left, top)
+		return
+	}
+	if len(p) < i16HE16+15*bps+16 || len(left) < 17 || len(top) < 16 {
+		panic("vp8enc: predLuma16: buffer too small")
+	}
+	predLuma16NEON(&p[0], &left[0], &top[0])
+}
+
+// predChroma8 computes the 4 chroma predictions into p (U and V side by
+// side); uLeft, vLeft (top-left then 8 samples) and uvTop (8 U then 8 V
+// samples) are nil when not available (picture edges: Go code).
+func predChroma8(p []byte, uLeft, vLeft, uvTop []byte) {
+	if !neonEnabled || uLeft == nil || vLeft == nil || uvTop == nil {
+		predChroma8Ref(p, uLeft, vLeft, uvTop)
+		return
+	}
+	if len(p) < c8HE8+7*bps+16 || len(uLeft) < 9 || len(vLeft) < 9 || len(uvTop) < 16 {
+		panic("vp8enc: predChroma8: buffer too small")
+	}
+	predChroma8NEON(&p[c8DC8], &uLeft[0], &vLeft[0], &uvTop[0])
+}
+
 func fTransformPairs(src, ref []byte, t *pairTable, out [][16]int16) {
 	if len(src) < t.need[0] || len(ref) < t.need[1] || len(out) < 2*t.n {
 		panic("vp8enc: fTransformPairs: buffer too small")
