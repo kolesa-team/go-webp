@@ -349,6 +349,25 @@ func (d *decoder) initRowEdges(mbY int) {
 // reconstructMB predicts the macroblock, adds the residuals and copies the
 // result into the row cache.
 func (d *decoder) reconstructMB(mbX, mbY int, blk *mbBlock) {
+	d.loadMBEdges(mbX, mbY, blk.isI4x4)
+	reconBlock(&d.yuvB, mbX, mbY, blk)
+	d.storeMB(mbX, mbY)
+}
+
+// reconBlock runs the prediction and residual kernels of the macroblock on
+// the work buffer, whose edges loadMBEdges has set up.
+func reconBlock(b *[yuvSize]byte, mbX, mbY int, blk *mbBlock) {
+	if blk.isI4x4 {
+		reconI4(b, &blk.coeffs, blk.nonZeroY, &blk.imodes)
+	} else {
+		reconI16(b, &blk.coeffs, blk.nonZeroY, checkMode(mbX, mbY, blk.imodes[0]))
+	}
+	reconUV(b, &blk.coeffs, blk.nonZeroUV, checkMode(mbX, mbY, blk.uvmode))
+}
+
+// loadMBEdges sets up the left, top and (for intra 4x4) top-right samples
+// of the macroblock in the work buffer.
+func (d *decoder) loadMBEdges(mbX, mbY int, isI4x4 bool) {
 	b := d.yuvB[:]
 	if mbX > 0 {
 		// Rotate in the left samples from the previous block.
@@ -369,9 +388,7 @@ func (d *decoder) reconstructMB(mbX, mbY int, blk *mbBlock) {
 		*(*[8]byte)(b[uOff-bps:]) = top.u
 		*(*[8]byte)(b[vOff-bps:]) = top.v
 	}
-	coeffs := &blk.coeffs
-	bits := blk.nonZeroY
-	if blk.isI4x4 {
+	if isI4x4 {
 		tr := yOff - bps + 16
 		if mbY > 0 {
 			if mbX >= d.mbW-1 { // on rightmost edge
@@ -385,28 +402,14 @@ func (d *decoder) reconstructMB(mbX, mbY int, blk *mbBlock) {
 		for k := 1; k <= 3; k++ {
 			*(*[4]byte)(b[tr+4*k*bps:]) = *(*[4]byte)(b[tr:])
 		}
-		for n := 0; n < 16; n++ {
-			o := yOff + kScan[n]
-			predLuma4(blk.imodes[n], b, o)
-			doTransform(bits>>30, (*[16]int16)(coeffs[n*16:]), b, o)
-			bits <<= 2
-		}
-	} else {
-		predLuma16(checkMode(mbX, mbY, blk.imodes[0]), b)
-		if bits != 0 {
-			for n := 0; n < 16; n++ {
-				doTransform(bits>>30, (*[16]int16)(coeffs[n*16:]), b, yOff+kScan[n])
-				bits <<= 2
-			}
-		}
 	}
-	// Chroma
-	uvMode := checkMode(mbX, mbY, blk.uvmode)
-	predChroma8(uvMode, b, uOff)
-	predChroma8(uvMode, b, vOff)
-	doUVTransform(blk.nonZeroUV>>0, coeffs, 16*16, b, uOff)
-	doUVTransform(blk.nonZeroUV>>8, coeffs, 20*16, b, vOff)
+}
 
+// storeMB saves the bottom samples of the reconstructed macroblock for the
+// next row and copies it into the row cache.
+func (d *decoder) storeMB(mbX, mbY int) {
+	b := d.yuvB[:]
+	top := &d.yuvT[mbX]
 	// stash away top samples for next block
 	if mbY < d.mbH-1 {
 		top.y = *(*[16]byte)(b[yOff+15*bps:])
