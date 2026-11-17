@@ -76,6 +76,36 @@ func clampAddSubHalf(l, t, tl uint32) uint32 {
 		addSubHalf(int32(a&0xff), int32(tl&0xff))
 }
 
+// predictLeft is predictor mode 1 (L) over in[x0:x1]: a running sum of the
+// residuals. Per-channel addition modulo 256 is associative, so 4 pixels at
+// a time are summed among themselves first, off the critical path, and the
+// serial dependency on the left pixel costs one addPixels per 4 pixels
+// instead of one per pixel. in may alias out (each group of 4 is read before
+// it is written).
+func predictLeft(in, out []uint32, x0, x1 int) {
+	in = in[:x1]
+	out = out[:x1]
+	l := out[x0-1]
+	x := x0
+	for ; x+4 <= x1; x += 4 {
+		s := in[x : x+4 : x+4]
+		a := s[0]
+		s2 := addPixels(a, s[1])
+		s3 := addPixels(s2, s[2])
+		s4 := addPixels(s3, s[3])
+		o := out[x : x+4 : x+4]
+		o[0] = addPixels(a, l)
+		o[1] = addPixels(s2, l)
+		o[2] = addPixels(s3, l)
+		l = addPixels(s4, l)
+		o[3] = l
+	}
+	for ; x < x1; x++ {
+		l = addPixels(in[x], l)
+		out[x] = l
+	}
+}
+
 // predictRun adds predictor mode to the residuals in[x0:x1] and stores the
 // result in out. up is the previous output row, extended by one pixel (the
 // first pixel of out) so that the top-right of the last column is valid.
@@ -86,11 +116,7 @@ func predictRun(mode uint32, in, out, up []uint32, x0, x1 int) {
 	up = up[:x1+1]
 	switch mode {
 	case 1: // L
-		l := out[x0-1]
-		for x := x0; x < x1; x++ {
-			l = addPixels(in[x], l)
-			out[x] = l
-		}
+		predictLeft(in, out, x0, x1)
 	case 2: // T
 		for x := x0; x < x1; x++ {
 			out[x] = addPixels(in[x], up[x])
@@ -180,11 +206,7 @@ func inversePredictor(t *transform, y0, y1 int, in, c []uint32, o int) {
 		out := c[o : o+width]
 		inr := in[:width]
 		out[0] = addPixels(inr[0], 0xff000000)
-		l := out[0]
-		for x := 1; x < width; x++ {
-			l = addPixels(inr[x], l)
-			out[x] = l
-		}
+		predictLeft(inr, out, 1, width)
 		o += width
 		i += width
 		y0++
