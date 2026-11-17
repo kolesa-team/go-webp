@@ -434,11 +434,7 @@ func encodeARGB(argb []uint32, w, h int, cfg *Config, useCache bool, prefix int,
 		// argb in place).
 		return encodeStream(argb[:n], true, w, h, &p, configs[0], prefix, sc, spare), nil
 	}
-	helpers := 0
-	if p.parallel {
-		helpers = configHelpers
-	}
-	return encodeConfigs(argb[:n], w, h, &p, configs, prefix, sc, spare, helpers)
+	return encodeConfigs(argb[:n], w, h, &p, configs, prefix, sc, spare, p.configHelpersFor(n))
 }
 
 // hashPix approximates palette entropy with a multiplicative hash.

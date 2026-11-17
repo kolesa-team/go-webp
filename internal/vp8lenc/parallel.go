@@ -107,6 +107,22 @@ func (p *params) remapHelpers() int {
 // configuration, up to 8).
 const configHelpers = 1
 
+// maxConfigPairPixels is the largest image (in pixels) whose configurations
+// are encoded two at a time: a working set takes up to about 90 bytes per
+// pixel at level 9 (1 GB for 12 MP), so larger images encode their
+// configurations one after the other (each with the parallel stages). A
+// variable for the tests.
+var maxConfigPairPixels = 8 << 20
+
+// configHelpersFor returns the number of helpers encoding configurations
+// of an image of n pixels concurrently with the caller.
+func (p *params) configHelpersFor(n int) int {
+	if !p.parallel || n > maxConfigPairPixels {
+		return 0
+	}
+	return configHelpers
+}
+
 // configCost ranks the configurations by expected encoding time (spatial
 // prediction with its mode search and cross-color is the slowest, palette
 // encodes the fastest), so that the slowest start first.
