@@ -344,6 +344,31 @@ func TestFrameLossless(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestFrameLossy checks that framing a VP8 payload in place gives exactly
+// what WriteLossy writes without alpha, for odd and even sizes, with and
+// without spare capacity for the padding byte.
+func TestFrameLossy(t *testing.T) {
+	for _, n := range []int{1, 5, 6, 7, 100, 101} {
+		payload := make([]byte, n)
+		for i := range payload {
+			payload[i] = byte(i*5 + 3)
+		}
+		var want bytes.Buffer
+		require.NoError(t, WriteLossy(&want, 3, 3, payload, nil))
+		for _, spare := range []int{0, 1, 16} {
+			buf := make([]byte, LossyHeaderSize+n, LossyHeaderSize+n+spare)
+			copy(buf[LossyHeaderSize:], payload)
+			got, err := FrameLossy(buf)
+			require.NoError(t, err)
+			assert.Equal(t, want.Bytes(), got, "n=%d spare=%d", n, spare)
+		}
+	}
+	_, err := FrameLossy(make([]byte, LossyHeaderSize))
+	require.EqualError(t, err, "VP8_STATUS_INVALID_PARAM: empty VP8 payload")
+	_, err = FrameLossless(nil)
+	require.EqualError(t, err, "VP8_STATUS_INVALID_PARAM: empty VP8L payload")
+}
+
 // TestGetFeaturesPrefixRawVP8 checks that for a raw VP8 bitstream (whose
 // size, used by the first partition length check, is that of the whole
 // input) GetFeaturesPrefix only reports a final result once the prefix

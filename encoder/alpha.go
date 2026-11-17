@@ -34,7 +34,7 @@ var errAlphaInterrupted = errors.New("alpha encoding interrupted")
 
 // The encoders, as variables so that tests can inject failures.
 var (
-	vp8Encode   = vp8enc.Encode
+	vp8Encode   = vp8enc.EncodeWithHeadroom
 	alphaEncode = encodeAlpha
 )
 

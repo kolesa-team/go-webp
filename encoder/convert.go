@@ -3,7 +3,8 @@ package encoder
 import (
 	"image"
 	"image/color"
-	"sync"
+
+	"github.com/kolesa-team/go-webp/v2/internal/bufpool"
 )
 
 // toNRGBA returns src as an *image.NRGBA. An *image.NRGBA is returned as is
@@ -19,41 +20,26 @@ func toNRGBA(src image.Image) *image.NRGBA {
 	return dst
 }
 
-// maxPooledPixels bounds the size of the snapshots whose storage is pooled
-// (as in the internal encoders): the buffers of larger pictures are left to
-// the garbage collector instead of being retained between calls.
-const maxPooledPixels = 2 << 20
-
-var pixPool sync.Pool // of *[]byte, NRGBA snapshot storage
+// pixPool holds the storage of NRGBA snapshots. It is a size-class pool
+// under the process-wide budget of internal/bufpool, shared with the lossy
+// encoder's buffers, so snapshots of any size are reused while the memory
+// kept between calls stays bounded (see bufpool).
+var pixPool bufpool.Pool[byte]
 
 // pooledNRGBA returns a w x h *image.NRGBA whose pixels (unspecified, to be
 // overwritten) may come from a pool, and the storage to hand back to
 // putPix when the image is no longer used.
-func pooledNRGBA(w, h int) (*image.NRGBA, *[]byte) {
-	n := 4 * w * h
-	var pp *[]byte
-	// A picture too large to be pooled leaves the pooled buffers alone
-	// (taking one would discard it).
-	if n <= 4*maxPooledPixels {
-		if p, ok := pixPool.Get().(*[]byte); ok && cap(*p) >= n {
-			pp = p
-		}
-	}
-	if pp == nil {
-		b := make([]byte, n)
-		pp = &b
-	}
-	*pp = (*pp)[:n]
-	return &image.NRGBA{Pix: *pp, Stride: 4 * w, Rect: image.Rect(0, 0, w, h)}, pp
+func pooledNRGBA(w, h int) (*image.NRGBA, []byte) {
+	pix := pixPool.Get(4 * w * h)
+	return &image.NRGBA{Pix: pix, Stride: 4 * w, Rect: image.Rect(0, 0, w, h)}, pix
 }
 
-// putPix returns storage obtained from pooledNRGBA to the pool (unless it
-// is too large to be retained).
-func putPix(pp *[]byte) {
-	if pp == nil || cap(*pp) > 4*maxPooledPixels {
-		return
+// putPix returns storage obtained from pooledNRGBA to the pool (if the
+// budget allows it). It may be called from any goroutine.
+func putPix(pix []byte) {
+	if pix != nil {
+		pixPool.Put(pix)
 	}
-	pixPool.Put(pp)
 }
 
 // convertNRGBA overwrites every pixel of dst (whose size is that of src's

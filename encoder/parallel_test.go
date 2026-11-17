@@ -199,7 +199,7 @@ func stoppableAlpha(started, returned chan struct{}) func(*image.NRGBA, *Config,
 
 func restoreHooks() {
 	alphaEncode = encodeAlpha
-	vp8Encode = vp8enc.Encode
+	vp8Encode = vp8enc.EncodeWithHeadroom
 }
 
 // TestParallelAlphaVP8Error checks that a failing VP8 frame stops the alpha
@@ -210,7 +210,7 @@ func TestParallelAlphaVP8Error(t *testing.T) {
 	errVP8 := errors.New("vp8 failure")
 	started, returned := make(chan struct{}), make(chan struct{})
 	alphaEncode = stoppableAlpha(started, returned)
-	vp8Encode = func(*vp8enc.Picture, *vp8enc.Config) ([]byte, error) {
+	vp8Encode = func(*vp8enc.Picture, *vp8enc.Config, int) ([]byte, error) {
 		<-started
 		return nil, errVP8
 	}
@@ -250,11 +250,11 @@ func TestParallelAlphaErrorPrecedence(t *testing.T) {
 			}
 			return encodeAlpha(img, c, interrupt)
 		}
-		vp8Encode = func(pic *vp8enc.Picture, cfg *vp8enc.Config) ([]byte, error) {
+		vp8Encode = func(pic *vp8enc.Picture, cfg *vp8enc.Config, headroom int) ([]byte, error) {
 			if tc.vp8Err != nil {
 				return nil, tc.vp8Err
 			}
-			return vp8enc.Encode(pic, cfg)
+			return vp8enc.EncodeWithHeadroom(pic, cfg, headroom)
 		}
 		for _, threads := range []bool{false, true} {
 			for _, b := range budgets {
@@ -296,7 +296,7 @@ func TestParallelAlphaPanics(t *testing.T) {
 	t.Run("vp8 frame", func(t *testing.T) {
 		started, returned := make(chan struct{}), make(chan struct{})
 		alphaEncode = stoppableAlpha(started, returned)
-		vp8Encode = func(*vp8enc.Picture, *vp8enc.Config) ([]byte, error) {
+		vp8Encode = func(*vp8enc.Picture, *vp8enc.Config, int) ([]byte, error) {
 			<-started
 			panic("vp8 boom")
 		}

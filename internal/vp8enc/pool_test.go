@@ -255,6 +255,9 @@ func TestEncodeWithHeadroom(t *testing.T) {
 		if !bytes.Equal(out[:headroom], make([]byte, headroom)) {
 			t.Fatalf("headroom %d: not zero", headroom)
 		}
+		if cap(out) <= len(out) {
+			t.Fatalf("headroom %d: no spare byte for a RIFF padding byte", headroom)
+		}
 	}
 	if _, err := EncodeWithHeadroom(pic, nil, -1); err == nil {
 		t.Fatal("negative headroom accepted")
