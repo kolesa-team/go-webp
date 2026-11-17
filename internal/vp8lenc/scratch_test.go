@@ -75,9 +75,9 @@ func TestRefsSizing(t *testing.T) {
 		}
 	}
 	sc.hc.fill(flat, w, h, 75, false, 0)
-	getBackwardRefs(flat, w, h, 75, false, false, 0, false, sc, nil)
+	getBackwardRefs(flat, w, h, 75, false, false, 0, false, -1, sc, nil)
 	check("flat", false)
 	sc.hc.fill(noise, w, h, 75, false, 0)
-	getBackwardRefs(noise, w, h, 75, false, false, 0, false, sc, nil)
+	getBackwardRefs(noise, w, h, 75, false, false, 0, false, -1, sc, nil)
 	check("noise", true)
 }

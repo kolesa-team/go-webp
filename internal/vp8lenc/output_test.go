@@ -3,6 +3,7 @@ package vp8lenc
 import (
 	"bytes"
 	"math"
+	"math/rand"
 	"slices"
 	"testing"
 )
@@ -39,6 +40,117 @@ func TestPaletteInPlace(t *testing.T) {
 				if !bytes.Equal(got, want) {
 					t.Fatalf("%s %dx%d m%d %v: in-place palette changes the stream", ti.name, w, h, method, cc)
 				}
+			}
+		}
+	}
+}
+
+// TestRefsCapEstimate checks initRefsCap against its definition and that
+// applyPalette returns initRefsCap of the bundled image.
+func TestRefsCapEstimate(t *testing.T) {
+	ref := func(argb []uint32, w, h int) int {
+		n := w * h
+		if n <= 4096 {
+			return n
+		}
+		est := 1
+		for i := 1; i < n; i++ {
+			if argb[i] != argb[i-1] && (i < w || argb[i] != argb[i-w]) {
+				est++
+			}
+		}
+		return min(n, est+est/2+4096)
+	}
+	rng := rand.New(rand.NewSource(9))
+	for _, sz := range [][2]int{{1, 5000}, {5000, 1}, {64, 64}, {65, 65}, {333, 101}, {7, 7}} {
+		w, h := sz[0], sz[1]
+		for _, colors := range []int{2, 4, 16, 17, 200} {
+			pal := make([]uint32, colors)
+			for i := range pal {
+				pal[i] = rng.Uint32()
+			}
+			argb := make([]uint32, w*h)
+			for i := range argb {
+				switch {
+				case i > 0 && rng.Intn(2) == 0:
+					argb[i] = argb[i-1]
+				case i >= w && rng.Intn(2) == 0:
+					argb[i] = argb[i-w]
+				default:
+					argb[i] = pal[rng.Intn(colors)]
+				}
+			}
+			if got, want := initRefsCap(argb, w, h), ref(argb, w, h); got != want {
+				t.Fatalf("%dx%d: initRefsCap %d, want %d", w, h, got, want)
+			}
+			palette := collectPalette(argb, nil)
+			pw := subSampleSize(w, paletteXBits(len(palette)))
+			for _, inPlace := range []bool{false, true} {
+				src := slices.Clone(argb)
+				dst := make([]uint32, pw*h)
+				if inPlace {
+					dst = src[:pw*h]
+				}
+				got := applyPalette(src, w, h, palette, dst, make([]uint8, w))
+				if want := ref(dst, pw, h); got != want {
+					t.Fatalf("%dx%d %d colors in place %v: applyPalette estimate %d, want %d", w, h, colors, inPlace, got, want)
+				}
+			}
+		}
+	}
+}
+
+// TestColorSetRows checks that collecting the colors row by row (as the
+// conversion does) gives the palette of the whole image.
+func TestColorSetRows(t *testing.T) {
+	rng := rand.New(rand.NewSource(5))
+	for _, colors := range []int{1, 2, 17, 255, 256, 257, 1000} {
+		for _, w := range []int{1, 3, 64} {
+			argb := make([]uint32, w*50)
+			for i := range argb {
+				if i > 0 && rng.Intn(3) == 0 {
+					argb[i] = argb[i-1] // runs across row boundaries
+				} else {
+					argb[i] = uint32(rng.Intn(colors)) * 0x01030507
+				}
+			}
+			want := collectPalette(argb, nil)
+			var s colorSet
+			for y := 0; y < 50; y++ {
+				s.add(argb[y*w : (y+1)*w])
+			}
+			got := s.palette(nil)
+			if (got == nil) != (want == nil) || !slices.Equal(got, want) {
+				t.Fatalf("%d colors, width %d: row-wise palette %d entries, whole %d", colors, w, len(got), len(want))
+			}
+		}
+	}
+}
+
+// TestImageInfo checks that the conversion's image info (palette and
+// transparency) gives the same streams as encodeARGB's own scans.
+func TestImageInfo(t *testing.T) {
+	for _, ti := range syntheticImages() {
+		w, h := ti.img.Rect.Dx(), ti.img.Rect.Dy()
+		for _, exact := range []bool{false, true} {
+			cfg := &Config{Quality: 75, Method: 4, Exact: exact}
+			want, err := Encode(ti.img, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			argb := make([]uint32, w*h)
+			for y := 0; y < h; y++ {
+				for x := 0; x < w; x++ {
+					s := ti.img.Pix[y*ti.img.Stride+4*x:]
+					if s[3] == 0 && !exact {
+						continue
+					}
+					argb[y*w+x] = uint32(s[3])<<24 | uint32(s[0])<<16 | uint32(s[1])<<8 | uint32(s[2])
+				}
+			}
+			got, _ := encodeARGB(argb, w, h, cfg, true, 5, nil, nil, nil)
+			if !bytes.Equal(got[5:], want[5:]) {
+				t.Fatalf("%s exact=%v: stream differs without image info", ti.name, exact)
 			}
 		}
 	}
