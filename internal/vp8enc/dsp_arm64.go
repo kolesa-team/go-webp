@@ -44,6 +44,19 @@ func predChroma8NEON(p, uLeft, vLeft, uvTop *byte)
 //go:noescape
 func predLuma4NEON(p, s *byte)
 
+//go:noescape
+func zeroBinStatsNEON(c *[16]int16, n int) (count0, maxBin int)
+
+func zeroBinStats(coeffs [][16]int16) (int, int) {
+	if len(coeffs) > 16 {
+		panic("vp8enc: zeroBinStats: too many blocks")
+	}
+	if !neonEnabled || len(coeffs) == 0 {
+		return zeroBinStatsRef(coeffs)
+	}
+	return zeroBinStatsNEON(&coeffs[0], len(coeffs))
+}
+
 // predLuma4 computes the 10 intra4 predictions into p from the boundary
 // samples b[t-5..t+7] (see predLuma4Ref). The kernel loads 16 bytes from
 // b[t-5]; the iterator's boundary array always has them.

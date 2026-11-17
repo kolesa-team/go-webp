@@ -613,7 +613,34 @@ func TestHistogramExact(t *testing.T) {
 		if m != mr || l != lr {
 			t.Fatalf("iter %d: got (%d, %d), want (%d, %d) for %v", iter, m, l, mr, lr, coeffs[:n])
 		}
+		c0, mb := zeroBinStats(coeffs[:n])
+		c0r, mbr := zeroBinStatsRef(coeffs[:n])
+		if c0 != c0r || mb != mbr {
+			t.Fatalf("iter %d: zeroBinStats (%d, %d), want (%d, %d) for %v", iter, c0, mb, c0r, mbr, coeffs[:n])
+		}
 	}
+}
+
+func FuzzZeroBinStats(f *testing.F) {
+	f.Add([]byte{0, 0x80, 0xff, 0x7f, 8, 0, 7, 0})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) < 2 {
+			return
+		}
+		n := 1 + int(data[0])%16
+		c := make([][16]int16, n)
+		for b := range c {
+			for i := range c[b] {
+				k := (b*16 + i) * 2 % (len(data) - 1)
+				c[b][i] = int16(uint16(data[k]) | uint16(data[k+1])<<8)
+			}
+		}
+		c0, mb := zeroBinStats(c)
+		c0r, mbr := zeroBinStatsRef(c)
+		if c0 != c0r || mb != mbr {
+			t.Fatalf("(%d, %d), want (%d, %d)", c0, mb, c0r, mbr)
+		}
+	})
 }
 
 func BenchmarkHistogram(b *testing.B) {

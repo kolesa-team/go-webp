@@ -691,7 +691,30 @@ func collectHistogram(ref, pred []byte, t *pairTable) (int, int) {
 	var coeffs [16][16]int16
 	n := 2 * t.n
 	fTransformPairs(ref, pred, t, coeffs[:n])
+	if vecKernels {
+		// When more than half of the coefficients fall in bin 0, no other
+		// bin can have more: the histogram reduces to two vector
+		// reductions (the common case).
+		count0, maxBin := zeroBinStats(coeffs[:n])
+		if 2*count0 > 16*n {
+			return count0, maxBin
+		}
+	}
 	return histogramStats(coeffs[:n])
+}
+
+// zeroBinStatsRef returns the number of coefficients in histogram bin 0
+// and the largest bin (coeffBin).
+func zeroBinStatsRef(coeffs [][16]int16) (int, int) {
+	count0, maxBin := 0, 0
+	for b := range coeffs {
+		for _, v := range coeffs[b] {
+			bin := coeffBin(v)
+			count0 += b2i(bin == 0)
+			maxBin = max(maxBin, bin)
+		}
+	}
+	return count0, maxBin
 }
 
 // coeffBin is the histogram bin of a DCT coefficient: min(|v| >> 3, 31).

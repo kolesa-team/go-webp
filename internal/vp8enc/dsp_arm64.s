@@ -996,3 +996,47 @@ TEXT ·predLuma4NEON(SB), NOSPLIT, $0-16
 	VST1.P	V25.D[0], (R0)(R7)
 	VST1	V25.D[1], (R0)
 	RET
+
+// ---------------------------------------------------------------------------
+// func zeroBinStatsNEON(c *[16]int16, n int) (count0, maxBin int)
+//
+// zeroBinStatsRef (dsp.go) of n <= 16 blocks: the histogram bins
+// min(|v| >> 3, 31) of 16 coefficients (ABS, USHR, UMIN, UZP1 to bytes;
+// ABS(-32768) reads as 32768 unsigned, as |v| in Go), their running maximum
+// (UMAX) and the per-lane count of bin 0 (CMEQ masks subtracted, at most
+// n <= 16 per byte lane), reduced at the end (UMAXV, UADDLV).
+//
+// Registers: R0 c, R1 blocks left, V2 maximum bins, V3 bin-0 counts,
+// V31 31.
+TEXT ·zeroBinStatsNEON(SB), NOSPLIT, $0-32
+	MOVD	c+0(FP), R0
+	MOVD	n+8(FP), R1
+	MOVD	$31, R2
+	VDUP	R2, V31.H8
+	VEOR	V2.B16, V2.B16, V2.B16
+	VEOR	V3.B16, V3.B16, V3.B16
+	CBZ	R1, zdone
+
+zloop:
+	VLD1.P	32(R0), [V0.H8, V1.H8]
+	VABS	V0.H8, V0.H8
+	VABS	V1.H8, V1.H8
+	VUSHR	$3, V0.H8, V0.H8
+	VUSHR	$3, V1.H8, V1.H8
+	VUMIN	V31.H8, V0.H8, V0.H8
+	VUMIN	V31.H8, V1.H8, V1.H8
+	VUZP1	V1.B16, V0.B16, V0.B16
+	VUMAX	V0.B16, V2.B16, V2.B16
+	VCMEQ	$0, V0.B16, V0.B16
+	VSUB	V0.B16, V3.B16, V3.B16
+	SUBS	$1, R1, R1
+	BNE	zloop
+
+zdone:
+	VUADDLV	V3.B16, V3
+	VUMAXV	V2.B16, V2
+	VMOV	V3.H[0], R3
+	VMOV	V2.B[0], R4
+	MOVD	R3, count0+16(FP)
+	MOVD	R4, maxBin+24(FP)
+	RET
