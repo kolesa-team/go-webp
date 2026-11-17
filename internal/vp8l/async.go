@@ -12,7 +12,7 @@ import (
 // The calling goroutine entropy-decodes the level-0 pixels (decodePixels)
 // while a helper goroutine runs the inverse transforms and the output
 // conversion (emitRows) on the rows decoded so far, and writes them into the
-// sink. Rows are handed over in jobs of at least asyncJobPixels pixels,
+// sink. Rows are handed over in jobs of about jobPixels image pixels,
 // zero-copy: a job is a slice of the level-0 buffer, which the producer does
 // not overwrite until the helper has acknowledged the job (see beforeSlide).
 //
@@ -101,7 +101,8 @@ func (d *decoder) startAsync() bool {
 	}
 	if d.sliding {
 		// Pending rows stay in the window: keep them well below the room
-		// a slide leaves (see initBuffer32).
+		// a slide leaves (see initBuffer32). The window counts level-0
+		// pixels, at most as many as image pixels.
 		a.jobPixels = min(a.jobPixels, d.window/4)
 	}
 	a.task = workers.Spawn(func() error { return d.consume(a) })
@@ -141,7 +142,7 @@ func (d *decoder) sendRows(buf []uint32, base, row int, flush bool) error {
 		return nil
 	}
 	w := d.xsize
-	if !flush && row < d.needRows && (row-y0)*w < a.jobPixels {
+	if !flush && row < d.needRows && (row-y0)*d.width < a.jobPixels {
 		a.pendingRow = row
 		return nil
 	}
