@@ -114,9 +114,10 @@ func transformDC(in *[16]int16, b []byte, o int) {
 	}
 }
 
-// transformWHT computes the inverse Walsh-Hadamard transform of the luma DC
-// coefficients and scatters them into the 16 luma blocks of out.
-func transformWHT(in *[16]int16, out *[384]int16) {
+// transformWHTRef computes the inverse Walsh-Hadamard transform of the luma
+// DC coefficients and scatters them into the 16 luma blocks of out (the
+// reference of the transformWHT entry point).
+func transformWHTRef(in *[16]int16, out *[384]int16) {
 	var tmp [16]int
 	for i := 0; i < 4; i++ {
 		a0 := int(in[0+i]) + int(in[12+i])

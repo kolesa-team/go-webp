@@ -43,6 +43,7 @@ func TestReconGuardPages(t *testing.T) {
 		bm := guardedBuf(t, yuvSize, atEnd)
 		cm := guardedBuf(t, 384*2, atEnd)
 		mm := guardedBuf(t, 16, atEnd)
+		in := (*[16]int16)(unsafe.Pointer(&guardedBuf(t, 32, atEnd)[0]))
 		b := (*[yuvSize]byte)(unsafe.Pointer(&bm[0]))
 		coeffs := (*[384]int16)(unsafe.Pointer(&cm[0]))
 		modes := (*[16]uint8)(unsafe.Pointer(&mm[0]))
@@ -74,6 +75,14 @@ func TestReconGuardPages(t *testing.T) {
 			}
 			if *coeffs != c.coeffs || *modes != c.modes {
 				t.Fatal("inputs modified")
+			}
+
+			*in = *(*[16]int16)(c.coeffs[16*r.IntN(24):])
+			whtOut := c.coeffs
+			transformWHTRef(in, &whtOut)
+			transformWHT(in, coeffs)
+			if *coeffs != whtOut {
+				t.Fatal("transformWHT differs from the reference")
 			}
 		}
 	}
