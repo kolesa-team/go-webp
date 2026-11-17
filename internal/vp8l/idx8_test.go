@@ -2,8 +2,10 @@ package vp8l
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"image"
+	"math/rand"
 	"testing"
 
 	"github.com/kolesa-team/go-webp/v2/internal/vp8lenc"
@@ -253,4 +255,74 @@ func FuzzDecodeIdx8(f *testing.F) {
 			}
 		})
 	})
+}
+
+// TestPaletteEmit checks the fused palette output kernels (index bytes and
+// 32-bit pixels, bundled or not) against inverseColorIndex + toRGBA, for
+// odd row widths and a destination shorter than the row.
+func TestPaletteEmit(t *testing.T) {
+	rng := rand.New(rand.NewSource(5))
+	for iter := 0; iter < 400; iter++ {
+		bits := rng.Intn(4)
+		width := 1 + rng.Intn(70)
+		tr := randomPaletteTransform(rng, width, bits)
+		pw := subSampleSize(width, bits)
+		src := make([]byte, pw)
+		src32 := make([]uint32, pw)
+		for i := range src {
+			src[i] = byte(rng.Intn(256))
+			src32[i] = rng.Uint32()&0xffff00ff | uint32(src[i])<<8
+		}
+		colors := make([]uint32, width)
+		inverseColorIndex(tr, 0, 1, src32, colors)
+		want := make([]byte, 4*width)
+		for i, c := range colors {
+			binary.LittleEndian.PutUint32(want[4*i:], toRGBA(c))
+		}
+		short := rng.Intn(width + 1) // a destination with fewer pixels
+		for _, n := range []int{width, short} {
+			for _, idx8 := range []bool{false, true} {
+				d := getDecoder()
+				got := make([]byte, 4*n+8)
+				for i := range got {
+					got[i] = 0xa5
+				}
+				if idx8 {
+					d.emitPaletteIdx8(tr, src, got[:4*n])
+				} else {
+					d.emitPalette(tr, src32, got[:4*n])
+				}
+				putDecoder(d)
+				if !bytes.Equal(got[:4*n], want[:4*n]) {
+					t.Fatalf("iter %d: bits %d width %d dst %d px idx8 %v: wrong pixels", iter, bits, width, n, idx8)
+				}
+				for _, b := range got[4*n:] {
+					if b != 0xa5 {
+						t.Fatalf("iter %d: bits %d width %d dst %d px idx8 %v: wrote past the destination", iter, bits, width, n, idx8)
+					}
+				}
+			}
+		}
+	}
+}
+
+func BenchmarkPaletteEmit(b *testing.B) {
+	rng := rand.New(rand.NewSource(1))
+	for bits := 0; bits <= 3; bits++ {
+		const width = 3000
+		tr := randomPaletteTransform(rng, width, bits)
+		src := make([]byte, subSampleSize(width, bits))
+		for i := range src {
+			src[i] = byte(rng.Intn(256))
+		}
+		dst := make([]byte, 4*width)
+		b.Run(fmt.Sprintf("bits%d", bits), func(b *testing.B) {
+			d := getDecoder()
+			defer putDecoder(d)
+			b.SetBytes(4 * width)
+			for i := 0; i < b.N; i++ {
+				d.emitPaletteIdx8(tr, src, dst)
+			}
+		})
+	}
 }

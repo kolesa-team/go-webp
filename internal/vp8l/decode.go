@@ -73,8 +73,8 @@ type decoder struct {
 	colorCache  *[1 << maxCacheBits]uint32
 	pal         [256]uint32 // RGBA palette for fused color-index output
 	palReady    bool
-	premulPal   bool   // pal is alpha-premultiplied (pipeline.PremultipliedSink)
-	bundle      []byte // RGBA bytes of the pixels of each bundled index byte
+	premulPal   bool     // pal is alpha-premultiplied (pipeline.PremultipliedSink)
+	bundle      []uint64 // RGBA pixels of each bundled index byte (bundleTable)
 	bundleReady bool
 	alphaTab    *alphaTables // 8-bit alpha path tables (built once per decode)
 
