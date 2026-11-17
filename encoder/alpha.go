@@ -6,10 +6,10 @@ package encoder
 import (
 	"errors"
 	"image"
-	"sync"
 	"sync/atomic"
 
 	"github.com/kolesa-team/go-webp/v2/internal/alpha"
+	"github.com/kolesa-team/go-webp/v2/internal/bufpool"
 	"github.com/kolesa-team/go-webp/v2/internal/vp8enc"
 	"github.com/kolesa-team/go-webp/v2/internal/vp8lenc"
 	"github.com/kolesa-team/go-webp/v2/internal/workers"
@@ -38,16 +38,11 @@ var (
 	alphaEncode = encodeAlpha
 )
 
-var planePool sync.Pool // of *[]byte
-
-func getPlane(n int) *[]byte {
-	if p, ok := planePool.Get().(*[]byte); ok && cap(*p) >= n {
-		*p = (*p)[:n]
-		return p
-	}
-	b := make([]byte, n)
-	return &b
-}
+// planePool holds the alpha planes (one byte per pixel) of encodeAlpha. It
+// is a bufpool pool rather than a sync.Pool: the planes of large pictures
+// (6 MB for 3000x2000) then survive the garbage collections that run while
+// the VP8 frame is being encoded.
+var planePool bufpool.Pool[byte]
 
 // encodeAlpha returns the ALPH chunk payload (header byte included) of img's
 // alpha channel, following libwebp's EncodeAlpha. interrupt, if not nil, is
@@ -65,9 +60,8 @@ func encodeAlpha(img *image.NRGBA, c *Config, interrupt func() bool) ([]byte, er
 	}
 
 	w, h := img.Rect.Dx(), img.Rect.Dy()
-	pp := getPlane(w * h)
-	defer planePool.Put(pp)
-	plane := *pp
+	plane := planePool.Get(w * h)
+	defer planePool.Put(plane)
 	for y := 0; y < h; y++ {
 		row := img.Pix[img.PixOffset(img.Rect.Min.X, img.Rect.Min.Y+y):][:4*w]
 		dst := plane[y*w : y*w+w]
@@ -104,9 +98,8 @@ func encodeAlpha(img *image.NRGBA, c *Config, interrupt func() bool) ([]byte, er
 
 	var filtered []byte
 	if tryMap != 1<<alpha.FilterNone {
-		fp := getPlane(w * h)
-		defer planePool.Put(fp)
-		filtered = *fp
+		filtered = planePool.Get(w * h)
+		defer planePool.Put(filtered)
 	}
 
 	pre := 0
