@@ -67,7 +67,13 @@ type Config struct {
 	UseScaling   bool
 	ScaledWidth  int
 	ScaledHeight int
-	// UseThreads decodes lossy pictures with two goroutines.
+	// UseThreads decodes lossy pictures with helper goroutines: one
+	// reconstructs the macroblock rows the calling goroutine parses, and
+	// for pictures with alpha (256K pixels or more) another decodes the
+	// alpha plane ahead of the rows that need it. The alpha helper takes a
+	// slot of the process-wide budget of GOMAXPROCS-1 helpers; without a
+	// free slot that work stays on the decoding goroutines. The output is
+	// the same either way.
 	UseThreads bool
 	// DitheringStrength in [0, 100] dithers the chroma of lossy pictures.
 	DitheringStrength int
