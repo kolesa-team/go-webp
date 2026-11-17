@@ -184,6 +184,50 @@ func doUVTransform(bits uint32, in *[384]int16, first int, b []byte, o int) {
 	}
 }
 
+// --- per-macroblock reconstruction -------------------------------------------
+//
+// These are the reference implementations of the macroblock-level entry
+// points reconI4, reconI16 and reconUV. Architectures with an assembly
+// kernel (recon_arm64.s) bind the entry points to it; the others, and the
+// purego build, bind them to these functions (recon_generic.go). The
+// assembly must stay bit-exact with them for every input, which the
+// differential tests in recon_test.go check.
+
+// reconI4Ref predicts and reconstructs the 16 luma sub-blocks of an
+// intra-4x4 macroblock in raster order. The top-right samples of the
+// macroblock must already be in place (and replicated below, see
+// reconstructMB). bits holds the 2-bit transform code of each sub-block,
+// sub-block 0 in the top bits.
+func reconI4Ref(b *[yuvSize]byte, coeffs *[384]int16, bits uint32, modes *[16]uint8) {
+	for n := 0; n < 16; n++ {
+		o := yOff + kScan[n]
+		predLuma4(modes[n], b[:], o)
+		doTransform(bits>>30, (*[16]int16)(coeffs[n*16:]), b[:], o)
+		bits <<= 2
+	}
+}
+
+// reconI16Ref runs the 16x16 luma predictor mode (after checkMode) and adds
+// the residuals of the 16 luma blocks.
+func reconI16Ref(b *[yuvSize]byte, coeffs *[384]int16, bits uint32, mode int) {
+	predLuma16(mode, b[:])
+	if bits != 0 {
+		for n := 0; n < 16; n++ {
+			doTransform(bits>>30, (*[16]int16)(coeffs[n*16:]), b[:], yOff+kScan[n])
+			bits <<= 2
+		}
+	}
+}
+
+// reconUVRef runs the 8x8 chroma predictor mode (after checkMode) on both
+// chroma planes and adds their residuals; bits is mbBlock.nonZeroUV.
+func reconUVRef(b *[yuvSize]byte, coeffs *[384]int16, bits uint32, mode int) {
+	predChroma8(mode, b[:], uOff)
+	predChroma8(mode, b[:], vOff)
+	doUVTransform(bits>>0, coeffs, 16*16, b[:], uOff)
+	doUVTransform(bits>>8, coeffs, 20*16, b[:], vOff)
+}
+
 // --- intra prediction -------------------------------------------------------
 
 func avg3(a, b, c int) uint8 { return uint8((a + 2*b + c + 2) >> 2) }
