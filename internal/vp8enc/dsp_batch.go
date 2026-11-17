@@ -93,13 +93,28 @@ func iTransformPairsRef(ref []byte, in [][16]int16, dst []byte, t *pairTable) {
 // rate and flatness estimates: bits 0-7 hold the index of the last
 // non-zero level plus one (0 for an empty block), bits 8-15 the number of
 // non-zero levels after the first (the AC levels).
+//
+// The Go mode search calls it for every quantized candidate block (the NEON
+// quantizer computes the summary itself), so the non-zero mask is built
+// four levels at a time instead of with a 16-step dependency chain.
 func levelInfoOf(c *[16]int16) uint16 {
-	m := uint32(0)
-	for i := 15; i >= 0; i-- {
-		v := uint32(uint16(c[i]))
-		m = m<<1 | (v|-v)>>31
-	}
+	m := nonZero4(c[0], c[1], c[2], c[3]) | nonZero4(c[4], c[5], c[6], c[7])<<4 |
+		nonZero4(c[8], c[9], c[10], c[11])<<8 | nonZero4(c[12], c[13], c[14], c[15])<<12
 	return uint16(bits.Len32(m)) | uint16(bits.OnesCount32(m>>1))<<8
+}
+
+// nonZero4 returns a 4-bit mask with bit i set when the i-th argument is
+// not zero. The levels are packed into 16-bit lanes: adding 0x7fff to the
+// low 15 bits of a lane carries into its bit 15 when they are not all zero,
+// and or-ing the lane itself adds its sign bit. The multiplication moves
+// the four lane flags (bits 0, 16, 32 and 48) to bits 48-51; its other
+// partial products land on distinct bits outside 48-51 or overflow, so
+// there are no carries.
+func nonZero4(a, b, c, d int16) uint32 {
+	const low15 = 0x7fff7fff7fff7fff
+	w := uint64(uint16(a)) | uint64(uint16(b))<<16 | uint64(uint16(c))<<32 | uint64(uint16(d))<<48
+	flags := ((w&low15 + low15) | w) >> 15 & 0x0001000100010001
+	return uint32(flags * 0x0001000200040008 >> 48)
 }
 
 // infoLast returns the index of the last non-zero level, or -1.

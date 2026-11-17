@@ -1,6 +1,7 @@
 package vp8enc
 
 import (
+	"math/bits"
 	"math/rand"
 	"testing"
 )
@@ -263,6 +264,48 @@ func isFlat(levels []([16]int16), thresh int) bool {
 		}
 	}
 	return true
+}
+
+// levelInfoLoop is the straightforward levelInfoOf (one level per step).
+func levelInfoLoop(c *[16]int16) uint16 {
+	m := uint32(0)
+	for i := 15; i >= 0; i-- {
+		v := uint32(uint16(c[i]))
+		m = m<<1 | (v|-v)>>31
+	}
+	return uint16(bits.Len32(m)) | uint16(bits.OnesCount32(m>>1))<<8
+}
+
+// TestLevelInfoPatterns checks levelInfoOf against levelInfoLoop on every
+// zero/non-zero pattern of a block, with non-zero levels at the lane
+// boundaries (1, -1, 0x7fff, -0x8000, ...) and random ones.
+func TestLevelInfoPatterns(t *testing.T) {
+	rng := rand.New(rand.NewSource(9))
+	vals := []int16{1, -1, 2, -2, 0x7fff, -0x8000, 0x100, -0x100, 0x4000, -0x7fff}
+	rounds := len(vals) + 4
+	if testing.Short() {
+		rounds = len(vals)
+	}
+	for p := 0; p < 1<<16; p++ {
+		for k := 0; k < rounds; k++ {
+			var c [16]int16
+			for i := range c {
+				if p>>i&1 == 0 {
+					continue
+				}
+				if k < len(vals) {
+					c[i] = vals[(k+i)%len(vals)]
+				} else {
+					for c[i] == 0 {
+						c[i] = int16(rng.Intn(65536))
+					}
+				}
+			}
+			if got, want := levelInfoOf(&c), levelInfoLoop(&c); got != want {
+				t.Fatalf("%v: levelInfoOf %#x, want %#x", c, got, want)
+			}
+		}
+	}
 }
 
 // TestLevelInfo checks levelInfoOf against lastNonZero and isFlat.
