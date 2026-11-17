@@ -132,6 +132,62 @@ func backwardRefsLz77(n int, argb []uint32, hc *hashChain, refs []pixOrCopy) []p
 	return refs
 }
 
+// rleSampleStep is the row sampling of rleRefsEstimate for images of at
+// least rleSampleMinRows rows.
+const (
+	rleSampleStep    = 8
+	rleSampleMinRows = 64
+)
+
+// rleRefsEstimate estimates the number of entries of the RLE parse of the
+// w x h image argb (backwardRefsRle) from its entries starting in every
+// rleSampleStep-th row (it counts them all in images of fewer than
+// rleSampleMinRows rows). initRefsCap undercounts them on photos (pixels
+// equal to a neighbor are often literals of the RLE parse, in runs too short
+// for a copy), whose RLE parse would then outgrow its buffer (a copy into
+// a buffer of one entry per pixel, both alive at once).
+func rleRefsEstimate(argb []uint32, w, h int) int {
+	n := w * h
+	argb = argb[:n]
+	if h < rleSampleMinRows {
+		return rleEntries(argb, w, 0, n)
+	}
+	count, rows := 0, 0
+	for y := 0; y < h; y += rleSampleStep {
+		count += rleEntries(argb, w, y*w, (y+1)*w)
+		rows++
+	}
+	return int(int64(count) * int64(h) / int64(rows))
+}
+
+// rleEntries returns the number of entries of backwardRefsRle that start
+// in argb[lo:hi] (w pixels wide), as if one started at lo.
+func rleEntries(argb []uint32, w, lo, hi int) int {
+	n := len(argb)
+	i, k := lo, 0
+	if i == 0 {
+		k, i = 1, 1 // the first pixel is a literal
+	}
+	for ; i < hi; k++ {
+		maxLen := min(n-i, maxLength)
+		cur := argb[i : i+maxLen]
+		rle := vectorMismatch(cur, argb[i-1:], maxLen)
+		prow := 0
+		if i >= w {
+			prow = vectorMismatch(cur, argb[i-w:], maxLen)
+		}
+		switch {
+		case rle >= prow && rle >= minLength:
+			i += rle
+		case prow >= minLength:
+			i += prow
+		default:
+			i++
+		}
+	}
+	return k
+}
+
 // backwardRefsRle computes references using only distance 1 and xsize.
 func backwardRefsRle(xsize, n int, argb []uint32, refs []pixOrCopy) []pixOrCopy {
 	refs = refs[:0]

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"image"
 	"math"
+	"slices"
 )
 
 // Config controls the lossless encoder. Field semantics follow libwebp's
@@ -762,6 +763,9 @@ func getBackwardRefs(argb []uint32, w, h int, quality int, lowEffort, box bool, 
 	// libwebp's for a small cost.
 	cacheBuf := sc.cacheBuf(1 << maxColorCacheBits)
 	trace := quality >= 25 && !lowEffort
+	if !tryNoCache {
+		return append(cands[:0], bestRefs(argb, w, n, quality, types, trace, cacheBitsMax, refsCap, cacheBuf, sc))
+	}
 	// sc.refs slots: best[0] with cache, best[1] without (tryNoCache), tmp.
 	best := [2]int{0, 1}
 	tmp := 2
@@ -838,6 +842,73 @@ func getBackwardRefs(argb []uint32, w, h int, quality int, lowEffort, box bool, 
 		cands = append(cands, refsCandidate{sc.refs[best[1]], 0, bestCost[1]})
 	}
 	return cands
+}
+
+// parseRefs computes the parse of type typ of argb into refs.
+func parseRefs(typ, w, n int, argb []uint32, sc *scratch, refs []pixOrCopy) []pixOrCopy {
+	switch typ {
+	case lz77Standard:
+		return backwardRefsLz77(n, argb, &sc.hc, refs)
+	case lz77RLE:
+		return backwardRefsRle(w, n, argb, refs)
+	}
+	return backwardRefsLz77(n, argb, &sc.hcBox, refs)
+}
+
+// bestRefs is getBackwardRefs without tryNoCache, keeping a single parse in
+// memory (in sc.refs[0]; a parse takes up to 8 bytes per pixel): every
+// parse type is evaluated in the same buffer, and the best one is computed
+// again (the parses are deterministic) when a later candidate has
+// overwritten it. Usually it has not: the last candidate (the RLE parse,
+// which a spatially predicted image favors), or the cost-based parse, wins.
+func bestRefs(argb []uint32, w, n, quality int, types []int, trace bool, cacheBitsMax, refsCap int, cacheBuf []uint32, sc *scratch) refsCandidate {
+	if refsCap < n && slices.Contains(types, lz77RLE) {
+		// The buffer holds the RLE parse in turn, often the longest one:
+		// size it for that parse too, rather than growing it during the
+		// parse (a copy, with both buffers alive).
+		e := rleRefsEstimate(argb, w, n/w)
+		refsCap = max(refsCap, min(n, e+e/8+4096))
+	}
+	r := sc.refsBuf(0, refsCap)
+	bestCost := math.Inf(1)
+	bestType, bestCB, inBuf := 0, 0, 0
+	for _, typ := range types {
+		r = parseRefs(typ, w, n, argb, sc, r)
+		cb := bestCacheBits(argb, quality, r, cacheBitsMax, sc)
+		applyColorCache(argb, cb, r, cacheBuf)
+		cost := histoCost(r, w, cb, trace, sc)
+		inBuf = typ
+		if cost < bestCost || bestType == 0 {
+			bestCost, bestType, bestCB = cost, typ, cb
+		}
+	}
+	redo := func(r []pixOrCopy) []pixOrCopy {
+		r = parseRefs(bestType, w, n, argb, sc, r)
+		applyColorCache(argb, bestCB, r, cacheBuf)
+		return r
+	}
+	if inBuf != bestType {
+		r = redo(r)
+	}
+	// Improve on the simple LZ77 with the cost-based parse (only for high
+	// quality, as it is costly).
+	if (bestType == lz77Standard || bestType == lz77Box) && trace {
+		hc := &sc.hc
+		if bestType == lz77Box {
+			hc = &sc.hcBox
+		}
+		// traceBackwards reads its input parse only before it writes its
+		// output: both can share the buffer.
+		r = traceBackwards(w, n, argb, bestCB, hc, r, r[:0], sc)
+		applyColorCache(argb, bestCB, r, cacheBuf)
+		if !(histoCost(r, w, bestCB, true, sc) < bestCost) {
+			r = redo(r)
+		}
+	}
+	sc.refs[0] = r
+	// (A cost-based parse only replaces a candidate when cheaper, so
+	// bestCost bounds the estimate of the returned parse.)
+	return refsCandidate{r, bestCB, bestCost}
 }
 
 // encodeImageNoHuffman encodes a sub-image (transform data, entropy image or

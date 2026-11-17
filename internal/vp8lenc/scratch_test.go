@@ -1,8 +1,12 @@
 package vp8lenc
 
 import (
+	"fmt"
+	"math"
+	"math/rand"
 	"reflect"
 	"runtime"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -265,8 +269,9 @@ func TestRefsSizing(t *testing.T) {
 				t.Errorf("%s refs[%d]: len %d cap %d, n %d", name, i, len(sc.refs[i]), cap(sc.refs[i]), n)
 			}
 		}
-		if used < 2 {
-			t.Errorf("%s: %d parse buffers in use, want at least 2", name, used)
+		// Without tryNoCache, a single parse is kept (bestRefs).
+		if used != 1 {
+			t.Errorf("%s: %d parse buffers in use, want 1", name, used)
 		}
 	}
 	sc.hc.fill(flat, w, h, 75, false, 0)
@@ -275,4 +280,146 @@ func TestRefsSizing(t *testing.T) {
 	sc.hc.fill(noise, w, h, 75, false, 0)
 	getBackwardRefs(noise, w, h, 75, false, false, 0, false, -1, sc, nil)
 	check("noise", true)
+}
+
+// TestRLERefsEstimate checks rleRefsEstimate: exact below
+// rleSampleMinRows rows, close to the parse on a photo, and that bestRefs
+// then needs no growth of its buffer.
+func TestRLERefsEstimate(t *testing.T) {
+	rng := rand.New(rand.NewSource(7))
+	for _, sz := range [][2]int{{1, 1}, {1, 63}, {63, 1}, {5000, 2}, {37, 63}} {
+		w, h := sz[0], sz[1]
+		argb := make([]uint32, w*h)
+		for i := range argb {
+			switch {
+			case i > 0 && rng.Intn(3) == 0:
+				argb[i] = argb[i-1]
+			case i >= w && rng.Intn(3) == 0:
+				argb[i] = argb[i-w]
+			default:
+				argb[i] = uint32(rng.Intn(3))
+			}
+		}
+		if got, want := rleRefsEstimate(argb, w, h), len(backwardRefsRle(w, w*h, argb, nil)); got != want {
+			t.Errorf("%dx%d: estimate %d, RLE parse %d entries", w, h, got, want)
+		}
+	}
+	img := downscale(loadTestJPEG(t, "source.jpg"), 1)
+	w, h := img.Rect.Dx(), img.Rect.Dy()
+	argb := make([]uint32, w*h)
+	for i := range argb {
+		p := img.Pix[(i/w)*img.Stride+4*(i%w):]
+		argb[i] = uint32(p[3])<<24 | uint32(p[0])<<16 | uint32(p[1])<<8 | uint32(p[2])
+	}
+	// The residuals of a photo (what the RLE parse usually wins on).
+	sc := new(scratch)
+	modes := make([]uint32, subSampleSize(w, 4)*subSampleSize(h, 4))
+	predictorImage(w, h, 4, 4, false, 1, false, false, true, argb, modes, sc, 0)
+	want := len(backwardRefsRle(w, w*h, argb, nil))
+	got := rleRefsEstimate(argb, w, h)
+	if d := got - want; d > want/20 || d < -want/20 {
+		t.Errorf("photo residuals: estimate %d, RLE parse %d entries", got, want)
+	}
+	sc.hc.fill(argb, w, h, 75, false, 0)
+	c := initRefsCap(argb, w, h)
+	r := bestRefs(argb, w, w*h, 75, []int{lz77Standard, lz77RLE}, true, maxColorCacheBits, c, sc.cacheBuf(1<<maxColorCacheBits), sc)
+	if cap(r.refs) != min(w*h, got+got/8+4096) {
+		t.Errorf("photo residuals: refs buffer of %d entries for an estimate of %d (initRefsCap %d)", cap(r.refs), got, c)
+	}
+}
+
+// refBestRefs is the two-buffer selection that bestRefs replaced: every
+// candidate parse is kept until a better one is found. It also returns the
+// winning parse type and whether the cost-based parse was tried and won.
+func refBestRefs(argb []uint32, w, n, quality int, types []int, trace bool, cacheBitsMax, refsCap int, sc *scratch) (refsCandidate, string) {
+	cacheBuf := make([]uint32, 1<<maxColorCacheBits)
+	var bufs [2][]pixOrCopy
+	best, tmp := 0, 1
+	bestCost, bestType, bestCB := math.Inf(1), 0, 0
+	for _, typ := range types {
+		r := parseRefs(typ, w, n, argb, sc, make([]pixOrCopy, 0, refsCap))
+		bufs[tmp] = r
+		cb := bestCacheBits(argb, quality, r, cacheBitsMax, sc)
+		applyColorCache(argb, cb, r, cacheBuf)
+		if cost := histoCost(r, w, cb, trace, sc); cost < bestCost {
+			best, tmp = tmp, best
+			bestCost, bestType, bestCB = cost, typ, cb
+		}
+	}
+	kind := fmt.Sprintf("type%d", bestType)
+	if (bestType == lz77Standard || bestType == lz77Box) && trace {
+		hc := &sc.hc
+		if bestType == lz77Box {
+			hc = &sc.hcBox
+		}
+		r := traceBackwards(w, n, argb, bestCB, hc, bufs[best], nil, sc)
+		applyColorCache(argb, bestCB, r, cacheBuf)
+		kind += "-trace-loses"
+		if c := histoCost(r, w, bestCB, true, sc); c < bestCost {
+			bufs[best] = r
+			kind = fmt.Sprintf("type%d-trace-wins", bestType)
+		}
+	}
+	return refsCandidate{bufs[best], bestCB, bestCost}, kind
+}
+
+// TestBestRefsSingleBuffer checks the single-buffer parse selection against
+// the two-buffer one, on images where each parse type (and the cost-based
+// parse, or not) wins.
+func TestBestRefsSingleBuffer(t *testing.T) {
+	rng := rand.New(rand.NewSource(5))
+	type img struct {
+		name string
+		w, h int
+		f    func(x, y int) uint32
+	}
+	imgs := []img{
+		{"noise", 97, 61, func(x, y int) uint32 { return rng.Uint32() }},
+		{"runs", 128, 40, func(x, y int) uint32 { return uint32(x/9+y/4) * 0x10203 }},
+		{"repeats", 77, 50, func(x, y int) uint32 { return uint32((x*7+y*3)%23)*0x1010101 ^ uint32(rng.Intn(2)) }},
+		{"rows", 64, 64, func(x, y int) uint32 { return uint32(x*x) ^ uint32(y%2)<<8 }},
+		{"few", 90, 70, func(x, y int) uint32 {
+			return []uint32{0xff000000, 0xffff0000, 0xff00ff00, 0xff0000ff}[(x/3+y/2+rng.Intn(2))%4]
+		}},
+	}
+	won := map[string]bool{}
+	for _, im := range imgs {
+		n := im.w * im.h
+		argb := make([]uint32, n)
+		for i := range argb {
+			argb[i] = im.f(i%im.w, i/im.w)
+		}
+		for _, q := range []int{0, 20, 25, 50, 75, 100} {
+			for _, box := range []bool{false, true} {
+				for _, cbMax := range []int{0, 4, maxColorCacheBits} {
+					sc := new(scratch)
+					sc.hc.fill(argb, im.w, im.h, q, q == 0, 0)
+					types := []int{lz77Standard, lz77RLE}
+					if box {
+						types = []int{lz77Box}
+						sc.hcBox.fillBox(argb, im.w, n, &sc.hc, sc)
+					}
+					trace := q >= 25
+					ref := new(scratch)
+					ref.hc, ref.hcBox = sc.hc, sc.hcBox // (read only)
+					want, kind := refBestRefs(argb, im.w, n, q, types, trace, cbMax, 16, ref)
+					cacheBuf := sc.cacheBuf(1 << maxColorCacheBits)
+					got := bestRefs(argb, im.w, n, q, types, trace, cbMax, 16, cacheBuf, sc)
+					name := fmt.Sprintf("%s q%d box=%v cb%d (%s)", im.name, q, box, cbMax, kind)
+					if got.cacheBits != want.cacheBits || got.bits != want.bits || !slices.Equal(got.refs, want.refs) {
+						t.Fatalf("%s: single-buffer parse differs (cache bits %d/%d, %d/%d refs)", name, got.cacheBits, want.cacheBits, len(got.refs), len(want.refs))
+					}
+					if &sc.refs[0][:1][0] != &got.refs[:1][0] {
+						t.Fatalf("%s: parse not kept in refs[0]", name)
+					}
+					won[kind] = true
+				}
+			}
+		}
+	}
+	for _, k := range []string{"type1", "type2", "type1-trace-wins", "type1-trace-loses", "type4-trace-wins"} {
+		if !won[k] {
+			t.Errorf("no case where %s (cases: %v)", k, won)
+		}
+	}
 }
