@@ -181,6 +181,9 @@ func TestEncodeContextThreadsAll(t *testing.T) {
 // included, go back to the pool and are reused, with the size and stride of
 // the request.
 func TestPooledNRGBAAnySize(t *testing.T) {
+	// The 64-bit default budget (32-bit platforms default to 64 MiB, which
+	// keeps no single buffer above 8 MiB).
+	defer bufpool.SetLimit(bufpool.SetLimit(256 << 20))
 	bufpool.Trim()
 	defer bufpool.Trim()
 	img, pix := pooledNRGBA(1449, 1449) // above v2.0's 2 MP pooling limit
