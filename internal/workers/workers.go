@@ -15,6 +15,7 @@
 package workers
 
 import (
+	"errors"
 	"fmt"
 	"runtime"
 	"runtime/debug"
@@ -106,15 +107,24 @@ func Spawn(f func() error) *Task {
 	return t
 }
 
+// ErrGoexit is the PanicError value of a helper that called runtime.Goexit
+// (for example testing.T.FailNow in a callback such as a sink): its work is
+// incomplete, so Wait must not report it as a success.
+var ErrGoexit = errors.New("runtime.Goexit called in a helper goroutine")
+
 func (t *Task) run(f func() error) {
 	defer close(t.done)
 	defer Release()
+	returned := false
 	defer func() {
 		if r := recover(); r != nil {
 			t.pe = &PanicError{Value: r, Stack: debug.Stack()}
+		} else if !returned {
+			t.pe = &PanicError{Value: ErrGoexit, Stack: debug.Stack()}
 		}
 	}()
 	t.err = f()
+	returned = true
 }
 
 // Done is closed when the helper has returned (normally or by panicking).
@@ -123,7 +133,8 @@ func (t *Task) run(f func() error) {
 func (t *Task) Done() <-chan struct{} { return t.done }
 
 // Wait blocks until the helper has returned and returns f's error. If f
-// panicked, Wait panics with the *PanicError on the calling goroutine.
+// panicked, or exited through runtime.Goexit (PanicError.Value ErrGoexit),
+// Wait panics with the *PanicError on the calling goroutine.
 func (t *Task) Wait() error {
 	<-t.done
 	if t.pe != nil {
@@ -132,8 +143,9 @@ func (t *Task) Wait() error {
 	return t.err
 }
 
-// Panicked reports, after Done is closed, whether f panicked (without
-// re-raising it). It lets deferred cleanup run before Wait re-panics.
+// Panicked reports, after Done is closed, whether f panicked or called
+// runtime.Goexit (without re-raising it). It lets deferred cleanup run
+// before Wait re-panics.
 func (t *Task) Panicked() bool {
 	<-t.done
 	return t.pe != nil
