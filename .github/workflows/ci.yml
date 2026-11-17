@@ -40,6 +40,11 @@ jobs:
           go run ./_examples/encode
       - name: Test
         run: go test ./...
+      # The arm64 assembly kernels are compared with the pure Go code they
+      # replace by the tests above; this runs the whole suite on the pure Go
+      # code path as well (what other architectures use).
+      - name: Test the pure Go code path (-tags purego)
+        run: go test -tags purego ./...
       - name: Test on 32-bit (linux/386)
         if: runner.os == 'Linux' && runner.arch == 'X64'
         env:
@@ -53,6 +58,44 @@ jobs:
         env:
           CGO_ENABLED: "1"
         run: go test -race -short -coverprofile=coverage.txt -covermode=atomic ./...
+      # Memory accesses made by assembly are invisible to the race detector:
+      # on arm64 also race-check the pure Go kernels, which write the same
+      # buffers.
+      - name: Test with the race detector (-tags purego)
+        if: runner.os != 'Windows' && runner.arch == 'ARM64'
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race -short -tags purego ./...
+      - name: Vet other architectures
+        # Pure Go fallbacks only (no assembly there): catches build and vet
+        # errors on 32-bit, big-endian and wasm targets.
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          for target in linux/386 linux/riscv64 linux/ppc64le linux/s390x js/wasm wasip1/wasm; do
+            echo "go vet $target"
+            GOOS="${target%/*}" GOARCH="${target#*/}" go vet ./...
+          done
+          # asmdecl checks of the arm64 assembly from an amd64 runner.
+          GOOS=linux GOARCH=arm64 go vet ./...
+      - name: Check that decodeBit is inlined into the token loop
+        # The lossy decoder's speed depends on the boolean decoder being
+        # inlined into getCoeffs (internal/vp8/parse.go); a change that
+        # makes it too expensive to inline would silently cost ~20%.
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        run: |
+          out="$(go build -gcflags=-m ./internal/vp8 2>&1)"
+          if ! echo "$out" | grep -q 'can inline decodeBit'; then
+            echo "decodeBit (internal/vp8/bitreader.go) is no longer inlinable"; exit 1
+          fi
+          start=$(grep -n '^func getCoeffs' internal/vp8/parse.go | cut -d: -f1)
+          end=$(awk -v s="$start" 'NR > s && /^}/ { print NR; exit }' internal/vp8/parse.go)
+          n=$(echo "$out" | awk -F: -v s="$start" -v e="$end" \
+            '$1 ~ /parse\.go$/ && $2 >= s && $2 <= e && /inlining call to decodeBit/' | wc -l)
+          if [ "$n" -lt 3 ]; then
+            echo "decodeBit is inlined $n times into getCoeffs (want 3)"; exit 1
+          fi
       - name: Upload coverage
         if: runner.os == 'Linux' && runner.arch == 'X64' && matrix.go == 'stable'
         uses: codecov/codecov-action@v4
