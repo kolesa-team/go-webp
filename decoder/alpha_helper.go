@@ -1,6 +1,7 @@
 package decoder
 
 import (
+	"runtime"
 	"sync"
 
 	"github.com/kolesa-team/go-webp/v2/internal/alpha"
@@ -87,6 +88,15 @@ type alphaHelper struct {
 	reqs []int
 }
 
+// handOff yields the processor after waking the other goroutine of the
+// alpha helper (the helper or the requester) while continuing to work:
+// otherwise the woken goroutine waits in this goroutine's next-to-run slot,
+// from which other threads only take it after a back-off (tens of
+// microseconds on darwin, hundreds on Linux VMs; see the vp8 package's
+// parked.handOff). It is no wait: Gosched returns at once when nothing
+// else is runnable.
+func handOff() { runtime.Gosched() }
+
 // errHelperPanic aborts a decode whose alpha helper panicked; the panic
 // itself is re-raised on the decoding goroutine by release.
 var errHelperPanic = status.New(utils.Vp8StatusBitstreamError, "alpha decoder failed")
@@ -168,10 +178,14 @@ func (a *lazyAlpha) runHelper(hp *alphaHelper) error {
 			return nil
 		}
 		hp.published, hp.pub = a.rows, a.buf
-		if hp.waiting {
+		wake := hp.waiting
+		if wake {
 			hp.cond.Broadcast()
 		}
 		hp.mu.Unlock()
+		if wake {
+			handOff()
+		}
 	}
 }
 
@@ -185,21 +199,27 @@ func (a *lazyAlpha) getAsync(rowStart, rowEnd int) ([]byte, int, error) {
 		hp.reqs = append(hp.reqs, rowEnd)
 	}
 	hp.mu.Lock()
+	wake := false
 	if rowEnd > hp.requested {
 		hp.requested = rowEnd
 		// A sleeping helper has published all its rows.
 		if hp.idle && hp.published+hp.band <= hp.requested+hp.ahead {
 			hp.cond.Broadcast()
+			wake = true
 		}
 	}
 	for hp.published < rowEnd && !hp.exited {
 		hp.waiting = true
+		wake = false // waiting lets the helper run
 		hp.cond.Wait()
 	}
 	hp.waiting = false
 	if hp.published >= rowEnd {
 		p := hp.pub
 		hp.mu.Unlock()
+		if wake {
+			handOff()
+		}
 		// The helper only writes rows from published on, below rowStart
 		// plus the ring size: not the rows of the window.
 		return a.window(p, rowStart, rowEnd)
