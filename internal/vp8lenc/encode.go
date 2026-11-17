@@ -633,7 +633,8 @@ func encodeStream(src []uint32, mutable bool, w, h int, p *params, cc crunchConf
 		if !usePalette && p.nearLossless < 100 {
 			maxQuant = 1 << uint(nearLosslessBits(p.nearLossless))
 		}
-		bits := predictorImage(width, h, minBits, maxBits, p.lowEffort, maxQuant, useSubGreen, p.cleanTransparent, cur, modes, sc)
+		bits := predictorImage(width, h, minBits, maxBits, p.lowEffort, maxQuant, useSubGreen, p.cleanTransparent, cur, modes, sc,
+			p.stageHelpers(width*h))
 		tw, th := subSampleSize(width, bits), subSampleSize(h, bits)
 		bw.putBits(1, 1)
 		bw.putBits(predictorTransform, 2)
@@ -872,7 +873,7 @@ func encodeImageInternal(bw *bitWriter, argb []uint32, w, h int, p *params, cach
 	if refsCap < 0 {
 		refsCap = initRefsCap(argb, w, h)
 	}
-	sc.hc.fill(argb, w, h, p.quality, p.lowEffort, p.windowCap)
+	sc.hc.fillPar(argb, w, h, p.quality, p.lowEffort, p.windowCap, p.stageHelpers(w*h), sc)
 	var candBuf [2]refsCandidate
 	cands := getBackwardRefs(argb, w, h, p.quality, p.lowEffort, false, cacheBitsMax, p.tryNoCache, refsCap, sc, candBuf[:0])
 	if len(cands) == 1 && !p.tryBox {
@@ -930,7 +931,7 @@ func writeMainImage(bw *bitWriter, w, h int, p *params, c refsCandidate, sc *scr
 		bw.putBits(0, 1)
 	}
 	hb := p.histoBits
-	ng := sc.clus.buildHistoImage(w, h, c.refs, p.quality, p.lowEffort, hb, c.cacheBits, &sc.out)
+	ng := sc.clus.buildHistoImage(w, h, c.refs, p.quality, p.lowEffort, hb, c.cacheBits, &sc.out, p.remapHelpers())
 	var symbols []uint16
 	if ng > 1 {
 		// Reduce the sampling of the entropy image if it is made of uniform

@@ -48,6 +48,15 @@ func checkNoLeak(t testing.TB, before int) {
 	}
 }
 
+// forceParallel lowers the size thresholds of the parallel stages so that
+// small test images take the parallel paths, until the returned function is
+// called.
+func forceParallel() func() {
+	px, stripe, remap := minParallelPixels, minHCStripe, minParallelRemap
+	minParallelPixels, minHCStripe, minParallelRemap = 0, 64, 0
+	return func() { minParallelPixels, minHCStripe, minParallelRemap = px, stripe, remap }
+}
+
 // budgets runs f with a budget of 1 helper, of 8 helpers and with the budget
 // fully taken.
 func budgets(t *testing.T, f func(t *testing.T)) {
@@ -237,19 +246,25 @@ func TestThreadLevelIdentical(t *testing.T) {
 		}
 	}
 	budgets(t, func(t *testing.T) {
-		for i, ti := range imgs {
-			for k := range threadTestConfigs {
-				cfg := threadTestConfigs[k]
-				if skip(ti, cfg) {
-					continue
-				}
-				cfg.ThreadLevel = true
-				out, err := Encode(ti.img, &cfg)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if !bytes.Equal(out, want[key(i, k)]) {
-					t.Fatalf("%s %+v: ThreadLevel output differs", ti.name, cfg)
+		for _, force := range []bool{false, true} {
+			if force {
+				// The stages of small images in parallel too.
+				defer forceParallel()()
+			}
+			for i, ti := range imgs {
+				for k := range threadTestConfigs {
+					cfg := threadTestConfigs[k]
+					if skip(ti, cfg) {
+						continue
+					}
+					cfg.ThreadLevel = true
+					out, err := Encode(ti.img, &cfg)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !bytes.Equal(out, want[key(i, k)]) {
+						t.Fatalf("%s %+v force=%v: ThreadLevel output differs", ti.name, cfg, force)
+					}
 				}
 			}
 		}
@@ -257,32 +272,36 @@ func TestThreadLevelIdentical(t *testing.T) {
 	checkNoLeak(t, before)
 }
 
-// TestThreadLevelConcurrent runs ThreadLevel encodes from several goroutines
-// sharing the budget (run with -race).
+// TestThreadLevelConcurrent runs ThreadLevel encodes, with every stage in
+// parallel, from several goroutines sharing the budget (run with -race).
 func TestThreadLevelConcurrent(t *testing.T) {
 	defer workers.SetLimitForTest(workers.SetLimitForTest(3))
+	defer forceParallel()()
 	imgs := threadTestImages()
-	cfg := Config{Quality: 90, Method: 5, ThreadLevel: true}
-	want := make([][]byte, len(imgs))
+	cfgs := []Config{{Quality: 75, Method: 4}, {Quality: 90, Method: 5}, {Quality: 80, Method: 3, NearLossless: 60}}
+	want := make([][]byte, len(imgs)*len(cfgs))
 	for i, ti := range imgs {
-		seq := cfg
-		seq.ThreadLevel = false
-		want[i], _ = Encode(ti.img, &seq)
+		for k := range cfgs {
+			want[i*len(cfgs)+k], _ = Encode(ti.img, &cfgs[k])
+		}
 	}
-	errs := make(chan error, 4*len(imgs))
+	errs := make(chan error, 4*len(want))
 	for g := 0; g < 4; g++ {
 		go func() {
 			for i, ti := range imgs {
-				c := cfg
-				out, err := Encode(ti.img, &c)
-				if err == nil && !bytes.Equal(out, want[i]) {
-					err = fmt.Errorf("%s: concurrent ThreadLevel output differs", ti.name)
+				for k := range cfgs {
+					c := cfgs[k]
+					c.ThreadLevel = true
+					out, err := Encode(ti.img, &c)
+					if err == nil && !bytes.Equal(out, want[i*len(cfgs)+k]) {
+						err = fmt.Errorf("%s %+v: concurrent ThreadLevel output differs", ti.name, c)
+					}
+					errs <- err
 				}
-				errs <- err
 			}
 		}()
 	}
-	for range 4 * len(imgs) {
+	for range 4 * len(want) {
 		if err := <-errs; err != nil {
 			t.Fatal(err)
 		}
