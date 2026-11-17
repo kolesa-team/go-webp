@@ -5,6 +5,11 @@
 // Results are bit-exact with libwebp's C implementation
 // (src/utils/rescaler_utils.c, src/dsp/rescaler.c).
 //
+// The horizontal geometry is the same for every row, so Init computes it
+// once into a column table (see initCols) and the row kernels in
+// kernels.go only walk that table. On arm64 the hot kernels are NEON
+// assembly (rescaler_arm64.s), bit-exact with the Go ones.
+//
 // Algorithm adapted from libwebp (BSD-3-Clause).
 package resample
 
@@ -45,14 +50,30 @@ type Rescaler struct {
 	srcY, dstY       int
 	irow, frow       []uint32
 	work             []uint32
+	// cols is the column table, two cells per destination pixel x:
+	//   shrinking: cols[2x] = number of source pixels whose sum makes up
+	//   pixel x (at least 1), cols[2x+1] = libwebp's -accum after them, the
+	//   weight of the last one that belongs to pixel x+1;
+	//   expanding: cols[2x] = index of the left source pixel,
+	//   cols[2x+1] = libwebp's accum, the weight of that pixel.
+	cols []uint32
+	arch archState // per-architecture kernel state, see initArch
 }
 
 // ErrInvalid is returned for invalid rescaler dimensions.
 var ErrInvalid = errors.New("resample: invalid dimensions")
 
-// WorkSize returns the number of uint32 work cells a rescaler with the given
-// destination width and channel count needs.
+// WorkSize returns the number of uint32 row cells a rescaler with the given
+// destination width and channel count needs, like libwebp's work buffer
+// (2 rows of dstWidth*numChannels accumulators).
 func WorkSize(dstWidth, numChannels int) int { return 2 * dstWidth * numChannels }
+
+// BufferSize returns the number of uint32 cells Init uses from its work
+// buffer: the WorkSize row cells plus the column tables. A work buffer of
+// that capacity spares Init any allocation.
+func BufferSize(dstWidth, numChannels int) int {
+	return WorkSize(dstWidth, numChannels) + 2*dstWidth + archTableSize(dstWidth, numChannels)
+}
 
 // New returns a rescaler with a freshly allocated work buffer.
 func New(srcWidth, srcHeight, dstWidth, dstHeight, numChannels int) (*Rescaler, error) {
@@ -64,7 +85,7 @@ func New(srcWidth, srcHeight, dstWidth, dstHeight, numChannels int) (*Rescaler, 
 }
 
 // Init (re)initializes r, like WebPRescalerInit. work is reused when its
-// capacity is at least WorkSize(dstWidth, numChannels); otherwise a new
+// capacity is at least BufferSize(dstWidth, numChannels); otherwise a new
 // buffer is allocated.
 func (r *Rescaler) Init(srcWidth, srcHeight, dstWidth, dstHeight, numChannels int, work []uint32) error {
 	if srcWidth <= 0 || srcHeight <= 0 || dstWidth <= 0 || dstHeight <= 0 ||
@@ -74,11 +95,12 @@ func (r *Rescaler) Init(srcWidth, srcHeight, dstWidth, dstHeight, numChannels in
 		return ErrInvalid
 	}
 	n := WorkSize(dstWidth, numChannels)
-	if cap(work) < n {
-		work = make([]uint32, n)
+	size := BufferSize(dstWidth, numChannels)
+	if cap(work) < size {
+		work = make([]uint32, size)
 	} else {
-		work = work[:n]
-		clear(work)
+		work = work[:size]
+		clear(work[:n])
 	}
 	*r = Rescaler{
 		xExpand:     srcWidth < dstWidth,
@@ -90,7 +112,8 @@ func (r *Rescaler) Init(srcWidth, srcHeight, dstWidth, dstHeight, numChannels in
 		dstHeight:   dstHeight,
 		work:        work,
 		irow:        work[: n/2 : n/2],
-		frow:        work[n/2:],
+		frow:        work[n/2 : n : n],
+		cols:        work[n : n+2*dstWidth : n+2*dstWidth],
 	}
 	xAdd, xSub := srcWidth, dstWidth
 	yAdd, ySub := srcHeight, dstHeight
@@ -117,7 +140,39 @@ func (r *Rescaler) Init(srcWidth, srcHeight, dstWidth, dstHeight, numChannels in
 		}
 		r.fyScale = frac(1, uint64(r.ySub))
 	}
+	r.initCols()
+	r.initArch(work[n+2*dstWidth:])
 	return nil
+}
+
+// initCols fills the column table by running libwebp's horizontal loops
+// (WebPRescalerImportRowExpand_C / _Shrink_C) once without the pixels.
+func (r *Rescaler) initCols() {
+	cols := r.cols
+	if r.xExpand {
+		// accum starts at x_add; whenever it drops below zero the left
+		// pixel advances by one (x_sub < x_add, so by one at most).
+		accum, left := r.xAdd, 0
+		for x := 0; x < r.dstWidth; x++ {
+			cols[2*x], cols[2*x+1] = uint32(left), uint32(accum)
+			accum -= r.xSub
+			if accum < 0 {
+				left++
+				accum += r.xAdd
+			}
+		}
+		return
+	}
+	// accum gains x_add per output pixel and loses x_sub per source pixel
+	// summed; it stays in (-x_sub, 0] between output pixels, and since
+	// x_add >= x_sub at least one source pixel is summed per output pixel.
+	accum := 0
+	for x := 0; x < r.dstWidth; x++ {
+		accum += r.xAdd
+		k := (accum + r.xSub - 1) / r.xSub
+		accum -= k * r.xSub
+		cols[2*x], cols[2*x+1] = uint32(k), uint32(-accum)
+	}
 }
 
 // SrcY returns the number of source rows imported so far.
@@ -167,184 +222,23 @@ func (r *Rescaler) ImportRow(src []byte) {
 	if r.InputDone() {
 		return
 	}
+	src = src[:r.srcWidth*r.numChannels]
+	// When shrinking vertically the new row is also added to the irow
+	// accumulators (libwebp does that in a second pass, the sum is the
+	// same); when expanding, irow and frow are the two latest rows.
+	var acc []uint32
 	if r.yExpand {
 		r.irow, r.frow = r.frow, r.irow
-	}
-	src = src[:r.srcWidth*r.numChannels]
-	if r.xExpand {
-		switch r.numChannels {
-		case 4:
-			r.importExpand4(src)
-		default:
-			r.importExpand(src)
-		}
 	} else {
-		switch r.numChannels {
-		case 4:
-			r.importShrink4(src)
-		case 1:
-			r.importShrink1(src)
-		default:
-			r.importShrink(src)
-		}
+		acc = r.irow
 	}
-	if !r.yExpand {
-		irow := r.irow
-		frow := r.frow[:len(irow)]
-		for i, v := range frow {
-			irow[i] += v
-		}
+	if r.xExpand {
+		r.expandRow(src, acc)
+	} else {
+		r.shrinkRow(src, acc)
 	}
 	r.srcY++
 	r.yAccum -= r.ySub
-}
-
-// importExpand is WebPRescalerImportRowExpand_C for any channel count.
-func (r *Rescaler) importExpand(src []byte) {
-	stride := r.numChannels
-	xOutMax := r.dstWidth * stride
-	frow := r.frow[:xOutMax]
-	xAdd, xSub := uint32(r.xAdd), r.xSub
-	for ch := 0; ch < stride; ch++ {
-		xIn := ch
-		accum := r.xAdd
-		left := uint32(src[xIn])
-		right := left
-		if r.srcWidth > 1 {
-			right = uint32(src[xIn+stride])
-		}
-		xIn += stride
-		for xOut := ch; ; {
-			frow[xOut] = right*xAdd + (left-right)*uint32(accum)
-			xOut += stride
-			if xOut >= xOutMax {
-				break
-			}
-			accum -= xSub
-			if accum < 0 {
-				left = right
-				xIn += stride
-				right = uint32(src[xIn])
-				accum += r.xAdd
-			}
-		}
-	}
-}
-
-// importExpand4 is importExpand specialized for 4 interleaved channels.
-func (r *Rescaler) importExpand4(src []byte) {
-	xOutMax := r.dstWidth * 4
-	frow := r.frow[:xOutMax]
-	xAdd, xSub := uint32(r.xAdd), r.xSub
-	accum := r.xAdd
-	l0, l1, l2, l3 := uint32(src[0]), uint32(src[1]), uint32(src[2]), uint32(src[3])
-	r0, r1, r2, r3 := l0, l1, l2, l3
-	if r.srcWidth > 1 {
-		s := src[4:8]
-		r0, r1, r2, r3 = uint32(s[0]), uint32(s[1]), uint32(s[2]), uint32(s[3])
-	}
-	xIn := 4
-	for xOut := 0; ; {
-		a := uint32(accum)
-		f := frow[xOut : xOut+4 : xOut+4]
-		f[0] = r0*xAdd + (l0-r0)*a
-		f[1] = r1*xAdd + (l1-r1)*a
-		f[2] = r2*xAdd + (l2-r2)*a
-		f[3] = r3*xAdd + (l3-r3)*a
-		xOut += 4
-		if xOut >= xOutMax {
-			break
-		}
-		accum -= xSub
-		if accum < 0 {
-			l0, l1, l2, l3 = r0, r1, r2, r3
-			xIn += 4
-			s := src[xIn : xIn+4 : xIn+4]
-			r0, r1, r2, r3 = uint32(s[0]), uint32(s[1]), uint32(s[2]), uint32(s[3])
-			accum += r.xAdd
-		}
-	}
-}
-
-// importShrink is WebPRescalerImportRowShrink_C for any channel count.
-func (r *Rescaler) importShrink(src []byte) {
-	stride := r.numChannels
-	xOutMax := r.dstWidth * stride
-	frow := r.frow[:xOutMax]
-	xSub := uint32(r.xSub)
-	for ch := 0; ch < stride; ch++ {
-		xIn := ch
-		var sum uint32
-		accum := 0
-		for xOut := ch; xOut < xOutMax; xOut += stride {
-			var base uint32
-			accum += r.xAdd
-			for accum > 0 {
-				accum -= r.xSub
-				base = uint32(src[xIn])
-				sum += base
-				xIn += stride
-			}
-			fr := base * uint32(-accum)
-			frow[xOut] = sum*xSub - fr
-			sum = multFix(fr, r.fxScale)
-		}
-	}
-}
-
-// importShrink1 is importShrink specialized for a single channel.
-func (r *Rescaler) importShrink1(src []byte) {
-	frow := r.frow[:r.dstWidth]
-	xSub := uint32(r.xSub)
-	xIn := 0
-	var sum uint32
-	accum := 0
-	for xOut := range frow {
-		var base uint32
-		accum += r.xAdd
-		for accum > 0 {
-			accum -= r.xSub
-			base = uint32(src[xIn])
-			sum += base
-			xIn++
-		}
-		fr := base * uint32(-accum)
-		frow[xOut] = sum*xSub - fr
-		sum = multFix(fr, r.fxScale)
-	}
-}
-
-// importShrink4 is importShrink specialized for 4 interleaved channels.
-func (r *Rescaler) importShrink4(src []byte) {
-	xOutMax := r.dstWidth * 4
-	frow := r.frow[:xOutMax]
-	xSub := uint32(r.xSub)
-	fx := r.fxScale
-	xIn := 0
-	var s0, s1, s2, s3 uint32
-	accum := 0
-	for xOut := 0; xOut < xOutMax; xOut += 4 {
-		var b0, b1, b2, b3 uint32
-		accum += r.xAdd
-		for accum > 0 {
-			accum -= r.xSub
-			p := src[xIn : xIn+4 : xIn+4]
-			b0, b1, b2, b3 = uint32(p[0]), uint32(p[1]), uint32(p[2]), uint32(p[3])
-			s0 += b0
-			s1 += b1
-			s2 += b2
-			s3 += b3
-			xIn += 4
-		}
-		na := uint32(-accum)
-		f := frow[xOut : xOut+4 : xOut+4]
-		fr0, fr1, fr2, fr3 := b0*na, b1*na, b2*na, b3*na
-		f[0] = s0*xSub - fr0
-		f[1] = s1*xSub - fr1
-		f[2] = s2*xSub - fr2
-		f[3] = s3*xSub - fr3
-		s0, s1, s2, s3 = multFix(fr0, fx), multFix(fr1, fx), multFix(fr2, fx), multFix(fr3, fx)
-	}
 }
 
 // ExportRow writes the next destination row (dstWidth*numChannels bytes)
@@ -360,48 +254,19 @@ func (r *Rescaler) ExportRow(dst []byte) bool {
 	frow := r.frow[:n]
 	switch {
 	case r.yExpand:
-		fy := r.fyScale
 		if r.yAccum == 0 {
-			for i, j := range frow {
-				dst[i] = clip8(multFix(j, fy))
-			}
+			exportExpand(dst, frow, r.fyScale)
 		} else {
-			b := uint64(frac(uint64(-r.yAccum), uint64(r.ySub)))
-			a := uint64(uint32(one - b))
-			fy := uint64(fy)
-			i := 0
-			for ; i+4 <= n; i += 4 {
-				f := frow[i : i+4 : i+4]
-				g := irow[i : i+4 : i+4]
-				d := dst[i : i+4 : i+4]
-				j0 := (a*uint64(f[0]) + b*uint64(g[0]) + rounder) >> rfix
-				j1 := (a*uint64(f[1]) + b*uint64(g[1]) + rounder) >> rfix
-				j2 := (a*uint64(f[2]) + b*uint64(g[2]) + rounder) >> rfix
-				j3 := (a*uint64(f[3]) + b*uint64(g[3]) + rounder) >> rfix
-				d[0] = clip8(uint32((uint64(uint32(j0))*fy + rounder) >> rfix))
-				d[1] = clip8(uint32((uint64(uint32(j1))*fy + rounder) >> rfix))
-				d[2] = clip8(uint32((uint64(uint32(j2))*fy + rounder) >> rfix))
-				d[3] = clip8(uint32((uint64(uint32(j3))*fy + rounder) >> rfix))
-			}
-			for ; i < n; i++ {
-				j := uint32((a*uint64(frow[i]) + b*uint64(irow[i]) + rounder) >> rfix)
-				dst[i] = clip8(uint32((uint64(j)*fy + rounder) >> rfix))
-			}
+			b := frac(uint64(-r.yAccum), uint64(r.ySub))
+			// -yAccum >= 1 and ySub < 2^32, so b >= 1 and a fits 32 bits.
+			a := uint32(one - uint64(b))
+			exportExpandMix(dst, frow, irow, a, b, r.fyScale)
 		}
 	case r.fxyScale != 0:
-		yscale := r.fyScale * uint32(-r.yAccum)
-		fxy := r.fxyScale
-		if yscale != 0 {
-			for i := range dst {
-				fr := uint32((uint64(frow[i]) * uint64(yscale)) >> rfix)
-				dst[i] = clip8(multFix(irow[i]-fr, fxy))
-				irow[i] = fr
-			}
+		if yscale := r.fyScale * uint32(-r.yAccum); yscale != 0 {
+			exportShrink(dst, irow, frow, yscale, r.fxyScale)
 		} else {
-			for i, v := range irow {
-				dst[i] = clip8(multFix(v, fxy))
-				irow[i] = 0
-			}
+			exportShrinkZero(dst, irow, r.fxyScale)
 		}
 	default:
 		// Special case src_height == dst_height, x_add == 1.
