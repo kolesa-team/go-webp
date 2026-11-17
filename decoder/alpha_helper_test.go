@@ -218,7 +218,7 @@ func TestAlphaHelperErrors(t *testing.T) {
 	assert.Equal(t, 0, workers.InUse())
 }
 
-func chunkData(t *testing.T, file []byte, tag string) []byte {
+func chunkData(t testing.TB, file []byte, tag string) []byte {
 	for _, c := range splitChunks(t, file) {
 		if c.tag == tag {
 			return c.data
@@ -262,23 +262,27 @@ func TestAlphaHelperPanic(t *testing.T) {
 }
 
 // FuzzAlphaHelper compares the alpha helper (tiny bands and steps) with the
-// sequential alpha decoding on arbitrary (mostly corrupted) lossy+alpha
-// files: pixels and errors must be identical.
+// sequential alpha decoding on a valid VP8 frame carrying an arbitrary ALPH
+// payload (and, with vp8cut, a truncated VP8 frame): pixels and errors must
+// be identical.
 func FuzzAlphaHelper(f *testing.F) {
-	for _, data := range alphaFiles(f, 41, 23) {
-		f.Add(data, uint8(0))
-		f.Add(data, uint8(0x5a))
+	files := alphaFiles(f, 41, 23)
+	base := files["41x23 comp1 filter1"]
+	for _, data := range files {
+		f.Add(chunkData(f, data, "ALPH"), uint16(0), uint8(0))
+		f.Add(chunkData(f, data, "ALPH"), uint16(300), uint8(0x5a))
 	}
-	f.Add(readFile(f, "100x150_lossy.webp"), uint8(3))
-	f.Fuzz(func(t *testing.T, data []byte, flags uint8) {
+	vp8 := chunkData(f, base, "VP8 ")
+	f.Fuzz(func(t *testing.T, alph []byte, vp8cut uint16, flags uint8) {
+		data := modifyChunk(t, base, "ALPH", func([]byte) []byte { return alph })
+		if cut := int(vp8cut); cut > 0 && cut < len(vp8) {
+			data = modifyChunk(t, data, "VP8 ", func(p []byte) []byte { return p[:cut] })
+		}
 		d, err := NewDecoder(bytes.NewReader(data), nil)
 		if err != nil {
 			return
 		}
 		feat := d.GetFeatures()
-		if feat.Width*feat.Height > 1<<16 {
-			return
-		}
 		smallBands(t, 1+int(flags&3), feat.Width)
 		o := &Options{UseThreads: true, NoFancyUpsampling: flags&4 != 0, AlphaDitheringStrength: int(flags>>3&1) * 60}
 		switch flags >> 5 & 3 {
