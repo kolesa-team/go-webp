@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/kolesa-team/go-webp/v2/internal/pipeline"
+	"github.com/kolesa-team/go-webp/v2/internal/vp8lenc"
 	"github.com/kolesa-team/go-webp/v2/internal/workers"
 )
 
@@ -149,6 +150,42 @@ func TestAsyncMatchesSequential(t *testing.T) {
 					})
 				}
 			}
+		}
+	}
+}
+
+// TestAsyncNarrowSliding checks the two-stage decode of tall, narrow images
+// bigger than the LZ77 window (a palette image decoded as index bytes and a
+// 32-bit one): a job of 16 rows is then only a few thousand level-0 pixels,
+// so many jobs are handed over between window slides, and the slides happen
+// with jobs of the previous window still in flight.
+func TestAsyncNarrowSliding(t *testing.T) {
+	if testing.Short() {
+		t.Skip("encodes 1.7 Mpx images")
+	}
+	checkNoLeak(t)
+	defer workers.SetLimitForTest(workers.SetLimitForTest(2))
+	for _, c := range []struct{ w, h, colors int }{{130, 13000, 40}, {150, 12000, 300}} {
+		name := fmt.Sprintf("%dx%d/%d colors", c.w, c.h, c.colors)
+		file, err := vp8lenc.Encode(fewColorImage(c.w, c.h, c.colors, int64(c.w)), &vp8lenc.Config{Quality: 75, Method: 4})
+		must(t, err, name)
+		payload := findChunk(file, "VP8L")
+		if payload == nil {
+			payload = file
+		}
+		ref := &rowSink{img: image.NewNRGBA(image.Rect(0, 0, c.w, c.h)), need: c.h}
+		must(t, Decode(payload, ref), name)
+		for _, jobPx := range []int{1, 0, 1 << 30} {
+			withAsync(jobPx, func(jobs *int) {
+				s := &rowSink{img: image.NewNRGBA(image.Rect(0, 0, c.w, c.h)), need: c.h}
+				must(t, DecodeWithOptions(payload, s, &Options{UseThreads: true}), name, jobPx)
+				if s.next != ref.next || !bytes.Equal(s.img.Pix, ref.img.Pix) {
+					t.Errorf("%s job %d: output differs from the sequential decode", name, jobPx)
+				}
+				if *jobs < 2 {
+					t.Errorf("%s job %d: %d jobs handed over", name, jobPx, *jobs)
+				}
+			})
 		}
 	}
 }
