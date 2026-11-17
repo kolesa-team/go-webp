@@ -104,6 +104,7 @@ func Encode(pic *Picture, cfg *Config) ([]byte, error) {
 	e := encoderPool.Get().(*encoder)
 	defer func() {
 		e.pic = nil
+		e.cfg.Interrupt = nil // do not retain the caller's closure in the pool
 		e.tokens.release()
 		if pic.Width*pic.Height <= maxPooledPixels {
 			encoderPool.Put(e)
@@ -111,6 +112,9 @@ func Encode(pic *Picture, cfg *Config) ([]byte, error) {
 	}()
 	e.setup(pic, &c)
 	e.analyze()
+	if c.interrupted() {
+		return nil, ErrInterrupted
+	}
 	if err := e.tokenLoop(); err != nil {
 		return nil, err
 	}

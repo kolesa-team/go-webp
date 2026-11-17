@@ -188,7 +188,7 @@ func colorSpaceTransform(width, height, bits, quality int, argb []uint32, image 
 	var accRed, accBlue [256]int32
 	var prevX, prevY multipliers
 	tp := &sc.tile
-	for ty := 0; ty < tilesY; ty++ {
+	for ty := 0; ty < tilesY && !sc.interrupted(); ty++ {
 		for tx := 0; tx < tilesX; tx++ {
 			x0 := tx * tile
 			y0 := ty * tile

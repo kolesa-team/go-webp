@@ -37,7 +37,16 @@ type Config struct {
 	// 3 graph). With 3 (graph), palette images additionally try the
 	// palette+spatial combination.
 	ImageHint int
+	// Interrupt, if not nil, is polled between the major passes of the
+	// encode; when it returns true, the encode stops and returns
+	// ErrInterrupted. It must be safe for concurrent use and, once it has
+	// returned true, keep doing so.
+	Interrupt func() bool
 }
+
+// ErrInterrupted is returned when Config.Interrupt (or
+// AlphaEncoder.Interrupt) asked the encoder to stop.
+var ErrInterrupted = errors.New("vp8lenc: interrupted")
 
 var (
 	errNilImage   = errors.New("vp8lenc: nil image")
@@ -86,7 +95,12 @@ type params struct {
 	cleanTransparent bool
 	parallel         bool
 	paletteSorts     [2][]uint32
+	interrupt        func() bool // Config.Interrupt
 }
+
+// interrupted polls Config.Interrupt. After it returned true the output of
+// the current encode is garbage: the caller reports ErrInterrupted instead.
+func (p *params) interrupted() bool { return p.interrupt != nil && p.interrupt() }
 
 func clampInt(v, lo, hi int) int {
 	if v < lo {
@@ -163,6 +177,9 @@ func EncodeWithHeadroom(img *image.NRGBA, cfg *Config, headroom int) ([]byte, er
 		}
 	}
 	out, _ := encodeARGB(argb, w, h, cfg, true, headroom+5, nil, nil)
+	if cfg.Interrupt != nil && cfg.Interrupt() {
+		return nil, ErrInterrupted
+	}
 	hdr := out[headroom : headroom+5]
 	hdr[0] = vp8lSignature
 	v := uint32(w-1) | uint32(h-1)<<14
@@ -197,6 +214,8 @@ type AlphaEncoder struct {
 	sc    *scratch
 	argb  []uint32
 	spare []byte // output buffer for the next encodeStream
+	// Interrupt is Config.Interrupt for Encode.
+	Interrupt func() bool
 }
 
 // Encode is EncodeAlpha using the encoder's buffers.
@@ -230,9 +249,13 @@ func (a *AlphaEncoder) Encode(plane []byte, width, height, stride int, method in
 	if a.sc == nil {
 		a.sc = getScratch()
 	}
-	cfg := &Config{Quality: q, Method: method, Exact: true, NearLossless: 100}
+	cfg := &Config{Quality: q, Method: method, Exact: true, NearLossless: 100, Interrupt: a.Interrupt}
 	out, spare := encodeARGB(argb, width, height, cfg, true, 0, a.sc, a.spare)
 	a.spare = spare
+	if cfg.Interrupt != nil && cfg.Interrupt() {
+		a.Recycle(out)
+		return nil, ErrInterrupted
+	}
 	return out, nil
 }
 
@@ -319,6 +342,7 @@ func encodeARGB(argb []uint32, w, h int, cfg *Config, useCache bool, prefix int,
 		lowEffort: method == 0,
 		useCache:  useCache,
 		parallel:  cfg.ThreadLevel && !cfg.LowMemory,
+		interrupt: cfg.Interrupt,
 	}
 	if !cfg.Exact {
 		for _, c := range argb[:w*h] {
@@ -559,6 +583,7 @@ func analyzeEntropy(argb []uint32, w, h int, usePalette bool, paletteSize, trans
 // new buffer. src is modified only if mutable is set.
 func encodeStream(src []uint32, mutable bool, w, h int, p *params, cc crunchConfig, prefix int, sc *scratch, buf []byte) []byte {
 	sc.noteSize(w * h)
+	sc.interrupt = p.interrupt
 	// The output is written straight into the returned buffer (no final
 	// copy), presized from a rough estimate of 1.5 bytes per pixel.
 	if need := prefix + w*h*3/2 + 4096; cap(buf) >= need {
@@ -566,6 +591,9 @@ func encodeStream(src []uint32, mutable bool, w, h int, p *params, cc crunchConf
 		clear(buf)
 	} else {
 		buf = make([]byte, prefix, need)
+	}
+	if p.interrupted() {
+		return buf
 	}
 	bw := &bitWriter{buf: buf}
 	usePalette := cc.entropy == modePalette || cc.entropy == modePaletteAndSpatial
@@ -632,6 +660,9 @@ func encodeStream(src []uint32, mutable bool, w, h int, p *params, cc crunchConf
 		bw.putBits(predictorTransform, 2)
 		bw.putBits(uint32(bits-minTransformBits), 3)
 		encodeImageNoHuffman(bw, modes[:tw*th], tw, th, quality, p.lowEffort, sc.child())
+		if p.interrupted() {
+			return bw.buf
+		}
 	}
 	if useCrossColor {
 		bits := p.transBits
@@ -642,6 +673,9 @@ func encodeStream(src []uint32, mutable bool, w, h int, p *params, cc crunchConf
 		bw.putBits(crossColorTransform, 2)
 		bw.putBits(uint32(bits-minTransformBits), 3)
 		encodeImageNoHuffman(bw, img[:tw*th], tw, th, quality, p.lowEffort, sc.child())
+		if p.interrupted() {
+			return bw.buf
+		}
 	}
 	bw.putBits(0, 1) // no more transforms
 	encodeImageInternal(bw, cur, width, h, p, cacheBitsMax, sc)
@@ -852,8 +886,14 @@ func buildCodes(s *histoSet, sc *scratch) []huffCode {
 // parse.
 func encodeImageInternal(bw *bitWriter, argb []uint32, w, h int, p *params, cacheBitsMax int, sc *scratch) {
 	sc.hc.fill(argb, w, h, p.quality, p.lowEffort, p.windowCap)
+	if p.interrupted() {
+		return
+	}
 	var candBuf [2]refsCandidate
 	cands := getBackwardRefs(argb, w, h, p.quality, p.lowEffort, false, cacheBitsMax, p.tryNoCache, sc, candBuf[:0])
+	if p.interrupted() {
+		return
+	}
 	if len(cands) == 1 && !p.tryBox {
 		writeMainImage(bw, w, h, p, cands[0], sc)
 		return
@@ -875,7 +915,7 @@ func encodeImageInternal(bw *bitWriter, argb []uint32, w, h int, p *params, cach
 	for _, c := range cands {
 		try(c)
 	}
-	if p.tryBox {
+	if p.tryBox && !p.interrupted() {
 		cands = getBackwardRefs(argb, w, h, p.quality, p.lowEffort, true, cacheBitsMax, p.tryNoCache, sc, candBuf[:0])
 		for _, c := range cands {
 			try(c)
@@ -892,7 +932,12 @@ func writeMainImage(bw *bitWriter, w, h int, p *params, c refsCandidate, sc *scr
 		bw.putBits(0, 1)
 	}
 	hb := p.histoBits
+	sc.clus.interrupt = p.interrupt
 	ng := sc.clus.buildHistoImage(w, h, c.refs, p.quality, p.lowEffort, hb, c.cacheBits, &sc.out)
+	sc.clus.interrupt = nil
+	if p.interrupted() {
+		return
+	}
 	var symbols []uint16
 	if ng > 1 {
 		// Reduce the sampling of the entropy image if it is made of uniform

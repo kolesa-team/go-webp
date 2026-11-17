@@ -336,7 +336,12 @@ type clusterer struct {
 	cacheBits int
 	binFirst  [binSize]int
 	binFail   [binSize]int
+	// interrupt is Config.Interrupt during buildHistoImage: when it fires,
+	// the clustering loops stop early (the clustering stays valid).
+	interrupt func() bool
 }
+
+func (c *clusterer) interrupted() bool { return c.interrupt != nil && c.interrupt() }
 
 // remove removes set[i], replacing it by the last histogram (libwebp
 // HistogramSetRemoveHistogram).
@@ -524,7 +529,7 @@ func (c *clusterer) stochasticCombine(s *histoSet, minClusterSize int) bool {
 	outerIters := c.size
 	numTriesNoSuccess := outerIters / 2
 	triesNoSuccess := 0
-	for iter := 0; iter < outerIters && c.size >= minClusterSize; iter++ {
+	for iter := 0; iter < outerIters && c.size >= minClusterSize && !c.interrupted(); iter++ {
 		triesNoSuccess++
 		if triesNoSuccess >= numTriesNoSuccess {
 			break
@@ -594,7 +599,7 @@ func (c *clusterer) greedyCombine(s *histoSet) {
 			pq.push(s, set, i, j, 0)
 		}
 	}
-	for len(pq.q) > 0 {
+	for len(pq.q) > 0 && !c.interrupted() {
 		i1, i2 := pq.q[0].i1, pq.q[0].i2
 		addHisto(set[i2], set[i1], set[i1])
 		set[i1].bitCost = pq.q[0].costCmb
@@ -629,6 +634,10 @@ func (c *clusterer) remap(out *histoSet) {
 	if len(set) > 1 {
 		var costs [5]float64
 		for i := range orig {
+			if c.interrupted() {
+				clear(syms[i:])
+				break
+			}
 			if !orig[i].used {
 				if i > 0 {
 					syms[i] = syms[i-1]

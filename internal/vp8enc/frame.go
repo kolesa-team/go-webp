@@ -197,6 +197,9 @@ func (e *encoder) tokenLoop() error {
 		e.tokens.reset()
 		rd := &it.rd
 		for {
+			if it.x == 0 && e.cfg.interrupted() {
+				return ErrInterrupted
+			}
 			it.importMB()
 			if rdOpt > rdOptNone {
 				cnt--

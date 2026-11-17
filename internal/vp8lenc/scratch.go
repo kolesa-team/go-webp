@@ -41,7 +41,13 @@ type scratch struct {
 	// pixels is the largest image (in pixels) this scratch has served; its
 	// buffers are sized accordingly.
 	pixels int
+
+	// interrupt is Config.Interrupt of the encode the scratch serves: long
+	// loops poll it to stop early.
+	interrupt func() bool
 }
+
+func (s *scratch) interrupted() bool { return s.interrupt != nil && s.interrupt() }
 
 // maxPooledPixels bounds the image size whose scratch buffers are kept in
 // the pool: the buffers of a large encode (hundreds of MB for 12 MP) are
@@ -58,6 +64,7 @@ func putScratch(s *scratch) {
 	if s.pixels > maxPooledPixels {
 		return
 	}
+	s.interrupt = nil
 	scratchPool.Put(s)
 }
 
