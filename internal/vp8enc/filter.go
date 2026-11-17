@@ -222,13 +222,7 @@ func (e *encoder) storeFilterStats(it *iterator) {
 		return
 	}
 	s := int(mb.segment & 3)
-	level0 := e.dqm[s].fstrength
-	deltaMin := -e.dqm[s].quant
-	deltaMax := e.dqm[s].quant
-	stepSize := 1
-	if deltaMax-deltaMin >= 4 {
-		stepSize = 4
-	}
+	level0, deltaMin, deltaMax, stepSize := e.filterLevels(s)
 	e.lfStats[s][0] += getMBSSIM(it.yuvIn, it.yuvOut)
 	for d := deltaMin; d <= deltaMax; d += stepSize {
 		level := level0 + d
@@ -238,6 +232,69 @@ func (e *encoder) storeFilterStats(it *iterator) {
 		it.doFilter(level)
 		e.lfStats[s][level] += getMBSSIM(it.yuvIn, it.yuvOut2)
 	}
+}
+
+// maxFilterSSIMs bounds the number of values appendFilterSSIMs appends for
+// one macroblock: the unfiltered SSIM and one per level in (0, maxLFLevels).
+const maxFilterSSIMs = maxLFLevels
+
+// filterLevels returns the filter levels storeFilterStats tries for
+// segment s: level0+d for d from deltaMin to deltaMax by step, skipping
+// the levels outside (0, maxLFLevels).
+func (e *encoder) filterLevels(s int) (level0, deltaMin, deltaMax, step int) {
+	level0 = e.dqm[s].fstrength
+	deltaMin = -e.dqm[s].quant
+	deltaMax = e.dqm[s].quant
+	step = 1
+	if deltaMax-deltaMin >= 4 {
+		step = 4
+	}
+	return
+}
+
+// appendFilterSSIMs is storeFilterStats for the wavefront pass: it appends
+// the values storeFilterStats would add to lfStats for the current
+// macroblock to dst, in the same order, and addFilterSSIMs adds them later
+// in raster order (floating-point sums depend on the order).
+func (it *iterator) appendFilterSSIMs(dst []float64) []float64 {
+	e := it.enc
+	mb := it.mb()
+	if mb.typ == 1 && mb.skip {
+		return dst
+	}
+	level0, deltaMin, deltaMax, step := e.filterLevels(int(mb.segment & 3))
+	dst = append(dst, getMBSSIM(it.yuvIn, it.yuvOut))
+	for d := deltaMin; d <= deltaMax; d += step {
+		level := level0 + d
+		if level <= 0 || level >= maxLFLevels {
+			continue
+		}
+		it.doFilter(level)
+		dst = append(dst, getMBSSIM(it.yuvIn, it.yuvOut2))
+	}
+	return dst
+}
+
+// addFilterSSIMs adds the values appendFilterSSIMs recorded for macroblock
+// mb, starting at vals[pos], to lfStats and returns the position of the
+// next macroblock's values.
+func (e *encoder) addFilterSSIMs(mb *mbInfo, vals []float64, pos int) int {
+	if mb.typ == 1 && mb.skip {
+		return pos
+	}
+	s := int(mb.segment & 3)
+	level0, deltaMin, deltaMax, step := e.filterLevels(s)
+	e.lfStats[s][0] += vals[pos]
+	pos++
+	for d := deltaMin; d <= deltaMax; d += step {
+		level := level0 + d
+		if level <= 0 || level >= maxLFLevels {
+			continue
+		}
+		e.lfStats[s][level] += vals[pos]
+		pos++
+	}
+	return pos
 }
 
 func (e *encoder) adjustFilterStrength() {

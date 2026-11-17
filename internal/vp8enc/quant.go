@@ -855,7 +855,10 @@ func (it *iterator) swapOut() {
 	it.yuvOut, it.yuvOut2 = it.yuvOut2, it.yuvOut
 }
 
-func storeMaxDelta(dqm *segmentInfo, dcs *[16]int16) {
+// storeMaxDelta raises *maxEdge (the iterator's copy of a segment's
+// segmentInfo.maxEdge, merged after the pass) to the largest edge delta of
+// the DC levels.
+func storeMaxDelta(maxEdge *int, dcs *[16]int16) {
 	v0 := abs16(dcs[1])
 	v1 := abs16(dcs[2])
 	v2 := abs16(dcs[4])
@@ -866,8 +869,8 @@ func storeMaxDelta(dqm *segmentInfo, dcs *[16]int16) {
 	if v2 > maxV {
 		maxV = v2
 	}
-	if maxV > dqm.maxEdge {
-		dqm.maxEdge = maxV
+	if maxV > *maxEdge {
+		*maxEdge = maxV
 	}
 }
 
@@ -923,7 +926,7 @@ func (it *iterator) pickBestIntra16(rd *modeScore) {
 	it.setIntra16Mode(rd.modeI16)
 
 	if rd.nz&0x100ffff == 0x1000000 && rd.D > int64(dqm.minDisto) {
-		storeMaxDelta(dqm, &rd.yDCLevels)
+		storeMaxDelta(&it.maxEdge[it.mb().segment&3], &rd.yDCLevels)
 	}
 }
 
