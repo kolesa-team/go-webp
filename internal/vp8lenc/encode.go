@@ -144,7 +144,10 @@ func EncodeWithHeadroom(img *image.NRGBA, cfg *Config, headroom int) ([]byte, er
 	n := w * h
 	argb := getU32(n)
 	defer putU32(argb)
-	hasAlpha := false
+	// The conversion also finds what encodeARGB would otherwise scan the
+	// image for: fully transparent pixels and the palette.
+	hasAlpha, transparent := false, false
+	var colors colorSet
 	for y := 0; y < h; y++ {
 		src := img.Pix[y*img.Stride : y*img.Stride+4*w]
 		dst := argb[y*w : (y+1)*w]
@@ -153,15 +156,21 @@ func EncodeWithHeadroom(img *image.NRGBA, cfg *Config, headroom int) ([]byte, er
 			a := uint32(s[3])
 			if a != 0xff {
 				hasAlpha = true
-			}
-			if a == 0 && !cfg.Exact {
-				dst[x] = 0
-				continue
+				if a == 0 {
+					transparent = true
+					if !cfg.Exact {
+						dst[x] = 0
+						continue
+					}
+				}
 			}
 			dst[x] = a<<24 | uint32(s[0])<<16 | uint32(s[1])<<8 | uint32(s[2])
 		}
+		colors.add(dst) // (a no-op past 256 colors)
 	}
-	out, _ := encodeARGB(argb, w, h, cfg, true, headroom+5, nil, nil)
+	var palBuf [maxPaletteSize]uint32
+	info := imageInfo{known: true, transparent: transparent, palette: colors.palette(palBuf[:0])}
+	out, _ := encodeARGB(argb, w, h, cfg, true, headroom+5, nil, nil, &info)
 	hdr := out[headroom : headroom+5]
 	hdr[0] = vp8lSignature
 	v := uint32(w-1) | uint32(h-1)<<14
@@ -218,19 +227,29 @@ func (a *AlphaEncoder) Encode(plane []byte, width, height, stride int, method in
 	}
 	argb := a.argb[:n]
 	// Like libwebp's WebPDispatchAlphaToGreen, the alpha, red and blue
-	// channels are left to 0 (the alpha channel is not transmitted).
+	// channels are left to 0 (the alpha channel is not transmitted). The
+	// plane has at most 256 values: its palette is collected on the way.
+	var seen [256]bool
 	for y := 0; y < height; y++ {
 		row := plane[y*stride : y*stride+width]
 		dst := argb[y*width : (y+1)*width]
 		for x, a := range row {
 			dst[x] = uint32(a) << 8
+			seen[a] = true
+		}
+	}
+	var palBuf [maxPaletteSize]uint32
+	info := imageInfo{known: true, palette: palBuf[:0]}
+	for v, ok := range seen {
+		if ok {
+			info.palette = append(info.palette, uint32(v)<<8)
 		}
 	}
 	if a.sc == nil {
 		a.sc = getScratch()
 	}
 	cfg := &Config{Quality: q, Method: method, Exact: true, NearLossless: 100}
-	out, spare := encodeARGB(argb, width, height, cfg, true, 0, a.sc, a.spare)
+	out, spare := encodeARGB(argb, width, height, cfg, true, 0, a.sc, a.spare, &info)
 	a.spare = spare
 	return out, nil
 }
@@ -300,6 +319,14 @@ func getTransformBits(method, histoBits int) int {
 	return histoBits
 }
 
+// imageInfo is what the caller of encodeARGB found out about the image
+// while converting it, saving encodeARGB a scan of its own.
+type imageInfo struct {
+	known       bool     // the fields below are set
+	transparent bool     // some pixel is fully transparent (alpha 0)
+	palette     []uint32 // the sorted distinct colors, nil if more than 256
+}
+
 // encodeARGB encodes argb (which may be modified: the caller must not use
 // it afterwards) and
 // returns a freshly allocated slice holding prefix zero bytes followed by the
@@ -310,7 +337,7 @@ func getTransformBits(method, histoBits int) int {
 // encodeStream). Besides the smallest stream, encodeARGB returns a buffer of
 // a losing candidate (or spare itself if unused), which the caller may pass
 // as spare to a later call.
-func encodeARGB(argb []uint32, w, h int, cfg *Config, useCache bool, prefix int, sc *scratch, spare []byte) (best, spareOut []byte) {
+func encodeARGB(argb []uint32, w, h int, cfg *Config, useCache bool, prefix int, sc *scratch, spare []byte, info *imageInfo) (best, spareOut []byte) {
 	quality, method := normalize(cfg)
 	p := params{
 		quality:   quality,
@@ -319,20 +346,26 @@ func encodeARGB(argb []uint32, w, h int, cfg *Config, useCache bool, prefix int,
 		useCache:  useCache,
 		parallel:  cfg.ThreadLevel && !cfg.LowMemory,
 	}
-	if !cfg.Exact {
-		for _, c := range argb[:w*h] {
-			if c < 0x01000000 {
-				p.cleanTransparent = true
-				break
+	n := w * h
+	var palette []uint32
+	if info != nil && info.known {
+		p.cleanTransparent = !cfg.Exact && info.transparent
+		palette = info.palette
+	} else {
+		if !cfg.Exact {
+			for _, c := range argb[:n] {
+				if c < 0x01000000 {
+					p.cleanTransparent = true
+					break
+				}
 			}
 		}
+		var palBuf [maxPaletteSize]uint32
+		palette = collectPalette(argb[:n], palBuf[:0])
 	}
 	if cfg.LowMemory {
 		p.windowCap = 1 << 16
 	}
-	n := w * h
-	var palBuf [maxPaletteSize]uint32
-	palette := collectPalette(argb[:n], palBuf[:0])
 	usePalette := palette != nil
 	p.nearLossless = clampInt(cfg.NearLossless, 0, 100)
 	p.histoBits = getHistoBits(method, usePalette, w, h)
@@ -541,6 +574,7 @@ func encodeStream(src []uint32, mutable bool, w, h int, p *params, cc crunchConf
 	quality := p.quality
 	width := w
 	var cur []uint32
+	refsCap := -1 // initRefsCap of the main image, when known
 	cacheBitsMax := 0
 	if p.useCache {
 		cacheBitsMax = maxColorCacheBits
@@ -557,7 +591,7 @@ func encodeStream(src []uint32, mutable bool, w, h int, p *params, cc crunchConf
 		} else {
 			cur = sc.curBuf(width * h)
 		}
-		applyPalette(src, w, h, pal, cur, sc.idx(w))
+		refsCap = applyPalette(src, w, h, pal, cur, sc.idx(w))
 		// Write the palette transform.
 		bw.putBits(1, 1)
 		bw.putBits(colorIndexingTransform, 2)
@@ -617,7 +651,10 @@ func encodeStream(src []uint32, mutable bool, w, h int, p *params, cc crunchConf
 		encodeImageNoHuffman(bw, img[:tw*th], tw, th, quality, p.lowEffort, sc.child())
 	}
 	bw.putBits(0, 1) // no more transforms
-	encodeImageInternal(bw, cur, width, h, p, cacheBitsMax, sc)
+	if usePredict {
+		refsCap = -1 // cur is now the residual image
+	}
+	encodeImageInternal(bw, cur, width, h, p, cacheBitsMax, refsCap, sc)
 	out := bw.finish()
 	if len(out) == cap(out) {
 		out = append(out, 0)[:len(out)] // room for a RIFF padding byte
@@ -666,9 +703,11 @@ const (
 // cache size and, when tryNoCache is set and that cache size is not 0, the
 // best parse without color cache (searched separately).
 func getBackwardRefs(argb []uint32, w, h int, quality int, lowEffort, box bool, cacheBitsMax int,
-	tryNoCache bool, sc *scratch, cands []refsCandidate) []refsCandidate {
+	tryNoCache bool, refsCap int, sc *scratch, cands []refsCandidate) []refsCandidate {
 	n := w * h
-	refsCap := initRefsCap(argb, w, h)
+	if refsCap < 0 {
+		refsCap = initRefsCap(argb, w, h)
+	}
 	types := []int{lz77Standard, lz77RLE}
 	if box {
 		types = []int{lz77Box}
@@ -829,10 +868,13 @@ func buildCodes(s *histoSet, sc *scratch) []huffCode {
 // and meta Huffman codes, choosing the smallest of the candidate parses.
 // Like libwebp, images with at most 16 colors also try the "box" LZ77
 // parse.
-func encodeImageInternal(bw *bitWriter, argb []uint32, w, h int, p *params, cacheBitsMax int, sc *scratch) {
+func encodeImageInternal(bw *bitWriter, argb []uint32, w, h int, p *params, cacheBitsMax, refsCap int, sc *scratch) {
+	if refsCap < 0 {
+		refsCap = initRefsCap(argb, w, h)
+	}
 	sc.hc.fill(argb, w, h, p.quality, p.lowEffort, p.windowCap)
 	var candBuf [2]refsCandidate
-	cands := getBackwardRefs(argb, w, h, p.quality, p.lowEffort, false, cacheBitsMax, p.tryNoCache, sc, candBuf[:0])
+	cands := getBackwardRefs(argb, w, h, p.quality, p.lowEffort, false, cacheBitsMax, p.tryNoCache, refsCap, sc, candBuf[:0])
 	if len(cands) == 1 && !p.tryBox {
 		bw.reserve(mainImageReserve(cands[0].bits))
 		writeMainImage(bw, w, h, p, cands[0], sc)
@@ -856,7 +898,7 @@ func encodeImageInternal(bw *bitWriter, argb []uint32, w, h int, p *params, cach
 		try(c)
 	}
 	if p.tryBox {
-		cands = getBackwardRefs(argb, w, h, p.quality, p.lowEffort, true, cacheBitsMax, p.tryNoCache, sc, candBuf[:0])
+		cands = getBackwardRefs(argb, w, h, p.quality, p.lowEffort, true, cacheBitsMax, p.tryNoCache, refsCap, sc, candBuf[:0])
 		for _, c := range cands {
 			try(c)
 		}
