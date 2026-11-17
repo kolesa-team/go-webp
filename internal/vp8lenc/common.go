@@ -10,10 +10,7 @@
 // Algorithm adapted from libwebp (BSD-3-Clause).
 package vp8lenc
 
-import (
-	"math/bits"
-	"sync"
-)
+import "math/bits"
 
 const (
 	numLiteralCodes   = 256
@@ -132,41 +129,9 @@ func colorCacheHash(argb uint32, shift uint) uint32 {
 
 // ---- pooled scratch buffers ----
 
-// u32Pools holds []uint32 buffers by power-of-two capacity class, for
-// buffers of up to maxPooledPixels entries.
-var u32Pools [32]sync.Pool
+// getU32 returns a []uint32 of length n (contents unspecified), from the
+// pool (see freelist.go) when it holds one of about that size.
+func getU32(n int) []uint32 { return u32Pool.Get(n) }
 
-// getU32 returns a []uint32 of length n (contents unspecified). Large
-// buffers come from the free list (one at most twice as large as needed),
-// or are allocated with their exact size.
-func getU32(n int) []uint32 {
-	if n > maxPooledPixels {
-		if b, ok := argbFree.get(func(b []uint32) bool { return cap(b) >= n && cap(b)/2 <= n }); ok {
-			return b[:n]
-		}
-		return make([]uint32, n)
-	}
-	c := bits.Len(uint(n - 1))
-	if n <= 1 {
-		c = 0
-	}
-	if v := u32Pools[c].Get(); v != nil {
-		return (*(v.(*[]uint32)))[:n]
-	}
-	return make([]uint32, n, 1<<uint(c))
-}
-
-// putU32 returns b (obtained from getU32) to the pool, or to the free list
-// if it is large.
-func putU32(b []uint32) {
-	if cap(b) > maxPooledPixels {
-		argbFree.put(b[:0], sliceBytes(b))
-		return
-	}
-	c := bits.Len(uint(cap(b) - 1))
-	if cap(b) == 0 || 1<<uint(c) != cap(b) {
-		return
-	}
-	b = b[:0]
-	u32Pools[c].Put(&b)
-}
+// putU32 returns b to the pool, if the budget allows it.
+func putU32(b []uint32) { u32Pool.Put(b) }

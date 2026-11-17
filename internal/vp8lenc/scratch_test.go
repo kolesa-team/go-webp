@@ -10,129 +10,133 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/kolesa-team/go-webp/v2/internal/bufpool"
 )
 
-// TestPoolBounds checks that buffers sized for large images are kept in the
-// free lists only within the budget (they used to be kept in sync.Pools
-// and retain hundreds of MB after a 12 MP encode), and are dropped by the
-// trimming.
+// withBudget sets the retention budget of internal/bufpool to limit with
+// empty pools, and returns the function restoring it.
+func withBudget(limit int64) func() {
+	bufpool.Trim()
+	prev := bufpool.SetLimit(limit)
+	return func() {
+		bufpool.SetLimit(prev)
+		bufpool.Trim()
+	}
+}
+
+// TestPoolBounds checks that the buffers and scratches of large images are
+// kept only within the budget shared with internal/bufpool (they used to be
+// kept in sync.Pools and retain hundreds of MB after a 12 MP encode), and
+// are dropped by the trimming.
 func TestPoolBounds(t *testing.T) {
-	defer func(b int64) { freeBudget = b; trimFree(-1) }(freeBudget)
-	trimFree(-1)
-	freeBudget = 64 << 20
+	const budget = 64 << 20
+	defer withBudget(budget)()
 	n := maxPooledPixels + 1
 	b := getU32(n)
 	if cap(b) != n {
 		t.Errorf("getU32(%d): cap %d, want the exact size", n, cap(b))
 	}
-	putU32(b) // kept: 8 MB is within a quarter of the budget
+	putU32(b)
 	if b2 := getU32(n); &b2[0] != &b[0] {
 		t.Error("large buffer was not reused")
 	}
-	if freeRetained.Load() != 0 {
-		t.Errorf("retained %d bytes, want 0", freeRetained.Load())
+	if r := bufpool.Retained(); r != 0 {
+		t.Errorf("retained %d bytes, want 0", r)
 	}
 	putU32(b)
 	if b2 := getU32(n / 3); cap(b2) == cap(b) {
-		t.Error("buffer more than twice as large as needed was used")
+		t.Error("buffer three times as large as needed was used")
 	}
-	trimFree(-1)
+	bufpool.Trim()
 	if b2 := getU32(n); &b2[0] == &b[0] {
 		t.Error("trimmed buffer was reused")
 	}
 
-	// A buffer larger than a quarter of the budget is never kept.
-	big := make([]uint32, freeBudget/16+1)
-	putU32(big)
-	if freeRetained.Load() != 0 {
-		t.Error("buffer above a quarter of the budget was kept")
+	// A buffer larger than the budget is never kept.
+	putU32(make([]uint32, budget/4+1))
+	if r := bufpool.Retained(); r != 0 {
+		t.Error("buffer above the budget was kept")
 	}
 
 	// The budget bounds the retained bytes.
-	var bufs [][]uint32
 	for i := 0; i < 12; i++ {
-		bufs = append(bufs, make([]uint32, freeBudget/4/4))
+		putU32(make([]uint32, budget/4/8))
 	}
-	for _, b := range bufs {
-		putU32(b)
+	if r := bufpool.Retained(); r > budget || r < budget/2 {
+		t.Errorf("retained %d bytes with a budget of %d", r, budget)
 	}
-	if r := freeRetained.Load(); r > freeBudget || r < freeBudget/2 {
-		t.Errorf("retained %d bytes with a budget of %d", r, freeBudget)
-	}
-	trimFree(freeNow() + 1)
-	if freeRetained.Load() != 0 || len(argbFree.entries) != 0 {
-		t.Errorf("trim left %d bytes in %d buffers", freeRetained.Load(), len(argbFree.entries))
+	bufpool.Trim()
+	if r := bufpool.Retained(); r != 0 {
+		t.Errorf("trim left %d bytes", r)
 	}
 
-	// A scratch of a large image is kept within the budget only.
+	// A scratch of a large image is kept within the budget only, and
+	// whole when it fits.
 	s := new(scratch)
 	s.noteSize(n)
-	s.resid = make([]uint32, freeBudget/4/4+1)
+	s.resid = make([]uint32, budget/4+1)
 	putScratch(s)
 	for i := 0; i < 4; i++ {
-		if getScratch() == s {
-			t.Fatal("scratch above a quarter of the budget was kept")
+		if getScratch(n) == s {
+			t.Fatal("scratch above the budget was kept")
 		}
 	}
-	s.resid = make([]uint32, n)
+	s.resid = make([]uint32, budget/4*3/4)
 	putScratch(s)
-	if getScratch() != s {
+	if r := bufpool.Retained(); r != s.bytes() {
+		t.Fatalf("retained %d bytes for a scratch of %d", r, s.bytes())
+	}
+	// Not handed to an image more than 4 times smaller (above 1 MP).
+	if getScratch(n/5) == s {
+		t.Fatal("scratch of a large image used for a small one")
+	}
+	if getScratch(n/3) != s {
 		t.Fatal("scratch within the budget was not kept")
+	}
+	small := new(scratch)
+	small.noteSize(minScratchFit)
+	putScratch(small)
+	if getScratch(1) != small {
+		t.Fatal("scratch of a small image not used for any size")
 	}
 }
 
-// TestFreeTrimOnGC checks that the free lists are emptied by garbage
-// collections once their objects are idle, and that the trimming re-arms
-// itself.
+// TestFreeTrimOnGC checks that the scratches of the free list are dropped
+// by garbage collections once idle.
 func TestFreeTrimOnGC(t *testing.T) {
-	defer func(b int64) { freeBudget = b; trimFree(-1) }(freeBudget)
-	trimFree(-1)
-	freeBudget = 64 << 20
-	put := func() {
-		s := new(scratch)
-		s.resid = make([]uint32, 1<<20)
-		// An entry put freeMaxIdle ago is idle.
-		scratchFree.put(s, s.bytes())
-		scratchFree.mu.Lock()
-		scratchFree.entries[len(scratchFree.entries)-1].at -= int64(2 * freeMaxIdle)
-		scratchFree.mu.Unlock()
-	}
-	for round := 0; round < 2; round++ {
-		put()
-		deadline := time.Now().Add(10 * time.Second)
-		for freeRetained.Load() != 0 {
-			if time.Now().After(deadline) {
-				t.Fatalf("round %d: idle scratch not dropped by the collections", round)
-			}
-			runtime.GC()
-			time.Sleep(time.Millisecond)
-		}
-	}
-	// A recent entry survives the collections.
+	defer withBudget(64 << 20)()
+	defer bufpool.SetMaxIdle(bufpool.SetMaxIdle(0))
 	s := new(scratch)
 	s.resid = make([]uint32, 1<<20)
-	scratchFree.put(s, s.bytes())
-	runtime.GC()
-	runtime.GC()
-	time.Sleep(10 * time.Millisecond)
-	if getScratch() != s {
-		t.Error("recently used scratch was dropped")
+	putScratch(s)
+	if bufpool.Retained() == 0 {
+		t.Fatal("scratch not kept")
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for bufpool.Retained() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("idle scratch not dropped by the collections")
+		}
+		runtime.GC()
+		time.Sleep(time.Millisecond)
+	}
+	if scratchFree.Len() != 0 {
+		t.Fatal("scratch still listed")
 	}
 }
 
 // TestFreeConcurrent hammers the free lists from several goroutines (for
 // the race detector) and checks the accounting.
 func TestFreeConcurrent(t *testing.T) {
-	defer func(b int64) { freeBudget = b; trimFree(-1) }(freeBudget)
-	trimFree(-1)
-	freeBudget = 64 << 20
+	defer withBudget(64 << 20)()
 	var wg sync.WaitGroup
 	for g := 0; g < 8; g++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 200; i++ {
-				s := getScratch()
+				s := getScratch(1 << (10 + i%8))
 				s.resid = s.residBuf(1 << (10 + i%8))
 				putScratch(s)
 				b := getU32(maxPooledPixels + 1 + i%7*1000)
@@ -141,15 +145,12 @@ func TestFreeConcurrent(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	var sum int64
-	for _, e := range scratchFree.entries {
-		sum += e.bytes
+	if r := bufpool.Retained(); r < 0 || r > 64<<20 {
+		t.Errorf("retained %d bytes, budget %d", r, 64<<20)
 	}
-	for _, e := range argbFree.entries {
-		sum += e.bytes
-	}
-	if r := freeRetained.Load(); r != sum || r > freeBudget {
-		t.Errorf("retained %d bytes, entries hold %d, budget %d", r, sum, freeBudget)
+	bufpool.Trim()
+	if r := bufpool.Retained(); r != 0 {
+		t.Errorf("retained %d bytes after Trim (accounting drift)", r)
 	}
 }
 
