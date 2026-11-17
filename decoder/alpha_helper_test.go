@@ -44,7 +44,7 @@ var budgets = []struct {
 
 // smallBands makes every frame use the helper, with bands of a few rows, so
 // that band boundaries fall everywhere relative to the VP8 output batches.
-func smallBands(t *testing.T, rows, w int) {
+func smallBands(t testing.TB, rows, w int) {
 	oldBand, oldStep, oldMin := alphaBandPixels, alphaStepPixels, minHelperPixels
 	alphaBandPixels, alphaStepPixels, minHelperPixels = rows*w, (rows+1)/2*w, 0
 	t.Cleanup(func() { alphaBandPixels, alphaStepPixels, minHelperPixels = oldBand, oldStep, oldMin })
@@ -71,7 +71,7 @@ func alphaPicture(w, h int) *image.NRGBA {
 // alphaFiles encodes alphaPicture with every ALPH variant: compression
 // none/lossless, each filter, and the "quantized levels" flag (which makes
 // AlphaDitheringStrength smooth the whole plane at once).
-func alphaFiles(t *testing.T, w, h int) map[string][]byte {
+func alphaFiles(t testing.TB, w, h int) map[string][]byte {
 	img := alphaPicture(w, h)
 	out := map[string][]byte{}
 	for _, comp := range []int{0, 1} {
@@ -94,7 +94,7 @@ type outcome struct {
 	pix []byte
 }
 
-func decodeOutcome(t *testing.T, data []byte, o *Options) outcome {
+func decodeOutcome(t testing.TB, data []byte, o *Options) outcome {
 	t.Helper()
 	d, err := NewDecoder(bytes.NewReader(data), o)
 	if err != nil {
@@ -259,6 +259,44 @@ func TestAlphaHelperPanic(t *testing.T) {
 	waitGoroutines(t, g)
 	// The decoder still works (no broken state was pooled).
 	assert.Equal(t, decodeOutcome(t, data, nil), decodeOutcome(t, data, &Options{UseThreads: true}))
+}
+
+// FuzzAlphaHelper compares the alpha helper (tiny bands and steps) with the
+// sequential alpha decoding on arbitrary (mostly corrupted) lossy+alpha
+// files: pixels and errors must be identical.
+func FuzzAlphaHelper(f *testing.F) {
+	for _, data := range alphaFiles(f, 41, 23) {
+		f.Add(data, uint8(0))
+		f.Add(data, uint8(0x5a))
+	}
+	f.Add(readFile(f, "100x150_lossy.webp"), uint8(3))
+	f.Fuzz(func(t *testing.T, data []byte, flags uint8) {
+		d, err := NewDecoder(bytes.NewReader(data), nil)
+		if err != nil {
+			return
+		}
+		feat := d.GetFeatures()
+		if feat.Width*feat.Height > 1<<16 {
+			return
+		}
+		smallBands(t, 1+int(flags&3), feat.Width)
+		o := &Options{UseThreads: true, NoFancyUpsampling: flags&4 != 0, AlphaDitheringStrength: int(flags>>3&1) * 60}
+		switch flags >> 5 & 3 {
+		case 1:
+			o.Crop = image.Rect(0, feat.Height/3, feat.Width, feat.Height/2+1)
+		case 2:
+			o.Scale = image.Rect(0, 0, feat.Width/2+1, feat.Height/3+1)
+		}
+		restore := budgets[0].set()
+		want := decodeOutcome(t, data, o)
+		restore()
+		restore = budgets[2].set()
+		got := decodeOutcome(t, data, o)
+		restore()
+		if want.err != got.err || !bytes.Equal(want.pix, got.pix) {
+			t.Fatalf("helper %q, sequential %q (pixels equal: %v)", got.err, want.err, bytes.Equal(want.pix, got.pix))
+		}
+	})
 }
 
 // BenchmarkAlphaHelper compares lossy+alpha decoding with UseThreads with
