@@ -21,10 +21,13 @@ no assembly, no dependencies outside the standard library.
   ./internal/vp8enc`, two test photos, quality 10–100): lossy methods 4 and 6
   are within −0.8%…+0.3% of cwebp's size at the same PSNR (±0.01 dB);
   method 0 files are 0.1–9% smaller (up to 41% at quality 100) at a PSNR
-  within 0.05 dB. Lossless output is 0.2% (level 6) to 1.2% (level 0) larger
-  than cwebp's on the benchmark photo (see below).
+  within 0.05 dB. Lossless output is the same size as cwebp's at level 6
+  and 1.2% larger at level 0 on the benchmark photo (see below).
 - Streaming decoder working one macroblock row at a time, pooled scratch
-  buffers, zero copies for the common "decode the whole picture" case.
+  buffers, zero copies for the common "decode the whole picture" case;
+  `DecodeInto` reuses the caller's output buffer.
+- Optional helper goroutines (`UseThreads`, `ThreadLevel`) from one
+  process-wide budget, with output identical to the single-goroutine one.
 - Works everywhere Go does, including `CGO_ENABLED=0`, cross compilation and
   scratch/distroless containers.
 
@@ -151,6 +154,160 @@ go run ./_examples/encode
 Lossless: `encoder.NewLosslessEncoderOptions(encoder.PresetDefault, level)`
 with `level` from 0 (fastest) to 9 (smallest), like `cwebp -z`.
 
+#### Decode into a reused buffer
+```go
+var img *image.NRGBA // nil: the first decode allocates it
+for _, data := range files {
+	dec, err := decoder.NewDecoder(bytes.NewReader(data), nil)
+	if err != nil {
+		return err
+	}
+	if img, err = dec.DecodeInto(img); err != nil {
+		return err
+	}
+	process(img) // before the next decode overwrites it
+}
+```
+
+`(*decoder.Decoder).DecodeInto(dst)` and `webp.DecodeInto(r, dst, options)`
+decode like `Decode`, but into `dst`:
+
+- `dst` is raw memory: its previous `Rect` and `Stride` are ignored. When
+  `cap(dst.Pix) >= 4*w*h` for the output size `w`x`h` (after crop and
+  scale), the pixels are written in place, with no allocation and no
+  clearing; otherwise a new buffer is allocated.
+- On success `dst.Rect` is `(0,0)-(w,h)`, `dst.Stride` is `4*w`, the
+  capacity of a reused buffer is kept, and the returned image is `dst`
+  itself. A nil `dst` behaves like `Decode`.
+- On error the fields of `dst` are unchanged, but its bytes may have been
+  partly overwritten.
+- Do not pass a `SubImage`, and do not use `dst` from other goroutines
+  during the call.
+
+#### Decode to Y'CbCr
+`(*decoder.Decoder).DecodeYCbCr()` returns the 4:2:0 planes of a lossy
+picture as an `*image.YCbCr` (1.5 bytes per pixel, no conversion to RGB);
+`DecodeNYCbCrA()` adds the alpha plane (`*image.NYCbCrA`, 2.5 bytes per
+pixel; all 0xff for an opaque picture).
+
+- The samples are those of the VP8 stream (BT.601 limited range), the same
+  as libwebp's `WebPDecodeYUV` / `dwebp -yuv` and as
+  `golang.org/x/image/webp`. Colors computed through `image.YCbCr`'s color
+  model therefore differ slightly from the RGB of `Decode`, which also
+  upsamples the chroma smoothly.
+- `Crop` (top-left corner rounded down to even coordinates), `Flip` (each
+  plane mirrored), `BypassFiltering`, `DitheringStrength`,
+  `AlphaDitheringStrength` (for `DecodeNYCbCrA`) and `UseThreads` apply;
+  `Scale` is refused with `VP8_STATUS_INVALID_PARAM`.
+- Lossless pictures and animations, and pictures with alpha for
+  `DecodeYCbCr`, are refused with `VP8_STATUS_UNSUPPORTED_FEATURE`: check
+  `GetFeatures()` first.
+
+#### Cancellation
+```go
+ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+defer cancel()
+img, err := webp.DecodeContext(ctx, r, nil)
+// errors.Is(err, context.DeadlineExceeded) once the deadline has passed
+err = webp.EncodeContext(ctx, w, img, options)
+```
+
+- Decoding: `(*decoder.Decoder).DecodeContext(ctx)`,
+  `DecodeIntoContext(ctx, dst)` and `webp.DecodeContext(ctx, r, options)`
+  check `ctx` between batches of output rows (at most 16 rows; a lossless
+  picture reads its headers first). The error satisfies
+  `errors.Is(err, context.Canceled)` (or `context.DeadlineExceeded`) and
+  carries the status `VP8_STATUS_USER_ABORT`;
+  `webp.DecodeContext` returns `ctx.Err()` itself when `ctx` is already
+  done before `r` is read.
+- Encoding: `(*encoder.Encoder).EncodeContext(ctx, w)` and
+  `webp.EncodeContext(ctx, w, src, options)` check `ctx` about once per
+  macroblock row (lossy) and between passes, search rows and work chunks
+  (lossless), on helper goroutines too. They return `ctx.Err()` itself (not
+  wrapped) and write nothing to `w`. The source conversion done by
+  `NewEncoder` and the RGB to Y'CbCr conversion are not interruptible.
+- Helper goroutines have exited when these functions return. With a
+  `context.Background()` there is no overhead.
+
+#### Releasing an encoder
+`encoder.NewEncoder` copies every source that is not an `*image.NRGBA`
+(as v1 did). `(*encoder.Encoder).Release()` hands that copy back to internal
+pools for later encoders; afterwards `Encode` and `EncodeContext` return
+`encoder.ErrReleased`. `Release` waits for encodes running on other
+goroutines, may be called more than once and is safe on a nil `*Encoder`.
+Calling it is optional: otherwise the copy goes back to the pools once the
+`Encoder` is unreachable. `webp.Encode` and `webp.EncodeContext` release
+automatically. (`Encoder` now holds a `sync.RWMutex`: use it through a
+pointer, as `NewEncoder` returns it; `go vet` reports copies.)
+
+## Threads
+
+By default every `Decode`/`Encode` call runs on the calling goroutine only.
+Helper goroutines are opt-in, per call:
+
+- `decoder.Options.UseThreads`:
+  - lossy pictures of at least 1024 macroblocks (about 512x512): one helper
+    reconstructs, filters and converts batches of macroblock rows while the
+    caller parses the next ones;
+  - lossy pictures with alpha whose rows down to the bottom of the output
+    hold 256K pixels or more: another helper decodes the alpha plane ahead
+    of the rows that need it;
+  - lossless pictures of at least about 256K output pixels: the caller
+    entropy-decodes while a helper applies the inverse transforms and
+    writes the output rows (libwebp ignores `use_threads` for lossless
+    pictures; this is a go-webp extension).
+- `encoder.Options.ThreadLevel`:
+  - lossy: the analysis pass runs in row bands (384 macroblocks or more,
+    1024 at methods 0-1), and the compressed alpha plane of a transparent
+    picture (64K pixels or more) is coded while the VP8 frame is;
+  - lossless and compressed alpha (256K pixels or more): the hash-chain
+    match search, the predictor search (methods 0-4) and the histogram
+    remap are split among helpers; level 9 codes at most two candidate
+    configurations at a time (one at a time above 8 MP).
+
+All helpers of the process come from one budget of `GOMAXPROCS-1`
+goroutines (re-read on every call), shared by all concurrent `Decode` and
+`Encode` calls. A call that finds no free slot does the work on its own
+goroutine, so a server that already runs one request per core is never
+oversubscribed. **The output is identical with or without the flags and
+for any budget.** A panic in a helper is re-raised on the calling
+goroutine, and helpers have exited when the call returns.
+
+The flags trade CPU for latency (for example lossless level 6 of a 1.2 MP
+photo: 308 ms sequential, 158 ms with `ThreadLevel`, for about 10% more CPU
+time). A server that is busy with concurrent requests gains little from
+them; an application that decodes or encodes one large picture at a time on
+an otherwise idle machine gains most.
+
+## Running on a server
+
+The library sets no process-wide limits itself. For a service that decodes
+or encodes untrusted pictures:
+
+- Bound the number of concurrent codec calls to about `GOMAXPROCS` (a
+  semaphore), and queue or shed the rest. Every call needs its working
+  memory at once, and more concurrent calls than cores only add memory.
+- Decode with `DecodeInto` into buffers from your own pool (one per worker,
+  sized for your largest accepted picture): the output image is nearly all
+  of a decode's memory (4 bytes per pixel), and reusing it removes most of
+  the garbage collector's work. Check `webp.DecodeConfig` or `GetFeatures`
+  against your size limits before decoding.
+- Set `GOMEMLIMIT` to about 1.3-1.5x the expected working set (roughly
+  4-5 bytes per pixel per concurrent decode, plus encodes), below the
+  container's memory limit. It also bounds the peaks of large lossless
+  encodes (see [Benchmarks](#benchmarks)). In our measurements of 15
+  concurrent decodes `GOMEMLIMIT` alone cost 7-33% more CPU; together with
+  `DecodeInto` it cost nothing measurable.
+- Between calls the encoders keep their scratch buffers in internal pools:
+  up to 256 MiB for the lossy encoder (and `Encoder` snapshots) and
+  256 MiB for the lossless encoder (64 MiB each on 32-bit platforms).
+  Buffers unused for 15 s are dropped at the next garbage collection, which
+  the runtime forces at least every two minutes. Leave room for them in
+  the memory limit; they do not follow `GOMEMLIMIT`.
+- Profile-guided optimization applies to dependencies: building the
+  service with a CPU profile of its own workload (`default.pgo` in the main
+  package) also optimizes this library. A library cannot ship a profile.
+
 ## Migrating from v1
 
 The v1 (cgo) line is tagged `v1.0.5`. Note that the last v1 commit on
@@ -203,8 +360,10 @@ Other differences worth knowing:
   partition.
 - As in libwebp, a NaN `Quality` or `TargetPsnr` passes validation; a NaN
   lossy quality encodes at the finest quantizer (like quality 100).
-- `UseThreads` (decoder) and `ThreadLevel` (encoder) use goroutines instead
-  of libwebp's worker threads; outputs do not depend on them.
+- `UseThreads` (decoder) and `ThreadLevel` (encoder) use goroutines from a
+  process-wide budget instead of libwebp's worker threads (see
+  [Threads](#threads)); outputs do not depend on them. `UseThreads` also
+  speeds up lossless pictures, which libwebp decodes on one thread.
 - Allocations are limited like libwebp's `WEBP_MAX_ALLOCABLE_MEMORY`
   (16 GiB on 64-bit targets, just under 2 GiB on 32-bit ones): a `Scale` or
   crop whose output would exceed it fails with `VP8_STATUS_OUT_OF_MEMORY`.
@@ -215,25 +374,69 @@ Other differences worth knowing:
 
 ## Benchmarks
 
-Apple M5 Pro, Go 1.27, `go test -bench -benchmem`, v1 = v1.0.5 with Homebrew
-libwebp 1.6.0 (NEON). Memory for v1 counts only Go allocations (libwebp's own
-C heap is not visible to the Go benchmark).
+Apple M5 Pro (15 cores), Go 1.27.1, darwin/arm64, `go test -bench
+-benchmem`. "v2.0" is the first pure Go release (commit `cc4c8bb`), "v2" is
+this version; both were measured in the same session with prebuilt test
+binaries run alternately, 10 rounds each, and the table shows medians
+(benchstat; every time difference quoted is significant at p < 0.05). The
+v1 column (v1.0.5 with Homebrew libwebp 1.6.0, NEON) is from an earlier
+session and was not re-measured; its memory counts only Go allocations
+(libwebp's own C heap is not visible to the Go benchmark). MB = 10^6 bytes
+allocated per operation.
 
-| Benchmark | v1 (libwebp) | v2 (pure Go) |
+| Benchmark | v1 (libwebp) | v2.0 | v2 |
+|---|---|---|---|
+| Decode lossy 675x900 (`m4_q75.webp`) | 3.1 ms, 2.57 MB, 22 allocs | 7.4 ms, 2.50 MB, 11 allocs | 6.6 ms (−12%), 2.50 MB, 11 allocs |
+| ↳ with `UseThreads` | | 4.8 ms, 2.50 MB, 15 allocs | 4.5 ms (−7%), 2.51 MB, 18 allocs |
+| ↳ `DecodeInto` (reused buffer) | | | 6.6 ms, 0.10 MB, 9 allocs |
+| ↳ `DecodeYCbCr` | | | 5.4 ms, 0.98 MB, 10 allocs |
+| Decode lossy+alpha 3000x2000 (`webp-logo-lossy.webp`) | 11.1 ms, 24.2 MB, 23 allocs | 24.2 ms, 24.5 MB, 17 allocs | 22.5 ms (−7%), 24.5 MB, 18 allocs |
+| ↳ with `UseThreads` | | 19.7 ms, 25.2 MB, 28 allocs | 17.3 ms (−12%), 24.2 MB, 30 allocs |
+| ↳ `DecodeInto` (reused buffer) | | | 22.4 ms, 1.75 MB, 14 allocs |
+| ↳ `DecodeNYCbCrA` | | | 11.2 ms, 15.3 MB, 15 allocs |
+| Decode lossless 3000x2000 (`webp-logo-lossless.webp`) | 5.9 ms, 24.2 MB, 23 allocs | 6.8 ms, 24.2 MB, 11 allocs | 2.7 ms (−60%), 24.1 MB, 11 allocs |
+| ↳ with `UseThreads` | | 6.8 ms, 24.2 MB, 10 allocs | 2.0 ms (−71%), 24.1 MB, 18 allocs |
+| ↳ `DecodeInto` (reused buffer) | | | 2.4 ms, 0.22 MB, 9 allocs |
+| Encode lossy q75, 960x1280 JPEG source | 66 ms, 117 858 bytes | 136 ms, 117 918 bytes, 2.20 MB, 18 allocs | 134 ms (−2%), 117 918 bytes, 0.14 MB, 12 allocs |
+| ↳ with `ThreadLevel` | | 132 ms | 127 ms (−4%), 0.15 MB, 49 allocs |
+| ↳ method 0 / method 6 | | 31.8 ms / 199 ms | 28.7 ms (−10%) / 179 ms (−10%) |
+| Encode lossy+alpha q75, 3000x2000 logo | | 485 ms, 120 MB, 202 allocs | 476 ms (−2%), 2.1 MB, 52 allocs |
+| ↳ with `ThreadLevel` | | 465 ms | 287 ms (−38%), 3.5 MB, 98 allocs |
+| Encode lossless level 6, same JPEG source | 395 ms, 1 098 384 bytes | 397 ms, 1 098 360 bytes, 20.6 MB | 308 ms (−22%), 1 098 360 bytes, 12.8 MB |
+| ↳ with `ThreadLevel` | | 396 ms | 158 ms (−60%), 4.8 MB |
+| Encode lossless level 0, same JPEG source | 40 ms, 1 201 738 bytes | 47.1 ms, 1 216 356 bytes, 15.5 MB | 46.2 ms (−2%), 1 216 356 bytes, 3.7 MB |
+| ↳ with `ThreadLevel` | | 47.2 ms | 37.3 ms (−21%), 4.5 MB |
+
+Encoded files are byte-identical between v2.0 and v2, and decoded pixels
+are identical (bit-exact with libwebp 1.6 `dwebp`). With `UseThreads` /
+`ThreadLevel` the process has 14 helper slots here; the threaded lossless
+stages use about 10% more CPU time in total than the sequential encode.
+
+Peak resident memory of a whole process (`getrusage`, median of 2-3 runs,
+same session, default `GOGC`, no `GOMEMLIMIT`):
+
+| Workload | v2.0 | v2 |
 |---|---|---|
-| Decode lossy 675x900 (`m4_q75.webp`) | 3.1 ms, 2.57 MB, 22 allocs | 7.4 ms, 2.50 MB, 11 allocs |
-| ↳ with `UseThreads` | | 4.7 ms, 2.50 MB, 16 allocs |
-| Decode lossy+alpha 3000x2000 (`webp-logo-lossy.webp`) | 11.1 ms, 24.2 MB, 23 allocs | 26.3 ms, 24.5 MB, 14 allocs |
-| ↳ with `UseThreads` | | 20.2 ms, 25.2 MB, 28 allocs |
-| Decode lossless 3000x2000 (`webp-logo-lossless.webp`) | 5.9 ms, 24.2 MB, 23 allocs | 6.8 ms, 25.2 MB, 13 allocs |
-| Encode lossy q75, 960x1280 JPEG source | 66 ms, 117 858 bytes | 138 ms, 117 918 bytes, 0.9 MB, 11 allocs |
-| Encode lossless level 6, same source | 395 ms, 1 098 384 bytes | 386 ms, 1 100 216 bytes |
-| Encode lossless level 0, same source | 40 ms, 1 201 738 bytes | 46 ms, 1 216 362 bytes |
+| One 12 MP lossy encode (4000x3000 `*image.YCbCr`, q75; the source takes 46 MB) | 78 MB | 78 MB |
+| Five 12 MP lossy encodes in a row | 148 MB | 87 MB |
+| 8 goroutines x 3 lossy 12 MP encodes | 584-590 MB | 377 MB |
+| One 12 MP lossless level 6 encode (upscaled photo) | 323 MB | 372 MB |
+| Three 12 MP lossless level 6 encodes in a row | 437 MB | 716 MB (486 MB with `GOMEMLIMIT=450MiB`) |
+| Three 1.9 MP (1600x1200) lossless level 6 encodes in a row | 105 MB | 82 MB |
+| One 12 MP lossless decode (output 48 MB) | 68 MB | 69 MB |
+| 15 goroutines x 4 decodes of the 6 MP lossless logo | 940-1120 MB | 860-960 MB; 401 MB with `DecodeInto` |
+| 15 goroutines x 4 decodes of the 6 MP lossy+alpha logo | 970-1090 MB | 1000-1120 MB; 493 MB with `DecodeInto` |
 
 The output image (24 MB for 3000x2000) dominates the decoder's memory; the
-decoder itself keeps O(width) state. Compared with `golang.org/x/image/webp`
-(decoder only), v2 decodes lossy pictures 1.6–2.6x and lossless pictures
-1.7–3.4x faster, with far fewer allocations.
+decoder itself keeps O(width) state, so `DecodeInto` with reused buffers
+removes most of it. Large lossless encodes run about 25% faster but can
+peak higher: the garbage collector now runs while more of their working set
+(about 30 bytes per pixel at level 6) is live, and its next target is twice
+that; `GOMEMLIMIT` bounds it. Up to a few megapixels v2 peaks lower than
+v2.0. Compared with
+`golang.org/x/image/webp` (decoder only), v2.0 already decoded lossy
+pictures 1.6–2.6x and lossless pictures 1.7–3.4x faster, with far fewer
+allocations.
 
 ```bash
 make bench
