@@ -16,3 +16,11 @@ func reconI16(b *[yuvSize]byte, coeffs *[384]int16, bits uint32, mode int) {
 func reconUV(b *[yuvSize]byte, coeffs *[384]int16, bits uint32, mode int) {
 	reconUVRef(b, coeffs, bits, mode)
 }
+
+func loadEdges(b *[yuvSize]byte, top *topSamples, tr, flags uint32) {
+	loadEdgesRef(b, top, tr, flags)
+}
+
+func storeMBRows(b *[yuvSize]byte, top *topSamples, cy, cu, cv []byte, ys, uvs int) {
+	storeMBRowsRef(b, top, cy, cu, cv, ys, uvs)
+}
