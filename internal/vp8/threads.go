@@ -179,7 +179,11 @@ parse:
 			select {
 			case <-m.free:
 			default:
-				waits++
+				if y >= 2*k {
+					// Past the first, short batches, which are mostly
+					// waiting for the helper to wake up.
+					waits++
+				}
 				select {
 				case <-m.free:
 				case <-t.Done():
