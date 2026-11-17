@@ -95,27 +95,6 @@ func (bw *bitWriter) putBit(bit bool, prob int) bool {
 	return bit
 }
 
-// putBitInt is putBit for a 0/1 integer value.
-func (bw *bitWriter) putBitInt(bit int, prob int) int {
-	split := (bw.rng * int32(prob)) >> 8
-	if bit != 0 {
-		bw.value += split + 1
-		bw.rng -= split + 1
-	} else {
-		bw.rng = split
-	}
-	if bw.rng < 127 {
-		shift := kNorm[bw.rng&127]
-		bw.rng = int32(kNewRange[bw.rng&127])
-		bw.value <<= shift
-		bw.nbBits += int(shift)
-		if bw.nbBits > 0 {
-			bw.flush()
-		}
-	}
-	return bit
-}
-
 func (bw *bitWriter) putBitUniform(bit bool) bool {
 	split := bw.rng >> 1
 	if bit {
