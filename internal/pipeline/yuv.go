@@ -61,8 +61,8 @@ func (s *scaleSink) initYUV(hasAlpha bool) error {
 	q.uvLeft = (s.left4 / 4) >> 1
 	q.uvTop = s.top >> 1
 	q.uvH = (ch + 1) >> 1
-	work := make([]uint32, 4*resample.WorkSize(dw, 1))
-	ws := resample.WorkSize(dw, 1)
+	ws := resample.BufferSize(dw, 1)
+	work := make([]uint32, 4*ws)
 	err := q.ry.Init(cw, ch, dw, dh, 1, work[0:ws:ws])
 	if err == nil {
 		err = q.ru.Init(q.cuw, q.uvH, dw, dh, 1, work[ws:2*ws:2*ws])
