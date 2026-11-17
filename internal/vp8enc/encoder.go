@@ -161,6 +161,14 @@ func (e *encoder) setup(pic *Picture, cfg *Config) {
 	default:
 		e.rdOptLevel = rdOptNone
 	}
+	// libwebp 1.6 codes methods >= 3 from its token buffer unless
+	// low_memory is set, and the token path supports a single partition
+	// only (MapConfigToTools: "doesn't work with multi-partition"): the
+	// Partitions setting is then ignored. Mirror that, so that the number
+	// of partitions in the output is the one cwebp writes.
+	if e.method >= 3 && !cfg.LowMemory {
+		e.numParts = 1
+	}
 	limit := 100 - cfg.PartitionLimit
 	e.maxI4HeaderBits = 256 * 16 * 16 * (limit * limit) / (100 * 100)
 	e.mbHeaderLimit = int64(256*510*8*1024) / int64(e.mbW*e.mbH)

@@ -21,6 +21,9 @@
 
 package main
 
+// Decodes test_data/images/m4_q75.webp to example/output_decode.jpg.
+// Run from the repository root: go run ./_examples/decode
+
 import (
 	"image/jpeg"
 	"log"
@@ -35,20 +38,27 @@ func main() {
 	if err != nil {
 		log.Fatalln(err)
 	}
-
-	output, err := os.Create("example/output_decode.jpg")
-	if err != nil {
-		log.Fatal(err)
-	}
 	//noinspection GoUnhandledErrorResult
-	defer output.Close()
+	defer file.Close()
 
 	img, err := webp.Decode(file, &decoder.Options{})
 	if err != nil {
 		log.Fatalln(err)
 	}
 
-	if err = jpeg.Encode(output, img, &jpeg.Options{Quality: 75}); err != nil {
+	if err := os.MkdirAll("example", 0o755); err != nil {
+		log.Fatalln(err)
+	}
+	output, err := os.Create("example/output_decode.jpg")
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	if err := jpeg.Encode(output, img, &jpeg.Options{Quality: 75}); err != nil {
+		output.Close()
+		log.Fatalln(err)
+	}
+	if err := output.Close(); err != nil {
 		log.Fatalln(err)
 	}
 }

@@ -61,7 +61,7 @@ func TestEncodeARGBSpare(t *testing.T) {
 	const w, h = 64, 48
 	argb := make([]uint32, w*h)
 	for i := range argb {
-		argb[i] = 0xff000000 | uint32(i*2654435761)&0x00f0f0f0
+		argb[i] = 0xff000000 | uint32(i)*2654435761&0x00f0f0f0
 	}
 	cfg := &Config{Quality: 100, Method: 6}
 	enc := func(spare []byte) ([]byte, []byte) {

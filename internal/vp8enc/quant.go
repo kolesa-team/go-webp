@@ -317,7 +317,14 @@ func (e *encoder) setSegmentParams(quality float64) {
 	for i := 0; i < numSegments; i++ {
 		expn := 1. - amp*float64(e.dqm[i].alpha)
 		c := math.Pow(cBase, expn)
-		q := int(127. * (1. - c))
+		// A NaN quality yields NaN here; libwebp's (int) cast of it ends up
+		// as quantizer 0 after clipping (0 on arm64, INT_MIN on x86), so
+		// make that explicit instead of relying on Go's platform-dependent
+		// NaN conversion.
+		q := 0
+		if f := 127. * (1. - c); f == f {
+			q = int(f)
+		}
 		e.dqm[i].quant = clipInt(q, 0, 127)
 	}
 	e.baseQuant = e.dqm[0].quant

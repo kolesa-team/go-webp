@@ -29,9 +29,21 @@ jobs:
           CGO_ENABLED: "0"
         run: go build ./...
       - name: Vet
-        run: go vet ./...
+        run: go vet ./... ./_examples/decode ./_examples/encode
+      # _examples starts with "_", so ./... (build, vet, test) skips it:
+      # run the examples explicitly, from the repository root as documented.
+      - name: Run examples
+        run: |
+          go run ./_examples/decode
+          go run ./_examples/encode
       - name: Test
         run: go test ./...
+      - name: Test on 32-bit (linux/386)
+        if: runner.os == 'Linux'
+        env:
+          GOARCH: "386"
+          CGO_ENABLED: "0"
+        run: go vet ./... && go test -short ./...
       - name: Test with the race detector
         # The race detector needs cgo; it is enabled where a C toolchain is
         # available by default.

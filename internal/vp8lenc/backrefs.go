@@ -170,8 +170,13 @@ func applyColorCache(argb []uint32, cacheBits int, refs []pixOrCopy, cache []uin
 			pos++
 		} else {
 			l := r.length()
+			// Runs of the same color insert it once.
+			prev := ^argb[pos]
 			for _, a := range argb[pos : pos+l] {
-				cache[colorCacheHash(a, shift)] = a
+				if a != prev {
+					cache[colorCacheHash(a, shift)] = a
+					prev = a
+				}
 			}
 			pos += l
 		}
@@ -276,16 +281,19 @@ func bestCacheBits(argb []uint32, quality int, refs []pixOrCopy, maxBits int, sc
 }
 
 // ---- cost-based optimal parsing ----
+//
+// Port of libwebp 1.6 src/enc/backward_references_cost_enc.c (BSD-3-Clause),
+// with its fixed-point costs.
 
-// costModel holds per-symbol bit cost estimates.
+// costModel holds per-symbol bit cost estimates (fixed point).
 type costModel struct {
-	alpha, red, blue [256]float32
-	lit              []float32 // green + length prefixes + cache
-	dist             [numDistanceCodes]float32
-	lenCost          []float32 // cost of a copy length (prefix + extra bits)
+	alpha, red, blue [256]uint32
+	lit              []uint32 // green + length prefixes + cache
+	dist             [numDistanceCodes]uint32
 }
 
-func popToBits(pop []uint32, out []float32) {
+// popToBits is libwebp's ConvertPopulationCountTableToBitEstimates.
+func popToBits(pop []uint32, out []uint32) {
 	var sum uint32
 	nz := 0
 	for _, v := range pop {
@@ -295,24 +303,22 @@ func popToBits(pop []uint32, out []float32) {
 		}
 	}
 	if nz <= 1 {
-		for i := range out {
-			out[i] = 0
-		}
+		clear(out)
 		return
 	}
-	ls := flog2(sum)
+	ls := fastLog2(sum)
 	for i, v := range pop {
-		out[i] = float32(ls - flog2(v))
+		out[i] = ls - fastLog2(v)
 	}
 }
 
-func (m *costModel) build(xsize, cacheBits int, refs []pixOrCopy, h *histo, hs *histoSet) {
+func (m *costModel) build(xsize int, refs []pixOrCopy, h *histo, hs *histoSet) {
 	hs.clear(h)
 	hs.addRefs(h, refs, xsize)
 	L := hs.litLen
 	d := h.d
 	if cap(m.lit) < L {
-		m.lit = make([]float32, L)
+		m.lit = make([]uint32, L)
 	}
 	m.lit = m.lit[:L]
 	popToBits(d[:L], m.lit)
@@ -320,133 +326,415 @@ func (m *costModel) build(xsize, cacheBits int, refs []pixOrCopy, h *histo, hs *
 	popToBits(d[L+256:L+512], m.blue[:])
 	popToBits(d[L+512:L+768], m.alpha[:])
 	popToBits(d[L+768:L+808], m.dist[:])
-	if cap(m.lenCost) < maxLength+1 {
-		m.lenCost = make([]float32, maxLength+1)
+}
+
+// prefixEncodeBits is libwebp's VP8LPrefixEncodeBits (0 maps to code 0).
+func prefixEncodeBits(v int) (code, nbits int) {
+	if v == 0 {
+		return 0, 0
 	}
-	m.lenCost = m.lenCost[:maxLength+1]
-	for l := 1; l <= maxLength; l++ {
-		code, nb, _ := prefixEncode(l)
-		m.lenCost[l] = m.lit[numLiteralCodes+code] + float32(nb)
+	code, nbits, _ = prefixEncode(v)
+	return
+}
+
+func (m *costModel) lengthCost(length int) int64 {
+	code, nb := prefixEncodeBits(length)
+	return int64(m.lit[numLiteralCodes+code]) + int64(nb)<<log2PrecisionBits
+}
+
+func (m *costModel) distanceCost(planeCode int) int64 {
+	code, nb := prefixEncodeBits(planeCode)
+	return int64(m.dist[code]) + int64(nb)<<log2PrecisionBits
+}
+
+// costInterval is a range [start, end) of pixels whose cost may be lowered
+// to cost by a copy starting at index.
+type costInterval struct {
+	cost            int64
+	start, end, idx int
+	prev, next      *costInterval
+}
+
+type costCacheInterval struct {
+	cost       int64
+	start, end int
+}
+
+const (
+	costCacheIntervalSizeMax = 500
+
+	// A copy found at pixel j <= i+maxLength (see the reach logic in
+	// traceBackwards) covers pixels up to j+maxLength-1, so costs are
+	// written at most costAhead pixels ahead of the current one.
+	costAhead = 2*maxLength + 2
+	costChunk = 4096
+	costRing  = 1 << 15 // > costAhead + costChunk + 1
+	costMask  = costRing - 1
+)
+
+// costManager keeps the minimal copy costs of the pixels ahead as
+// non-overlapping intervals sorted by start (libwebp CostManager). At most
+// costCacheIntervalSizeMax intervals exist at a time; they live in slab.
+type costManager struct {
+	slab      [costCacheIntervalSizeMax]costInterval
+	used      int // slab[:used] have been handed out
+	free      *costInterval
+	head      *costInterval
+	count     int
+	cacheIv   []costCacheInterval
+	costCache []int64
+	// costs holds the cost of pixels [i-1, i+costAhead+costChunk) (i being
+	// the current pixel) in a ring indexed by pixel&costMask: older costs
+	// are never read again.
+	costs    *[costRing]int64
+	n        int
+	initUpTo int // the costs of pixels below initUpTo are initialized
+	dist     []uint16
+}
+
+func (cm *costManager) init(dist []uint16, costs *[costRing]int64, n int, m *costModel) {
+	cm.used = 0
+	cm.free = nil
+	cm.head = nil
+	cm.count = 0
+	cm.dist = dist
+	sz := min(n, maxLength)
+	if cap(cm.costCache) < sz {
+		cm.costCache = make([]int64, sz)
+	}
+	cm.costCache = cm.costCache[:sz]
+	for i := range cm.costCache {
+		cm.costCache[i] = m.lengthCost(i)
+	}
+	cm.cacheIv = cm.cacheIv[:0]
+	cur := costCacheInterval{cost: cm.costCache[0], start: 0, end: 1}
+	for i := 1; i < sz; i++ {
+		if c := cm.costCache[i]; c != cur.cost {
+			cm.cacheIv = append(cm.cacheIv, cur)
+			cur = costCacheInterval{cost: c, start: i}
+		}
+		cur.end = i + 1
+	}
+	cm.cacheIv = append(cm.cacheIv, cur)
+	cm.costs = costs
+	cm.n = n
+	cm.initUpTo = 0
+}
+
+// prepare initializes (to MaxInt64) the costs of the pixels that may be
+// written while processing pixel i.
+func (cm *costManager) prepare(i int) {
+	need := min(i+costAhead, cm.n)
+	if need <= cm.initUpTo {
+		return
+	}
+	end := min(need+costChunk, cm.n)
+	for k := cm.initUpTo; k < end; {
+		// Fill up to the end of the ring or to end.
+		lo := k & costMask
+		c := cm.costs[lo:min(costRing, lo+end-k)]
+		for j := range c {
+			c[j] = math.MaxInt64
+		}
+		k += len(c)
+	}
+	cm.initUpTo = end
+}
+
+func (cm *costManager) updateCost(i, position int, cost int64) {
+	if c := &cm.costs[i&costMask]; *c > cost {
+		*c = cost
+		cm.dist[i] = uint16(i - position + 1)
 	}
 }
 
-func (m *costModel) literalCost(p uint32) float32 {
-	return m.alpha[p>>24] + m.red[(p>>16)&0xff] + m.lit[(p>>8)&0xff] + m.blue[p&0xff]
+func (cm *costManager) updateCostPerInterval(start, end, position int, cost int64) {
+	for i := start; i < end; i++ {
+		cm.updateCost(i, position, cost)
+	}
 }
 
-func (m *costModel) distCost(xsize int, dist int) float32 {
-	code, nb, _ := prefixEncode(distanceToPlaneCode(xsize, dist))
-	return m.dist[code] + float32(nb)
+func (cm *costManager) connect(prev, next *costInterval) {
+	if prev != nil {
+		prev.next = next
+	} else {
+		cm.head = next
+	}
+	if next != nil {
+		next.prev = prev
+	}
+}
+
+func (cm *costManager) pop(iv *costInterval) {
+	if iv == nil {
+		return
+	}
+	cm.connect(iv.prev, iv.next)
+	iv.next = cm.free
+	cm.free = iv
+	cm.count--
+}
+
+// updateCostAtIndex lowers the cost of pixel i with the intervals covering
+// it; with clean, it drops the intervals ending before i.
+func (cm *costManager) updateCostAtIndex(i int, clean bool) {
+	cur := cm.head
+	for cur != nil && cur.start <= i {
+		next := cur.next
+		if cur.end <= i {
+			if clean {
+				cm.pop(cur)
+			}
+		} else if c := &cm.costs[i&costMask]; *c > cur.cost {
+			*c = cur.cost
+			cm.dist[i] = uint16(i - cur.idx + 1)
+		}
+		cur = next
+	}
+}
+
+// positionOrphan links the unlinked interval cur into the list, using prev
+// as a hint.
+func (cm *costManager) positionOrphan(cur, prev *costInterval) {
+	if prev == nil {
+		prev = cm.head
+	}
+	start := cur.start
+	for prev != nil && start < prev.start {
+		prev = prev.prev
+	}
+	for prev != nil && prev.next != nil && prev.next.start < start {
+		prev = prev.next
+	}
+	if prev != nil {
+		cm.connect(cur, prev.next)
+	} else {
+		cm.connect(cur, cm.head)
+	}
+	cm.connect(prev, cur)
+}
+
+func (cm *costManager) insert(hint *costInterval, cost int64, position, start, end int) {
+	if start >= end {
+		return
+	}
+	if cm.count >= costCacheIntervalSizeMax {
+		cm.updateCostPerInterval(start, end, position, cost)
+		return
+	}
+	var iv *costInterval
+	if cm.free != nil {
+		iv = cm.free
+		cm.free = iv.next
+	} else {
+		iv = &cm.slab[cm.used]
+		cm.used++
+	}
+	*iv = costInterval{cost: cost, idx: position, start: start, end: end}
+	cm.positionOrphan(iv, hint)
+	cm.count++
+}
+
+// push adds the contributions of a copy of up to len pixels at position
+// whose distance cost (plus the cost before position) is distCost.
+func (cm *costManager) push(distCost int64, position, length int) {
+	const skipDistance = 10
+	if length < skipDistance {
+		cc := cm.costCache[:length]
+		for k, c := range cc {
+			c += distCost
+			if p := &cm.costs[(position+k)&costMask]; *p > c {
+				*p = c
+				cm.dist[position+k] = uint16(k + 1)
+			}
+		}
+		return
+	}
+	iv := cm.head
+	for _, ci := range cm.cacheIv {
+		if ci.start >= length {
+			break
+		}
+		start := position + ci.start
+		end := position + min(ci.end, length)
+		cost := distCost + ci.cost
+		for iv != nil && iv.start < end {
+			next := iv.next
+			if start >= iv.end {
+				iv = next
+				continue
+			}
+			if cost >= iv.cost {
+				startNew := iv.end
+				cm.insert(iv, cost, position, start, iv.start)
+				start = startNew
+				if start >= end {
+					break
+				}
+				iv = next
+				continue
+			}
+			if start <= iv.start {
+				if iv.end <= end {
+					cm.pop(iv)
+				} else {
+					iv.start = end
+					break
+				}
+			} else {
+				if end < iv.end {
+					endOrig := iv.end
+					iv.end = start
+					cm.insert(iv, iv.cost, iv.idx, end, endOrig)
+					iv = iv.next
+					break
+				}
+				iv.end = start
+			}
+			iv = next
+		}
+		cm.insert(iv, cost, position, start, end)
+	}
 }
 
 // traceBackwards computes cost-optimal references using the matches found by
-// the hash chain and the statistics of an initial parse (refsIn).
+// the hash chain and the statistics of an initial parse (refsIn), like
+// libwebp's VP8LBackwardReferencesTraceBackwards. The returned references
+// use no color cache (applyColorCache converts them).
 func traceBackwards(xsize, n int, argb []uint32, cacheBits int, hc *hashChain,
-	refsIn []pixOrCopy, refsOut []pixOrCopy, quality int, sc *scratch) []pixOrCopy {
+	refsIn []pixOrCopy, refsOut []pixOrCopy, sc *scratch) []pixOrCopy {
 	m := &sc.cm
 	h := sc.tmpHisto(cacheBits)
-	m.build(xsize, cacheBits, refsIn, h, &sc.tmpSet)
+	m.build(xsize, refsIn, h, &sc.tmpSet)
 
-	costs := sc.f32(n + 1)
-	steps := sc.u16(n + 1)
-	inf := float32(math.MaxFloat32)
-	for i := range costs {
-		costs[i] = inf
+	dist := sc.u16(n)
+	cm := &sc.costMgr
+	if sc.costRing == nil {
+		sc.costRing = new([costRing]int64)
 	}
-	costs[0] = 0
+	cm.init(dist, sc.costRing, n, m)
+	costs := cm.costs
 	var cache []uint32
 	shift := uint(32 - cacheBits)
 	if cacheBits > 0 {
 		cache = sc.cacheBuf(1 << uint(cacheBits))
 	}
-	window := 16 + quality/4 // number of short lengths evaluated exhaustively
-	const skipLen = 128      // matches at least this long are taken greedily
-	ol := hc.ol[:n]
 	argb = argb[:n]
-	lenCost := m.lenCost
-	for i := 0; i < n; {
-		c := costs[i]
-		p := argb[i]
-		var lc float32
+	ol := hc.ol[:n]
+	dist = dist[:n]
+	// Literal costs are scaled by 82/100 and cache costs by 68/100 (with
+	// rounding, both positive), as in libwebp.
+	lit := m.lit
+	cacheLit := lit[numLiteralCodes+numLengthCodes:]
+	alpha, red, blue := &m.alpha, &m.red, &m.blue
+	green := (*[256]uint32)(lit[:256])
+	dist[0] = 0
+	offsetPrev, lenPrev := -1, -1
+	var offsetCost int64 = -1
+	firstOffsetIsConstant := -1
+	reach := 0
+	var cacheCost []int64
+	if cacheBits > 0 {
+		cacheCost = sc.cacheCosts(1 << uint(cacheBits))
+		for k := range cacheCost {
+			cacheCost[k] = (int64(cacheLit[k])*68 + 50) / 100
+		}
+	}
+	cm.prepare(0)
+	initUpTo := cm.initUpTo
+	// The cost before pixel 0 is 0; its ring slot (that of the pixel
+	// costRing-1) is reinitialized before that pixel is reached.
+	costs[costMask] = 0
+	for i := 0; i < n; i++ {
+		if i+costAhead > initUpTo {
+			cm.prepare(i)
+			initUpTo = cm.initUpTo
+		}
+		prevCost := costs[(i-1)&costMask]
+		// The pixel as a literal (or cache hit).
+		c := argb[i]
+		v := prevCost
 		if cacheBits > 0 {
-			key := colorCacheHash(p, shift)
-			if cache[key] == p {
-				lc = m.lit[numLiteralCodes+numLengthCodes+int(key)]
+			key := colorCacheHash(c, shift)
+			if cache[key] == c {
+				v += cacheCost[key]
 			} else {
-				lc = m.literalCost(p)
+				cache[key] = c
+				lc := uint64(alpha[c>>24]) + uint64(red[(c>>16)&0xff]) + uint64(green[(c>>8)&0xff]) + uint64(blue[c&0xff])
+				v += int64((lc*82 + 50) / 100)
 			}
 		} else {
-			lc = m.literalCost(p)
+			lc := uint64(alpha[c>>24]) + uint64(red[(c>>16)&0xff]) + uint64(green[(c>>8)&0xff]) + uint64(blue[c&0xff])
+			v += int64((lc*82 + 50) / 100)
 		}
-		if nc := c + lc; nc < costs[i+1] {
-			costs[i+1] = nc
-			steps[i+1] = 1
+		if c := &costs[i&costMask]; *c > v {
+			*c = v
+			dist[i] = 1
 		}
-		v := ol[i]
-		l := int(v & (1<<maxLengthBits - 1))
-		if l >= 2 {
-			base := c + m.distCost(xsize, int(v>>maxLengthBits))
-			kmax := l
-			if kmax > window {
-				kmax = window
-			}
-			for k := 2; k <= kmax; k++ {
-				if nc := base + lenCost[k]; nc < costs[i+k] {
-					costs[i+k] = nc
-					steps[i+k] = uint16(k)
+		// (Pixel 0 has no match: offset and length are 0.)
+		offset := int(ol[i] >> maxLengthBits)
+		length := int(ol[i] & (1<<maxLengthBits - 1))
+		if length >= 2 {
+			if offset != offsetPrev {
+				offsetCost = m.distanceCost(distanceToPlaneCode(xsize, offset))
+				firstOffsetIsConstant = 1
+				cm.push(prevCost+offsetCost, i, length)
+			} else {
+				if firstOffsetIsConstant == 1 {
+					reach = i - 1 + lenPrev - 1
+					firstOffsetIsConstant = 0
 				}
-			}
-			if l > kmax {
-				if nc := base + lenCost[l]; nc < costs[i+l] {
-					costs[i+l] = nc
-					steps[i+l] = uint16(l)
-				}
-			}
-			if l >= skipLen {
-				if cacheBits > 0 {
-					for _, q := range argb[i : i+l] {
-						cache[colorCacheHash(q, shift)] = q
+				if i+length-1 > reach {
+					var lenJ int
+					j := i
+					for ; j <= reach; j++ {
+						if int(ol[j+1]>>maxLengthBits) != offset {
+							lenJ = int(ol[j] & (1<<maxLengthBits - 1))
+							break
+						}
+						lenJ = int(ol[j+1] & (1<<maxLengthBits - 1))
 					}
+					cm.updateCostAtIndex(j-1, false)
+					cm.updateCostAtIndex(j, false)
+					cm.push(costs[(j-1)&costMask]+offsetCost, j, lenJ)
+					reach = j + lenJ - 1
 				}
-				// Force the long match: make sure i+l is reached from i.
-				if costs[i+l] > base+lenCost[l] {
-					costs[i+l] = base + lenCost[l]
-					steps[i+l] = uint16(l)
-				}
-				i += l
-				continue
 			}
 		}
-		if cacheBits > 0 {
-			cache[colorCacheHash(p, shift)] = p
+		if h := cm.head; h != nil && h.start <= i {
+			if h.end > i && (h.next == nil || h.next.start > i) {
+				// Fast path: only the head interval covers i.
+				if c := &costs[i&costMask]; *c > h.cost {
+					*c = h.cost
+					dist[i] = uint16(i - h.idx + 1)
+				}
+			} else {
+				cm.updateCostAtIndex(i, true)
+			}
 		}
-		i++
+		offsetPrev = offset
+		lenPrev = length
 	}
-	// Trace back the chosen steps, storing them in place at the path's end.
-	cnt := 0
-	for pos := n; pos > 0; {
-		s := int(steps[pos])
-		pos -= s
-		cnt++
+
+	// Trace back the chosen path, packing it at the end of dist.
+	p := n
+	for cur := n - 1; cur >= 0; {
+		k := int(dist[cur])
+		p--
+		dist[p] = uint16(k)
+		cur -= k
 	}
-	path := sc.u16b(cnt)
-	k := cnt
-	for pos := n; pos > 0; {
-		s := steps[pos]
-		k--
-		path[k] = s
-		pos -= int(s)
-	}
-	if cap(refsOut) < cnt {
-		refsOut = make([]pixOrCopy, 0, cnt)
+	path := dist[p:]
+	if cap(refsOut) < len(path) {
+		refsOut = make([]pixOrCopy, 0, len(path))
 	}
 	refsOut = refsOut[:0]
 	pos := 0
 	for _, s := range path {
-		if s == 1 {
-			refsOut = append(refsOut, mkLiteral(argb[pos]))
-		} else {
+		if s != 1 {
 			refsOut = append(refsOut, mkCopy(ol[pos]>>maxLengthBits, int(s)))
+		} else {
+			refsOut = append(refsOut, mkLiteral(argb[pos]))
 		}
 		pos += int(s)
 	}

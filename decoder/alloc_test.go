@@ -138,3 +138,23 @@ func TestAlphaDecodedWithVP8Rows(t *testing.T) {
 		}
 	}
 }
+
+// TestHugeScaleOutOfMemory checks that a Scale whose output (or rescaler
+// state) exceeds libwebp's WEBP_MAX_ALLOCABLE_MEMORY fails with
+// VP8_STATUS_OUT_OF_MEMORY before allocating anything, on 64-bit and on
+// 32-bit targets (where it used to overflow an int and panic).
+func TestHugeScaleOutOfMemory(t *testing.T) {
+	for _, file := range []string{"100x150_lossy.webp", "100x150_lossless.webp"} {
+		data := readFile(t, file)
+		for _, scale := range []image.Point{{1 << 29, 1}, {1 << 20, 1 << 20}, {1<<30 - 1, 1}} {
+			d, err := NewDecoder(bytes.NewReader(data), &Options{Scale: image.Rectangle{Max: scale}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = d.Decode()
+			if status.CodeOf(err) != utils.Vp8StatusOutOfMemory {
+				t.Errorf("%s scale %v: got %v, want VP8_STATUS_OUT_OF_MEMORY", file, scale, err)
+			}
+		}
+	}
+}

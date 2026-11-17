@@ -8,13 +8,23 @@ import "math"
 // histo is a view on a flat population array laid out as
 // literal[litLen] | red[256] | blue[256] | alpha[256] | dist[40].
 type histo struct {
-	d        []uint32
-	bitCost  float64
-	litCost  float64
-	redCost  float64
-	blueCost float64
-	used     bool
+	d []uint32
+	// Clustering state (libwebp VP8LHistogram): bitCost is the sum of the
+	// population costs of the 5 codes (without the extra bits), costs the
+	// cost of each code, trivial the single symbol of a code (or
+	// nonTrivialSym) and isUsed whether a code has any symbol. As in
+	// libwebp, trivial and isUsed are propagated (not recomputed) when
+	// histograms are merged.
+	bitCost float64
+	costs   [5]float64
+	trivial [5]int32
+	isUsed  [5]bool
+	binID   int
+	used    bool // the histogram is not empty
 }
+
+// nonTrivialSym marks a code with zero or several symbols.
+const nonTrivialSym = -1
 
 // histoSet owns the storage of several histograms of the same layout.
 type histoSet struct {
@@ -78,6 +88,23 @@ func (s *histoSet) addRef(d []uint32, r pixOrCopy, xsize int) {
 	}
 }
 
+// addRefsRawDist is addRefs with the distances coded as linear distances
+// instead of plane codes. libwebp compares candidate parses with such
+// histograms (VP8LHistogramCreate in GetBackwardReferences, before
+// BackwardReferences2DLocality), which favours short linear distances.
+func (s *histoSet) addRefsRawDist(h *histo, refs []pixOrCopy) {
+	d := h.d
+	L := s.litLen
+	for _, r := range refs {
+		if r.mode() == modeCopy {
+			d[numLiteralCodes+prefixCode(r.length())]++
+			d[L+768+prefixCode(int(r.val))]++
+			continue
+		}
+		s.addRef(d, r, 0)
+	}
+}
+
 func (s *histoSet) addRefs(h *histo, refs []pixOrCopy, xsize int) {
 	d := h.d
 	for _, r := range refs {
@@ -85,51 +112,103 @@ func (s *histoSet) addRefs(h *histo, refs []pixOrCopy, xsize int) {
 	}
 }
 
-// estimate computes and stores the bit cost of h.
+// code returns the population of code k (0 literal, 1 red, 2 blue, 3
+// alpha, 4 distance) of h.
+func (s *histoSet) code(h *histo, k int) []uint32 {
+	L := s.litLen
+	switch k {
+	case 0:
+		return h.d[:L]
+	case 4:
+		return h.d[L+768 : L+808]
+	}
+	return h.d[L+256*(k-1) : L+256*k]
+}
+
+// estimate returns the estimated number of bits to code h, including the
+// extra bits of lengths and distances (libwebp VP8LHistogramEstimateBits).
 func (s *histoSet) estimate(h *histo) float64 {
 	L := s.litLen
 	d := h.d
-	h.litCost = populationCost(d[:L])
-	h.redCost = populationCost(d[L : L+256])
-	h.blueCost = populationCost(d[L+256 : L+512])
-	h.bitCost = h.litCost + h.redCost + h.blueCost +
+	return populationCost(d[:L]) + populationCost(d[L:L+256]) + populationCost(d[L+256:L+512]) +
 		populationCost(d[L+512:L+768]) +
 		populationCost(d[L+768:L+808]) +
 		extraCost(d[numLiteralCodes:numLiteralCodes+numLengthCodes]) +
 		extraCost(d[L+768:L+808])
-	return h.bitCost
 }
 
-// combinedCost returns the cost of a+b, or +Inf when it exceeds limit.
-func (s *histoSet) combinedCost(a, b *histo, limit float64) float64 {
-	L := s.litLen
-	x, y := a.d, b.d
-	c := extraCostCombined(x[numLiteralCodes:numLiteralCodes+numLengthCodes], y[numLiteralCodes:numLiteralCodes+numLengthCodes]) +
-		extraCostCombined(x[L+768:L+808], y[L+768:L+808])
-	c += combinedPopulationCost(x[:L], y[:L])
-	if c > limit {
-		return math.Inf(1)
+// computeCost sets the clustering state of h from its populations (libwebp
+// ComputeHistogramCost).
+func (s *histoSet) computeCost(h *histo) {
+	h.bitCost = 0
+	for k := 0; k < 5; k++ {
+		pop := s.code(h, k)
+		h.costs[k] = populationCost(pop)
+		nz, sym := 0, 0
+		for i, v := range pop {
+			if v != 0 {
+				nz++
+				sym = i
+				if nz > 1 {
+					break
+				}
+			}
+		}
+		h.isUsed[k] = nz > 0
+		h.trivial[k] = nonTrivialSym
+		if nz == 1 {
+			h.trivial[k] = int32(sym)
+		}
+		h.bitCost += h.costs[k]
 	}
-	c += combinedPopulationCost(x[L:L+256], y[L:L+256])
-	if c > limit {
-		return math.Inf(1)
-	}
-	c += combinedPopulationCost(x[L+256:L+512], y[L+256:L+512])
-	if c > limit {
-		return math.Inf(1)
-	}
-	c += combinedPopulationCost(x[L+512:L+768], y[L+512:L+768])
-	if c > limit {
-		return math.Inf(1)
-	}
-	c += combinedPopulationCost(x[L+768:L+808], y[L+768:L+808])
-	if c > limit {
-		return math.Inf(1)
-	}
-	return c
 }
 
-// addInto adds b into a.
+// combinedCost computes the cost of a+b (without extra bits) into costs and
+// returns it, or ok = false if it is not below threshold (libwebp
+// GetCombinedHistogramEntropy).
+func (s *histoSet) combinedCost(a, b *histo, threshold float64, costs *[5]float64) (cost float64, ok bool) {
+	if threshold <= 0 {
+		return 0, false
+	}
+	for k := 0; k < 5; k++ {
+		var c float64
+		switch {
+		case a.trivial[k] != nonTrivialSym && a.trivial[k] == b.trivial[k], !a.isUsed[k] || !b.isUsed[k]:
+			if a.isUsed[k] {
+				c = a.costs[k]
+			} else {
+				c = b.costs[k]
+			}
+		default:
+			c = combinedPopulationCost(s.code(a, k), s.code(b, k))
+		}
+		costs[k] = c
+		cost += c
+		if cost >= threshold {
+			return cost, false
+		}
+	}
+	return cost, true
+}
+
+// addHisto sets out = a + b, propagating the clustering state like libwebp's
+// HistogramAdd (out may be b).
+func addHisto(a, b, out *histo) {
+	x, y, o := a.d, b.d[:len(a.d)], out.d[:len(a.d)]
+	for i := range o {
+		o[i] = x[i] + y[i]
+	}
+	for k := 0; k < 5; k++ {
+		if a.trivial[k] != b.trivial[k] {
+			out.trivial[k] = nonTrivialSym
+		} else {
+			out.trivial[k] = a.trivial[k]
+		}
+		out.isUsed[k] = a.isUsed[k] || b.isUsed[k]
+	}
+}
+
+// addInto adds b into a (data only).
 func addInto(a, b *histo) {
 	x := a.d
 	y := b.d[:len(x)]
@@ -139,11 +218,17 @@ func addInto(a, b *histo) {
 }
 
 // ---- clustering ----
+//
+// The clustering follows libwebp 1.6 (histogram_enc.c) closely, including the
+// order in which histograms are removed from the working set (the last one
+// takes the place of the removed one), since it drives the random pair
+// selection and the final cluster order.
 
 type histoPair struct {
 	i1, i2   int
 	costDiff float64
 	costCmb  float64
+	costs    [5]float64
 }
 
 // pairQueue keeps the best (lowest costDiff) pair at index 0.
@@ -164,29 +249,53 @@ func (pq *pairQueue) pop(k int) {
 	pq.q = pq.q[:last]
 }
 
+// fixPair replaces bad by good in p.
+func fixPair(bad, good int, p *histoPair) {
+	if p.i1 == bad {
+		p.i1 = good
+	}
+	if p.i2 == bad {
+		p.i2 = good
+	}
+	if p.i1 > p.i2 {
+		p.i1, p.i2 = p.i2, p.i1
+	}
+}
+
+// updatePair evaluates the merge of h1 and h2 into p; it fails when the
+// cost difference is not below threshold.
+func updatePair(s *histoSet, h1, h2 *histo, threshold float64, p *histoPair) bool {
+	sum := h1.bitCost + h2.bitCost
+	cmb, ok := s.combinedCost(h1, h2, sum+threshold, &p.costs)
+	if !ok {
+		return false
+	}
+	p.costCmb = cmb
+	p.costDiff = cmb - sum
+	return true
+}
+
 // push evaluates the pair (i1,i2) and inserts it if merging gains more than
 // threshold. Returns the cost difference (0 when not pushed).
-func (pq *pairQueue) push(s *histoSet, hs []histo, i1, i2 int, threshold float64) float64 {
+func (pq *pairQueue) push(s *histoSet, set []*histo, i1, i2 int, threshold float64) float64 {
 	if len(pq.q) >= pq.max {
 		return 0
 	}
 	if i1 > i2 {
 		i1, i2 = i2, i1
 	}
-	a, b := &hs[i1], &hs[i2]
-	sumCost := a.bitCost + b.bitCost
-	cmb := s.combinedCost(a, b, sumCost+threshold)
-	diff := cmb - sumCost
-	if !(diff < threshold) {
+	p := histoPair{i1: i1, i2: i2}
+	if !updatePair(s, set[i1], set[i2], threshold, &p) {
 		return 0
 	}
-	pq.q = append(pq.q, histoPair{i1, i2, diff, cmb})
+	pq.q = append(pq.q, p)
 	pq.updateHead(len(pq.q) - 1)
-	return diff
+	return p.costDiff
 }
 
 const numPartitions = 4
 const binSize = numPartitions * numPartitions * numPartitions
+const maxHistoGreedy = 100
 
 func binID(min, max, v float64) int {
 	r := max - min
@@ -196,8 +305,9 @@ func binID(min, max, v float64) int {
 	return 0
 }
 
+// combineCostFactor is libwebp's GetCombineCostFactor, divided by 100.
 func combineCostFactor(histoSize, quality int) float64 {
-	f := 0.16
+	f := 16
 	if quality < 90 {
 		if histoSize > 256 {
 			f /= 2
@@ -212,16 +322,27 @@ func combineCostFactor(histoSize, quality int) float64 {
 			f /= 2
 		}
 	}
-	return f
+	return float64(f) / 100
 }
 
 type clusterer struct {
-	orig     histoSet // per-tile histograms
-	symbols  []uint16
-	mapping  []int
-	queue    pairQueue
-	binFirst [binSize]int
-	binFail  [binSize]int
+	orig      histoSet // per-tile histograms
+	symbols   []uint16
+	mapping   []int
+	queue     pairQueue
+	set       []*histo // working set; set[:size] are the live histograms
+	size      int
+	combo     *histo // scratch histogram of the entropy-bin combination
+	cacheBits int
+	binFirst  [binSize]int
+	binFail   [binSize]int
+}
+
+// remove removes set[i], replacing it by the last histogram (libwebp
+// HistogramSetRemoveHistogram).
+func (c *clusterer) remove(i int) {
+	c.set[i] = c.set[c.size-1]
+	c.size--
 }
 
 // buildHistoImage computes the clustered histograms for refs. It returns the
@@ -231,6 +352,7 @@ func (c *clusterer) buildHistoImage(xsize, ysize int, refs []pixOrCopy, quality 
 	hx := subSampleSize(xsize, histoBits)
 	hy := subSampleSize(ysize, histoBits)
 	nt := hx * hy
+	c.cacheBits = cacheBits
 	c.orig.init(nt, cacheBits)
 	// Build per-tile histograms.
 	x, y := 0, 0
@@ -248,285 +370,264 @@ func (c *clusterer) buildHistoImage(xsize, ysize int, refs []pixOrCopy, quality 
 	}
 	c.symbols = c.symbols[:nt]
 
-	// Copy non-empty histograms into the working set.
+	// Analyze the tile histograms and copy the non-empty ones into the
+	// working set (plus one scratch histogram).
 	numUsed := 0
 	for i := range c.orig.h {
 		h := &c.orig.h[i]
-		empty := true
-		for _, v := range h.d {
-			if v != 0 {
-				empty = false
-				break
-			}
-		}
-		h.used = !empty
-		if !empty {
+		c.orig.computeCost(h)
+		h.used = h.isUsed[0] || h.isUsed[1] || h.isUsed[2] || h.isUsed[3] || h.isUsed[4]
+		if h.used {
 			numUsed++
 		}
-	}
-	out.init(numUsed, cacheBits)
-	if cap(c.mapping) < nt {
-		c.mapping = make([]int, nt)
-	}
-	k := 0
-	for i := range c.orig.h {
-		if !c.orig.h[i].used {
-			continue
-		}
-		copy(out.h[k].d, c.orig.h[i].d)
-		out.estimate(&out.h[k])
-		k++
 	}
 	if numUsed == 0 {
 		// Empty image (cannot happen for valid input); single histogram.
 		out.init(1, cacheBits)
-		for i := range c.symbols {
-			c.symbols[i] = 0
-		}
+		clear(c.symbols)
 		return 1
 	}
-	hs := out.h
+	out.init(numUsed+1, cacheBits)
+	if cap(c.set) < numUsed {
+		c.set = make([]*histo, numUsed)
+	}
+	c.set = c.set[:numUsed]
+	k := 0
+	for i := range c.orig.h {
+		o := &c.orig.h[i]
+		if !o.used {
+			continue
+		}
+		h := &out.h[k]
+		copy(h.d, o.d)
+		d := h.d
+		*h = *o
+		h.d = d
+		c.set[k] = h
+		k++
+	}
+	c.size = numUsed
+	c.combo = &out.h[numUsed]
 
 	entropyBins := binSize
 	if lowEffort {
 		entropyBins = numPartitions
 	}
-	if numUsed > 2*entropyBins && quality < 100 {
-		c.entropyBinCombine(out, lowEffort, combineCostFactor(nt, quality))
+	entropyCombine := numUsed > 2*entropyBins && quality < 100
+	if entropyCombine {
+		c.entropyBinCombine(out, entropyBins, lowEffort, combineCostFactor(nt, quality))
 	}
-	if !lowEffort || !(numUsed > 2*entropyBins && quality < 100) {
-		thresholdSize := 1 + (quality*quality*quality*(100-1)+(100*100*100)/2)/(100*100*100)
-		doGreedy := c.stochasticCombine(out, thresholdSize)
-		if doGreedy {
+	if !lowEffort || !entropyCombine {
+		thresholdSize := 1 + (quality*quality*quality*(maxHistoGreedy-1)+(100*100*100)/2)/(100*100*100)
+		if c.stochasticCombine(out, thresholdSize) {
 			c.greedyCombine(out)
 		}
 	}
-	// Compact the used histograms.
-	n := 0
-	for i := range hs {
-		if hs[i].used {
-			if n != i {
-				copy(hs[n].d, hs[i].d)
-				hs[n].bitCost = hs[i].bitCost
-			}
-			hs[n].used = true
-			n++
-		}
-	}
-	out.h = hs[:n]
 	c.remap(out)
 	return len(out.h)
 }
 
-func (c *clusterer) entropyBinCombine(s *histoSet, lowEffort bool, factor float64) {
-	hs := s.h
+// entropyBinCombine merges histograms with similar dominant costs (libwebp
+// HistogramAnalyzeEntropyBin and HistogramCombineEntropyBin).
+func (c *clusterer) entropyBinCombine(s *histoSet, numBins int, lowEffort bool, factor float64) {
+	set := c.set
 	litMin, litMax := math.MaxFloat64, -math.MaxFloat64
 	redMin, redMax := litMin, litMax
 	blueMin, blueMax := litMin, litMax
-	for i := range hs {
-		h := &hs[i]
-		litMin = math.Min(litMin, h.litCost)
-		litMax = math.Max(litMax, h.litCost)
-		redMin = math.Min(redMin, h.redCost)
-		redMax = math.Max(redMax, h.redCost)
-		blueMin = math.Min(blueMin, h.blueCost)
-		blueMax = math.Max(blueMax, h.blueCost)
+	for _, h := range set[:c.size] {
+		litMin = math.Min(litMin, h.costs[0])
+		litMax = math.Max(litMax, h.costs[0])
+		redMin = math.Min(redMin, h.costs[1])
+		redMax = math.Max(redMax, h.costs[1])
+		blueMin = math.Min(blueMin, h.costs[2])
+		blueMax = math.Max(blueMax, h.costs[2])
 	}
-	for i := range c.binFirst {
+	for _, h := range set[:c.size] {
+		b := binID(litMin, litMax, h.costs[0])
+		if !lowEffort {
+			b = b*numPartitions + binID(redMin, redMax, h.costs[1])
+			b = b*numPartitions + binID(blueMin, blueMax, h.costs[2])
+		}
+		h.binID = b
+	}
+	for i := 0; i < numBins; i++ {
 		c.binFirst[i] = -1
 		c.binFail[i] = 0
 	}
-	for i := range hs {
-		h := &hs[i]
-		b := binID(litMin, litMax, h.litCost)
-		if !lowEffort {
-			b = b*numPartitions + binID(redMin, redMax, h.redCost)
-			b = b*numPartitions + binID(blueMin, blueMax, h.blueCost)
-		}
-		f := c.binFirst[b]
-		if f == -1 {
-			c.binFirst[b] = i
+	const maxCombineFailures = 32
+	for idx := 0; idx < c.size; {
+		h := set[idx]
+		b := h.binID
+		first := c.binFirst[b]
+		if first == -1 {
+			c.binFirst[b] = idx
+			idx++
 			continue
 		}
-		first := &hs[f]
+		f := set[first]
 		if lowEffort {
-			addInto(first, h)
-			s.estimate(first)
-			h.used = false
+			addHisto(h, f, f)
+			c.remove(idx)
 			continue
 		}
 		thresh := -h.bitCost * factor
-		sumCost := first.bitCost + h.bitCost
-		cmb := s.combinedCost(first, h, sumCost+thresh)
-		if cmb-sumCost < thresh {
-			addInto(first, h)
-			first.bitCost = cmb
-			// Keep per-channel costs roughly up to date for later bins.
-			h.used = false
+		sum := f.bitCost + h.bitCost
+		combo := c.combo
+		cmb, ok := s.combinedCost(f, h, sum+thresh, &combo.costs)
+		if !ok {
+			idx++
+			continue
+		}
+		addHisto(f, h, combo)
+		combo.bitCost = cmb
+		// Merge only if the combination is trivial or both histograms are
+		// already non-trivial (unless merges keep failing for this bin).
+		try := combo.trivial[1] != nonTrivialSym && combo.trivial[2] != nonTrivialSym &&
+			combo.trivial[3] != nonTrivialSym
+		if !try {
+			try = (h.trivial[1] == nonTrivialSym || h.trivial[2] == nonTrivialSym || h.trivial[3] == nonTrivialSym) &&
+				(f.trivial[1] == nonTrivialSym || f.trivial[2] == nonTrivialSym || f.trivial[3] == nonTrivialSym)
+		}
+		if try || c.binFail[b] >= maxCombineFailures {
+			set[first], c.combo = combo, f
+			c.remove(idx)
+		} else {
+			c.binFail[b]++
+			idx++
+		}
+	}
+	if lowEffort {
+		for _, h := range set[:c.size] {
+			s.computeCost(h)
 		}
 	}
 }
 
-// myRand is libwebp's MyRand LCG.
+// myRand is libwebp's MyRand Lehmer generator.
 func myRand(seed *uint32) uint32 {
-	*seed = (*seed * 16807) & 0xffffffff
-	if *seed == 0 {
-		*seed = 1
-	}
+	*seed = uint32(uint64(*seed) * 48271 % 2147483647)
 	return *seed
 }
 
 // stochasticCombine merges random pairs until the number of histograms is
 // below minClusterSize. Returns whether a greedy pass should follow.
 func (c *clusterer) stochasticCombine(s *histoSet, minClusterSize int) bool {
-	hs := s.h
-	idx := c.mapping[:0]
-	for i := range hs {
-		if hs[i].used {
-			idx = append(idx, i)
-		}
-	}
-	numUsed := len(idx)
-	if numUsed < minClusterSize {
+	if c.size < minClusterSize {
 		return true
 	}
+	set := c.set
 	const queueSize = 9
-	c.queue.q = c.queue.q[:0]
-	c.queue.max = queueSize
+	pq := &c.queue
+	pq.q = pq.q[:0]
+	pq.max = queueSize
 	seed := uint32(1)
-	outerIters := numUsed
+	outerIters := c.size
 	numTriesNoSuccess := outerIters / 2
 	triesNoSuccess := 0
-	for iter := 0; iter < outerIters && numUsed >= minClusterSize; iter++ {
+	for iter := 0; iter < outerIters && c.size >= minClusterSize; iter++ {
 		triesNoSuccess++
 		if triesNoSuccess >= numTriesNoSuccess {
 			break
 		}
 		bestCost := 0.0
-		if len(c.queue.q) > 0 {
-			bestCost = c.queue.q[0].costDiff
+		if len(pq.q) > 0 {
+			bestCost = pq.q[0].costDiff
 		}
-		randRange := uint32((numUsed - 1) * numUsed)
-		numTries := numUsed / 2
-		for j := 0; numUsed >= 2 && j < numTries; j++ {
+		randRange := uint32((c.size - 1) * c.size)
+		numTries := c.size / 2
+		for j := 0; c.size >= 2 && j < numTries; j++ {
 			t := myRand(&seed) % randRange
-			i1 := t / uint32(numUsed-1)
-			i2 := t % uint32(numUsed-1)
+			i1 := t / uint32(c.size-1)
+			i2 := t % uint32(c.size-1)
 			if i2 >= i1 {
 				i2++
 			}
-			cur := c.queue.push(s, hs, idx[i1], idx[i2], bestCost)
+			cur := pq.push(s, set, int(i1), int(i2), bestCost)
 			if cur < 0 {
 				bestCost = cur
-				if len(c.queue.q) == c.queue.max {
+				if len(pq.q) == pq.max {
 					break
 				}
 			}
 		}
-		if len(c.queue.q) == 0 {
+		if len(pq.q) == 0 {
 			continue
 		}
-		b1, b2 := c.queue.q[0].i1, c.queue.q[0].i2
-		// Remove b2 from idx.
-		for k := range idx {
-			if idx[k] == b2 {
-				copy(idx[k:], idx[k+1:])
-				idx = idx[:len(idx)-1]
-				break
-			}
-		}
-		addInto(&hs[b1], &hs[b2])
-		hs[b1].bitCost = c.queue.q[0].costCmb
-		hs[b2].used = false
-		numUsed--
-		for j := 0; j < len(c.queue.q); {
-			p := &c.queue.q[j]
+		b1, b2 := pq.q[0].i1, pq.q[0].i2
+		addHisto(set[b2], set[b1], set[b1])
+		set[b1].bitCost = pq.q[0].costCmb
+		set[b1].costs = pq.q[0].costs
+		c.remove(b2)
+		for j := 0; j < len(pq.q); {
+			p := &pq.q[j]
 			is1 := p.i1 == b1 || p.i1 == b2
 			is2 := p.i2 == b1 || p.i2 == b2
 			if is1 && is2 {
-				c.queue.pop(j)
+				pq.pop(j)
 				continue
 			}
-			eval := false
-			if is1 {
-				p.i1 = b1
-				eval = true
-			} else if is2 {
-				p.i2 = b1
-				eval = true
-			}
-			if p.i1 > p.i2 {
-				p.i1, p.i2 = p.i2, p.i1
-			}
-			if eval {
-				a, b := &hs[p.i1], &hs[p.i2]
-				sumCost := a.bitCost + b.bitCost
-				cmb := s.combinedCost(a, b, sumCost)
-				p.costCmb = cmb
-				p.costDiff = cmb - sumCost
-				if !(p.costDiff < 0) {
-					c.queue.pop(j)
+			if is1 || is2 {
+				fixPair(b2, b1, p)
+				if !updatePair(s, set[p.i1], set[p.i2], 0, p) {
+					pq.pop(j)
 					continue
 				}
 			}
-			c.queue.updateHead(j)
+			fixPair(c.size, b2, p)
+			pq.updateHead(j)
 			j++
 		}
 		triesNoSuccess = 0
 	}
-	return numUsed <= minClusterSize
+	return c.size <= minClusterSize
 }
 
 // greedyCombine repeatedly merges the best pair while it reduces the cost.
 func (c *clusterer) greedyCombine(s *histoSet) {
-	hs := s.h
-	n := len(hs)
-	c.queue.q = c.queue.q[:0]
-	c.queue.max = n * n
-	if cap(c.queue.q) < 64 {
-		c.queue.q = make([]histoPair, 0, 64)
-	}
+	set := c.set
+	n := c.size
+	pq := &c.queue
+	pq.q = pq.q[:0]
+	pq.max = n * n
 	for i := 0; i < n; i++ {
-		if !hs[i].used {
-			continue
-		}
 		for j := i + 1; j < n; j++ {
-			if !hs[j].used {
-				continue
-			}
-			c.queue.push(s, hs, i, j, 0)
+			pq.push(s, set, i, j, 0)
 		}
 	}
-	for len(c.queue.q) > 0 {
-		i1, i2 := c.queue.q[0].i1, c.queue.q[0].i2
-		addInto(&hs[i1], &hs[i2])
-		hs[i1].bitCost = c.queue.q[0].costCmb
-		hs[i2].used = false
-		for k := 0; k < len(c.queue.q); {
-			p := &c.queue.q[k]
+	for len(pq.q) > 0 {
+		i1, i2 := pq.q[0].i1, pq.q[0].i2
+		addHisto(set[i2], set[i1], set[i1])
+		set[i1].bitCost = pq.q[0].costCmb
+		set[i1].costs = pq.q[0].costs
+		c.remove(i2)
+		for k := 0; k < len(pq.q); {
+			p := &pq.q[k]
 			if p.i1 == i1 || p.i2 == i1 || p.i1 == i2 || p.i2 == i2 {
-				c.queue.pop(k)
+				pq.pop(k)
 			} else {
-				c.queue.updateHead(k)
+				fixPair(c.size, i2, p)
+				pq.updateHead(k)
 				k++
 			}
 		}
-		for k := 0; k < n; k++ {
-			if k == i1 || !hs[k].used {
+		for k := 0; k < c.size; k++ {
+			if k == i1 {
 				continue
 			}
-			c.queue.push(s, hs, i1, k, 0)
+			pq.push(s, set, i1, k, 0)
 		}
 	}
 }
 
-// remap assigns each tile histogram to the best final cluster, renumbers
-// clusters by first use and recomputes the final histograms.
+// remap assigns each tile histogram to the best final cluster (libwebp
+// HistogramRemap), renumbers the clusters by first use (dropping the
+// unused ones) and recomputes the final histograms into out.
 func (c *clusterer) remap(out *histoSet) {
-	hs := out.h
+	set := c.set[:c.size]
 	syms := c.symbols
 	orig := c.orig.h
-	if len(hs) > 1 {
+	if len(set) > 1 {
+		var costs [5]float64
 		for i := range orig {
 			if !orig[i].used {
 				if i > 0 {
@@ -538,26 +639,22 @@ func (c *clusterer) remap(out *histoSet) {
 			}
 			best := 0
 			bestBits := math.MaxFloat64
-			for k := range hs {
-				limit := bestBits + hs[k].bitCost
-				cmb := out.combinedCost(&hs[k], &orig[i], limit)
-				cur := cmb - hs[k].bitCost
-				if k == 0 || cur < bestBits {
-					bestBits = cur
+			for k, h := range set {
+				cmb, ok := out.combinedCost(h, &orig[i], h.bitCost+bestBits, &costs)
+				if ok {
+					bestBits = cmb - h.bitCost
 					best = k
 				}
 			}
 			syms[i] = uint16(best)
 		}
 	} else {
-		for i := range syms {
-			syms[i] = 0
-		}
+		clear(syms)
 	}
 	// Renumber by first appearance; drop clusters nobody maps to.
-	order := c.mapping[:len(hs)]
-	for i := range order {
-		order[i] = -1
+	order := c.mapping[:0]
+	for range set {
+		order = append(order, -1)
 	}
 	n := 0
 	for i, sym := range syms {
@@ -567,10 +664,8 @@ func (c *clusterer) remap(out *histoSet) {
 		}
 		syms[i] = uint16(order[sym])
 	}
-	out.h = out.h[:n]
-	for i := range out.data[:n*out.stride] {
-		out.data[i] = 0
-	}
+	c.mapping = order
+	out.init(n, c.cacheBits)
 	for i := range orig {
 		if orig[i].used {
 			addInto(&out.h[syms[i]], &orig[i])

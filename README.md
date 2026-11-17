@@ -15,9 +15,14 @@ no assembly, no dependencies outside the standard library.
   upsampling, `NoFancyUpsampling`, `BypassFiltering`, dithering, alpha
   dithering, cropping and flipping. Scaling uses libwebp's rescaler.
 - Encoder follows libwebp's algorithms (segmentation, RD-optimised mode
-  decision, trellis quantization, LZ77/color cache/meta-Huffman for lossless):
-  output size and quality are within a fraction of a percent of `cwebp` at the
-  same settings, but the bytes are not identical.
+  decision, trellis quantization, LZ77/color cache/meta-Huffman for lossless),
+  but the bytes are not identical to `cwebp`'s. Measured against cwebp 1.6.0
+  at the same settings (`go test -tags interop -run VsCwebp -v
+  ./internal/vp8enc`, two test photos, quality 10–100): lossy methods 4 and 6
+  are within −0.8%…+0.3% of cwebp's size at the same PSNR (±0.01 dB);
+  method 0 files are 0.1–9% smaller (up to 41% at quality 100) at a PSNR
+  within 0.05 dB. Lossless output is 0.2% (level 6) to 1.2% (level 0) larger
+  than cwebp's on the benchmark photo (see below).
 - Streaming decoder working one macroblock row at a time, pooled scratch
   buffers, zero copies for the common "decode the whole picture" case.
 - Works everywhere Go does, including `CGO_ENABLED=0`, cross compilation and
@@ -56,26 +61,34 @@ func main() {
 	if err != nil {
 		log.Fatalln(err)
 	}
-
-	output, err := os.Create("example/output_decode.jpg")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer output.Close()
+	defer file.Close()
 
 	img, err := webp.Decode(file, &decoder.Options{})
 	if err != nil {
 		log.Fatalln(err)
 	}
 
-	if err = jpeg.Encode(output, img, &jpeg.Options{Quality:75}); err != nil {
+	if err := os.MkdirAll("example", 0o755); err != nil {
+		log.Fatalln(err)
+	}
+	output, err := os.Create("example/output_decode.jpg")
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	if err := jpeg.Encode(output, img, &jpeg.Options{Quality: 75}); err != nil {
+		output.Close()
+		log.Fatalln(err)
+	}
+	if err := output.Close(); err != nil {
 		log.Fatalln(err)
 	}
 }
 ```
 
+From the repository root:
 ```bash
-go run _examples/decode/main.go
+go run ./_examples/decode
 ```
 
 Importing `github.com/kolesa-team/go-webp/v2/webp` also registers the format
@@ -100,36 +113,50 @@ func main() {
 	if err != nil {
 		log.Fatalln(err)
 	}
+	defer file.Close()
 
 	img, err := jpeg.Decode(file)
 	if err != nil {
 		log.Fatalln(err)
 	}
 
-	output, err := os.Create("example/output_decode.webp")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer output.Close()
-
 	options, err := encoder.NewLossyEncoderOptions(encoder.PresetDefault, 75)
 	if err != nil {
 		log.Fatalln(err)
 	}
 
+	if err := os.MkdirAll("example", 0o755); err != nil {
+		log.Fatalln(err)
+	}
+	output, err := os.Create("example/output_encode.webp")
+	if err != nil {
+		log.Fatalln(err)
+	}
+
 	if err := webp.Encode(output, img, options); err != nil {
+		output.Close()
+		log.Fatalln(err)
+	}
+	if err := output.Close(); err != nil {
 		log.Fatalln(err)
 	}
 }
 ```
+
+From the repository root:
 ```bash
-go run _examples/encode/main.go
+go run ./_examples/encode
 ```
 
 Lossless: `encoder.NewLosslessEncoderOptions(encoder.PresetDefault, level)`
 with `level` from 0 (fastest) to 9 (smallest), like `cwebp -z`.
 
 ## Migrating from v1
+
+The v1 (cgo) line is tagged `v1.0.5`. Note that the last v1 commit on
+`master`, `64776d9` ("fix: add missing cgo linker flags for Windows"), is
+**not** part of `v1.0.5`: tag it `v1.0.6` before merging v2, so that v1 users
+on Windows can get the fix with `go get github.com/kolesa-team/go-webp@v1.0.6`.
 
 v2 keeps the v1 API: the same packages, types, fields, constants, functions
 and option semantics (presets, lossless levels, `Crop`/`Scale` conventions,
@@ -144,9 +171,10 @@ error messages such as `cannot decode picture: VP8_STATUS_BITSTREAM_ERROR` or
    not be used outside the packages. They now return the pure Go
    `*encoder.Config` / `*decoder.Config`, with the same fields as libwebp's
    structures and the same validation (`WebPValidateConfig`).
-4. The encoder produces valid WebP files of the same size and quality as
-   libwebp, but not the same bytes. Tests comparing encoder output with files
-   produced by libwebp need to compare decoded pixels instead.
+4. The encoder produces valid WebP files of about the same size and quality
+   as libwebp (see the measurements above), but not the same bytes. Tests
+   comparing encoder output with files produced by libwebp need to compare
+   decoded pixels instead. Decoded pixels are bit-identical to v1's.
 
 Other differences worth knowing:
 
@@ -159,10 +187,31 @@ Other differences worth knowing:
 - New helper `webp.GetFeatures(io.Reader)` returns `utils.BitstreamFeatures`
   without decoding.
 - `*image.YCbCr` sources (e.g. from `image/jpeg`) are encoded lossy directly
-  from their Y'CbCr planes; `*image.RGBA`, `*image.Gray`, `*image.Paletted` and
-  `*image.NYCbCrA` are converted without the generic per-pixel path.
+  from their Y'CbCr planes (rescaled from full to studio range) instead of
+  going through RGB like v1, so the encoded result is slightly different
+  from v1's for the same JPEG; `*image.RGBA`, `*image.Gray`,
+  `*image.Paletted` and `*image.NYCbCrA` are converted without the generic
+  per-pixel path.
+- As in v1, `encoder.NewEncoder` takes a snapshot of the source: changing the
+  pixels of the source after `NewEncoder` does not change what `Encode`
+  writes, except for an `*image.NRGBA`, which (as in v1) is used in place
+  until `Encode` returns.
 - `Options.ShowCompressed` and `Options.UseDeltaPalette` are accepted and have
-  no effect; `Options.LowMemory` only affects the lossless encoder.
+  no effect. `Options.LowMemory` does not reduce the lossy encoder's memory
+  use; as in libwebp it re-enables `Options.Partitions` (more than one token
+  partition) at `Method` >= 3, where libwebp and v2 otherwise write a single
+  partition.
+- As in libwebp, a NaN `Quality` or `TargetPsnr` passes validation; a NaN
+  lossy quality encodes at the finest quantizer (like quality 100).
+- `UseThreads` (decoder) and `ThreadLevel` (encoder) use goroutines instead
+  of libwebp's worker threads; outputs do not depend on them.
+- Allocations are limited like libwebp's `WEBP_MAX_ALLOCABLE_MEMORY`
+  (16 GiB on 64-bit targets, just under 2 GiB on 32-bit ones): a `Scale` or
+  crop whose output would exceed it fails with `VP8_STATUS_OUT_OF_MEMORY`.
+- Raw VP8/VP8L bitstreams without a RIFF header are accepted by
+  `decoder.NewDecoder`, `webp.Decode`, `webp.DecodeConfig` and
+  `webp.GetFeatures`, as in libwebp; `image.Decode` / `image.DecodeConfig`
+  only recognize RIFF files (same registered magic as v1).
 
 ## Benchmarks
 
@@ -175,7 +224,7 @@ C heap is not visible to the Go benchmark).
 | Decode lossy 675x900 (`m4_q75.webp`) | 3.1 ms, 2.57 MB, 22 allocs | 7.4 ms, 2.50 MB, 11 allocs |
 | ↳ with `UseThreads` | | 4.7 ms, 2.50 MB, 16 allocs |
 | Decode lossy+alpha 3000x2000 (`webp-logo-lossy.webp`) | 11.1 ms, 24.2 MB, 23 allocs | 26.3 ms, 24.5 MB, 14 allocs |
-| ↳ with `UseThreads` | | 22.1 ms, 28 MB, 35 allocs |
+| ↳ with `UseThreads` | | 20.2 ms, 25.2 MB, 28 allocs |
 | Decode lossless 3000x2000 (`webp-logo-lossless.webp`) | 5.9 ms, 24.2 MB, 23 allocs | 6.8 ms, 25.2 MB, 13 allocs |
 | Encode lossy q75, 960x1280 JPEG source | 66 ms, 117 858 bytes | 138 ms, 117 918 bytes, 0.9 MB, 11 allocs |
 | Encode lossless level 6, same source | 395 ms, 1 098 384 bytes | 386 ms, 1 100 216 bytes |

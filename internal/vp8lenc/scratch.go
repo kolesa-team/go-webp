@@ -4,20 +4,23 @@ import "sync"
 
 // scratch holds all reusable buffers of one encoding goroutine.
 type scratch struct {
-	hc     hashChain
-	refs   [4][]pixOrCopy
-	cm     costModel
-	tmpSet histoSet
-	clus   clusterer
-	out    histoSet
-	huff   huffScratch
-	lens   []uint8
-	codes  []uint16
-	hcodes []huffCode
+	hc      hashChain
+	hcBox   hashChain // matches of the box LZ77 parse
+	counts  []uint16  // pixel repetition counts (box LZ77)
+	refs    [4][]pixOrCopy
+	cm      costModel
+	costMgr costManager
+	tmpSet  histoSet
+	clus    clusterer
+	out     histoSet
+	huff    huffScratch
+	lens    []uint8
+	codes   []uint16
+	hcodes  []huffCode
 
-	f32buf   []float32
+	costRing *[costRing]int64 // trace backwards costs
+	ccost    []int64
 	u16buf   []uint16
-	u16bbuf  []uint16
 	cache    []uint32
 	u32abuf  []uint32
 	resid    []uint32
@@ -26,7 +29,9 @@ type scratch struct {
 	rowb     []uint32
 	idxRow   []uint8
 	md       []uint8
-	h4a, h4b histo4
+	predMode []uint32 // mode images of all the samplings (predSearch)
+	predHist []histo4 // per sampling and mode residual histograms
+	predAccH []histo4 // per sampling accumulated histograms
 	tile     tilePixels
 
 	bwTmp [2]bitWriter
@@ -68,25 +73,11 @@ func (s *scratch) child() *scratch {
 	return s.sub
 }
 
-func (s *scratch) f32(n int) []float32 {
-	if cap(s.f32buf) < n {
-		s.f32buf = make([]float32, n)
-	}
-	return s.f32buf[:n]
-}
-
 func (s *scratch) u16(n int) []uint16 {
 	if cap(s.u16buf) < n {
 		s.u16buf = make([]uint16, n)
 	}
 	return s.u16buf[:n]
-}
-
-func (s *scratch) u16b(n int) []uint16 {
-	if cap(s.u16bbuf) < n {
-		s.u16bbuf = make([]uint16, n)
-	}
-	return s.u16bbuf[:n]
 }
 
 func (s *scratch) u32a(n int) []uint32 {
@@ -164,4 +155,38 @@ func (s *scratch) maxDiffs(n int) []uint8 {
 		s.md = make([]uint8, n)
 	}
 	return s.md[:n]
+}
+
+func (s *scratch) predModeBuf(n int) []uint32 {
+	if cap(s.predMode) < n {
+		s.predMode = make([]uint32, n)
+	}
+	return s.predMode[:n]
+}
+
+// predHistos returns n cleared histograms.
+func (s *scratch) predHistos(n int) []histo4 {
+	if cap(s.predHist) < n {
+		s.predHist = make([]histo4, n)
+	}
+	h := s.predHist[:n]
+	clear(h)
+	return h
+}
+
+// predAcc returns n cleared histograms.
+func (s *scratch) predAcc(n int) []histo4 {
+	if cap(s.predAccH) < n {
+		s.predAccH = make([]histo4, n)
+	}
+	h := s.predAccH[:n]
+	clear(h)
+	return h
+}
+
+func (s *scratch) cacheCosts(n int) []int64 {
+	if cap(s.ccost) < n {
+		s.ccost = make([]int64, n)
+	}
+	return s.ccost[:n]
 }

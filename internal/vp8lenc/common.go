@@ -32,7 +32,12 @@ const (
 	maxHuffImageSize = 2600
 	minHuffmanBits   = 2
 	maxHuffmanBits   = 9
-	maxTransformBits = 6
+	minTransformBits = 2
+	maxTransformBits = 9 // MIN_TRANSFORM_BITS + (1 << NUM_TRANSFORM_BITS) - 1
+
+	// maxPredictorImageSize bounds the size of the predictor image (in
+	// tiles) when choosing its sampling.
+	maxPredictorImageSize = 1 << 14
 
 	argbBlack = 0xff000000
 

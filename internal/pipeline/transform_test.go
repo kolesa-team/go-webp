@@ -4,6 +4,7 @@ import (
 	"image"
 	"math/rand"
 	"runtime"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -198,6 +199,45 @@ func TestInvalidParams(t *testing.T) {
 	}
 	_, _, err := NewSink(Params{SrcW: 10, SrcH: 10, ScaleW: 1 << 20, ScaleH: 1 << 20})
 	assert.Equal(t, utils.Vp8StatusOutOfMemory, status.CodeOf(err))
+}
+
+// TestAllocationLimit checks that output images and rescalers above
+// libwebp's WEBP_MAX_ALLOCABLE_MEMORY are refused with OutOfMemory instead
+// of being allocated (on 32-bit targets image.NewNRGBA would panic), using
+// a lowered limit.
+func TestAllocationLimit(t *testing.T) {
+	if strconv.IntSize == 64 {
+		assert.Equal(t, uint64(1)<<34, maxAllocableMemory)
+	} else {
+		assert.Equal(t, uint64(1)<<31-1<<16, maxAllocableMemory)
+	}
+	defer func(old uint64) { maxOutputBytes = old }(maxOutputBytes)
+	maxOutputBytes = 40 * 30 * 4
+
+	for _, p := range []Params{
+		{SrcW: 40, SrcH: 31},
+		{SrcW: 41, SrcH: 30, Flip: true},
+		{SrcW: 100, SrcH: 100, Crop: image.Rect(0, 0, 41, 30)},
+		{SrcW: 10, SrcH: 10, ScaleW: 40, ScaleH: 31},
+		{SrcW: 10, SrcH: 10, ScaleW: 41, ScaleH: 0}, // height derived: 41
+		// The rescaler state (36 bytes per output column) is too large,
+		// although the 4 bytes/pixel output fits.
+		{SrcW: 10, SrcH: 10, ScaleW: 134, ScaleH: 1},
+	} {
+		_, _, err := NewSink(p)
+		assert.Equal(t, utils.Vp8StatusOutOfMemory, status.CodeOf(err), "%+v", p)
+	}
+	for _, p := range []Params{
+		{SrcW: 40, SrcH: 30},
+		{SrcW: 100, SrcH: 100, Crop: image.Rect(10, 10, 50, 40), Flip: true},
+		{SrcW: 10, SrcH: 10, ScaleW: 40, ScaleH: 30},
+		{SrcW: 10, SrcH: 10, ScaleW: 133, ScaleH: 1},
+	} {
+		sink, result, err := NewSink(p)
+		require.NoError(t, err, "%+v", p)
+		require.NotNil(t, sink)
+		require.NotNil(t, result)
+	}
 }
 
 func TestCropFromV1(t *testing.T) {

@@ -24,7 +24,6 @@ package encoder
 import (
 	"errors"
 	"fmt"
-	"math"
 )
 
 // Default libwebp image hints
@@ -132,7 +131,9 @@ type Config struct {
 	// Preprocessing in [0, 7]: bit 0 segment smoothing, bit 1 dithering,
 	// bit 2 sharp YUV conversion (lossy).
 	Preprocessing int
-	// Partitions is log2 of the number of token partitions in [0, 3] (lossy).
+	// Partitions is log2 of the number of token partitions in [0, 3]
+	// (lossy). As in libwebp it is ignored (a single partition is written)
+	// for Method >= 3 unless LowMemory is set.
 	Partitions int
 	// PartitionLimit in [0, 100] allows quality degradation to fit the
 	// 512k limit on the first partition (lossy).
@@ -141,7 +142,9 @@ type Config struct {
 	EmulateJPEGSize bool
 	// ThreadLevel allows the encoder to use more than one goroutine.
 	ThreadLevel bool
-	// LowMemory reduces memory usage at some cost in speed or size.
+	// LowMemory reduces memory usage at some cost in speed or size
+	// (lossless). For lossy coding it only re-enables Partitions at
+	// Method >= 3, as libwebp's low_memory does.
 	LowMemory bool
 	// NearLossless in [0, 100] enables near-lossless preprocessing (100 = off).
 	NearLossless int
@@ -153,13 +156,15 @@ type Config struct {
 	UseSharpYUV bool
 }
 
-// validate reproduces libwebp's WebPValidateConfig.
+// validate reproduces libwebp's WebPValidateConfig. Like libwebp (whose
+// range checks are comparisons that are false for NaN), a NaN Quality or
+// TargetPSNR is accepted: the lossy encoder then codes at the best quality
+// (quantizer index 0), which is what libwebp does.
 func (c *Config) validate() bool {
-	q := float64(c.Quality)
 	switch {
-	case math.IsNaN(q) || c.Quality < 0 || c.Quality > 100,
+	case c.Quality < 0 || c.Quality > 100,
 		c.TargetSize < 0,
-		math.IsNaN(float64(c.TargetPSNR)) || c.TargetPSNR < 0,
+		c.TargetPSNR < 0,
 		c.Method < 0 || c.Method > 6,
 		c.Segments < 1 || c.Segments > 4,
 		c.SNSStrength < 0 || c.SNSStrength > 100,

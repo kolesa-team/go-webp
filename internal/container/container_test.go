@@ -343,3 +343,37 @@ func TestFrameLossless(t *testing.T) {
 	_, err := FrameLossless(make([]byte, LosslessHeaderSize))
 	require.Error(t, err)
 }
+
+// TestGetFeaturesPrefixRawVP8 checks that for a raw VP8 bitstream (whose
+// size, used by the first partition length check, is that of the whole
+// input) GetFeaturesPrefix only reports a final result once the prefix
+// extends past the first partition, and that every final result equals
+// GetFeatures of the whole input.
+func TestGetFeaturesPrefixRawVP8(t *testing.T) {
+	data, err := os.ReadFile("../../test_data/images/m4_q75.webp")
+	require.NoError(t, err)
+	img, err := Parse(data)
+	require.NoError(t, err)
+	raw := img.Chunk()
+	part0 := int(uint32(raw[0])|uint32(raw[1])<<8|uint32(raw[2])<<16) >> 5
+	require.Greater(t, part0, 64, "the first partition must be longer than a small prefix")
+
+	want, err := GetFeatures(raw)
+	require.NoError(t, err)
+	for n := 1; n <= len(raw); n++ {
+		f, done, err := GetFeaturesPrefix(raw[:n])
+		if n <= part0 {
+			require.False(t, done, "prefix %d of %d (first partition %d)", n, len(raw), part0)
+			continue
+		}
+		require.True(t, done, "prefix %d", n)
+		require.NoError(t, err, "prefix %d", n)
+		require.Equal(t, want, f, "prefix %d", n)
+	}
+	// An invalid header is final right away.
+	bad := append([]byte(nil), raw[:64]...)
+	bad[3] = 0
+	_, done, err := GetFeaturesPrefix(bad)
+	assert.True(t, done)
+	assert.Equal(t, utils.Vp8StatusBitstreamError, status.CodeOf(err))
+}

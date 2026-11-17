@@ -233,6 +233,7 @@ func TestEncodeStructure(t *testing.T) {
 		for parts := 0; parts < 4; parts++ {
 			cfg := DefaultConfig()
 			cfg.Partitions = parts
+			cfg.LowMemory = true // multiple partitions at method 4
 			data := encodeNRGBA(t, synthImage(sz[0], sz[1], 0, 1), cfg)
 			f := parseFrame(t, data)
 			if !f.keyFrame || !f.show {
@@ -246,6 +247,42 @@ func TestEncodeStructure(t *testing.T) {
 			}
 			if f.profile != 0 {
 				t.Errorf("profile: got %d want 0", f.profile)
+			}
+		}
+	}
+}
+
+// expectedParts is the number of token partitions libwebp 1.6.0 writes for
+// cfg.
+func expectedParts(cfg *Config) int {
+	if cfg.Method >= 3 && !cfg.LowMemory {
+		return 1
+	}
+	return 1 << cfg.Partitions
+}
+
+// TestPartitionsRule checks the number of token partitions written for each
+// (Method, LowMemory, Partitions) combination against libwebp 1.6.0, whose
+// token path (methods >= 3 without low_memory) always writes a single
+// partition. Expected values verified with webpinfo -bitstream_info on the
+// output of v1 (cgo, libwebp 1.6.0).
+func TestPartitionsRule(t *testing.T) {
+	img := synthImage(64, 48, 0, 1)
+	for m := 0; m <= 6; m++ {
+		for _, lowMem := range []bool{false, true} {
+			for parts := 0; parts <= 3; parts++ {
+				cfg := DefaultConfig()
+				cfg.Method, cfg.LowMemory, cfg.Partitions = m, lowMem, parts
+				want := 1 << parts
+				if m >= 3 && !lowMem {
+					want = 1
+				}
+				if e := expectedParts(&cfg); e != want {
+					t.Fatalf("expectedParts = %d, want %d", e, want)
+				}
+				if got := parseFrame(t, encodeNRGBA(t, img, cfg)).numParts; got != want {
+					t.Errorf("method=%d low_memory=%v partitions=%d: %d partitions, want %d", m, lowMem, parts, got, want)
+				}
 			}
 		}
 	}
@@ -335,7 +372,7 @@ func TestManyConfigs(t *testing.T) {
 			t.Fatalf("config %+v size %v: %v", cfg, sz, err)
 		}
 		f := parseFrame(t, data)
-		if f.width != sz[0] || f.height != sz[1] || f.numParts != 1<<cfg.Partitions {
+		if f.width != sz[0] || f.height != sz[1] || f.numParts != expectedParts(&cfg) {
 			t.Fatalf("config %+v: bad header %+v", cfg, f)
 		}
 	}
@@ -391,7 +428,6 @@ func TestErrors(t *testing.T) {
 	bad := []func(c *Config){
 		func(c *Config) { c.Quality = -1 },
 		func(c *Config) { c.Quality = 101 },
-		func(c *Config) { c.Quality = float32(math.NaN()) },
 		func(c *Config) { c.Method = 7 },
 		func(c *Config) { c.Segments = 0 },
 		func(c *Config) { c.Segments = 5 },

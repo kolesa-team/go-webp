@@ -59,7 +59,7 @@ func FuzzEncode(f *testing.F) {
 			return
 		}
 		fr := parseFrame(t, out)
-		if fr.width != w || fr.height != h || fr.numParts != 1<<cfg.Partitions {
+		if fr.width != w || fr.height != h || fr.numParts != expectedParts(&cfg) {
 			t.Fatalf("bad frame %+v for %dx%d", fr, w, h)
 		}
 		// raw planes with a large stride

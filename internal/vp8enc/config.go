@@ -6,17 +6,19 @@
 // rate-distortion optimised intra mode selection (i16/i4/UV), trellis
 // quantization at methods 5-6, DC error diffusion for chroma, adaptive token
 // probabilities, SSIM-based autofilter and multi-pass rate control towards a
-// target size or PSNR. At equal settings the output size and quality are
-// within a fraction of a percent of cwebp's for methods 1-6.
+// target size or PSNR. At equal settings, methods 4 and 6 produce files
+// within -0.8%..+0.3% of cwebp 1.6.0's size at the same PSNR (+-0.01 dB) on
+// the test photos (TestInteropVsCwebp); method 0 files are smaller.
 //
 // Encode returns the payload of a "VP8 " RIFF chunk; wrapping it into a
 // WebP container (and coding the alpha plane) is left to the caller.
 //
 // Differences from libwebp 1.6.0, all of them producing valid bitstreams:
 //   - All methods code the frame from a token buffer (libwebp does so for
-//     methods >= 3 only, with a single partition). Methods 0-2 therefore get
-//     exact token probabilities, which makes their output smaller than
-//     cwebp's; multiple token partitions are supported with every method.
+//     methods >= 3 without LowMemory only). Methods 0-2 therefore get exact
+//     token probabilities, which makes their output smaller than cwebp's.
+//     The number of token partitions follows libwebp: Partitions is
+//     ignored (one partition) for methods >= 3 unless LowMemory is set.
 //   - The skip flag is used whenever enough macroblocks have no
 //     coefficients (libwebp only uses it for methods 0-2).
 //   - With a single segment, the autofilter result is applied (libwebp
@@ -26,7 +28,8 @@
 //   - Config.Preprocessing bits 1 (dithering) and 2 (sharp YUV) act on the
 //     RGB->YUV conversion, which happens before Encode: use
 //     FromNRGBADithered with DitheringFor(cfg), and sharpYUV for bit 2.
-//   - Config.LowMemory has no effect.
+//   - Config.LowMemory only selects the number of partitions (see above);
+//     it does not change how the frame is coded.
 //
 // Algorithm adapted from libwebp (BSD-3-Clause).
 package vp8enc
@@ -66,14 +69,18 @@ type Config struct {
 	// (dithered RGB->YUV conversion) and 2 (sharp YUV) concern the
 	// conversion done by FromNRGBADithered before Encode and are ignored
 	// here.
-	Preprocessing   int
-	Partitions      int // log2 of the number of token partitions, 0..3
+	Preprocessing int
+	// Partitions is log2 of the number of token partitions, 0..3. As in
+	// libwebp it is ignored (one partition) for Method >= 3 unless
+	// LowMemory is set.
+	Partitions      int
 	PartitionLimit  int // 0..100: quality degradation allowed to fit the 512k limit on partition #0
 	EmulateJPEGSize bool
 	// ThreadLevel allows the analysis pass to run on two goroutines.
 	ThreadLevel bool
 	// LowMemory is accepted for compatibility. The encoder always uses a
-	// compact token buffer, so it has no effect.
+	// compact token buffer; like libwebp's low_memory it only re-enables
+	// multiple partitions (Partitions) for Method >= 3.
 	LowMemory bool
 }
 
@@ -94,13 +101,13 @@ func DefaultConfig() Config {
 
 func (c *Config) validate() error {
 	switch {
-	case c.Quality < 0 || c.Quality > 100 || c.Quality != c.Quality:
+	case c.Quality < 0 || c.Quality > 100: // NaN is accepted, as in libwebp
 		return status.InvalidParam("vp8enc: quality out of range [0,100]")
 	case c.Method < 0 || c.Method > 6:
 		return status.InvalidParam("vp8enc: method out of range [0,6]")
 	case c.TargetSize < 0:
 		return status.InvalidParam("vp8enc: negative target size")
-	case c.TargetPSNR < 0 || c.TargetPSNR != c.TargetPSNR:
+	case c.TargetPSNR < 0: // NaN is accepted (and ignored), as in libwebp
 		return status.InvalidParam("vp8enc: negative target PSNR")
 	case c.Pass > 10:
 		return status.InvalidParam("vp8enc: pass out of range [1,10]")

@@ -41,10 +41,18 @@ const maxDimension = 16383
 type Encoder struct {
 	options *Options
 	config  *Config
-	img     *image.NRGBA
-	// ycc is set instead of img for opaque *image.YCbCr sources encoded
-	// lossy: they are converted straight to the encoder's YUV 4:2:0.
-	ycc *image.YCbCr
+	// img is the picture to encode. Like v1 (which imported the source into
+	// a WebPPicture in NewEncoder), it is a snapshot taken by NewEncoder,
+	// except for an *image.NRGBA source, which is used in place (v1 shared
+	// its pixels too): changes made to any other source after NewEncoder
+	// do not affect Encode.
+	img *image.NRGBA
+	// pic is set instead of img for *image.YCbCr sources encoded lossy:
+	// they are converted in NewEncoder straight to the encoder's YUV 4:2:0
+	// (cheaper than going through NRGBA). Its storage is not pooled, so
+	// nothing needs releasing when Encode is never called, and Encode can
+	// be called more than once.
+	pic *vp8enc.Picture
 	// bounds of the source image
 	bounds image.Rectangle
 }
@@ -71,7 +79,7 @@ func NewEncoder(src image.Image, options *Options) (e *Encoder, err error) {
 	}
 
 	if ycc, ok := src.(*image.YCbCr); ok && !config.Lossless {
-		e.ycc = ycc
+		e.pic = vp8enc.SnapshotYCbCr(ycc)
 	} else {
 		e.img = toNRGBA(src)
 	}
@@ -153,8 +161,8 @@ func (e *Encoder) encodeLossy() ([]byte, error) {
 		alph []byte
 		err  error
 	)
-	if e.ycc != nil {
-		pic = vp8enc.FromYCbCr(e.ycc)
+	if e.pic != nil {
+		pic = e.pic // owned by e, not pooled
 	} else {
 		if hasTransparency(e.img) {
 			if alph, err = encodeAlpha(e.img, c); err != nil {
@@ -163,8 +171,8 @@ func (e *Encoder) encodeLossy() ([]byte, error) {
 		}
 		dithering := vp8enc.DitheringFor(&vp8enc.Config{Quality: c.Quality, Preprocessing: c.Preprocessing})
 		pic = vp8enc.FromNRGBADithered(e.img, c.UseSharpYUV || c.Preprocessing&4 != 0, c.Exact, dithering)
+		defer pic.Release()
 	}
-	defer pic.Release()
 
 	payload, err := vp8enc.Encode(pic, &vp8enc.Config{
 		Quality:         c.Quality,

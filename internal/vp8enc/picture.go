@@ -51,6 +51,23 @@ func newPicture(w, h int) *Picture {
 	}
 }
 
+// unpooledPicture is newPicture with freshly allocated storage that Release
+// does not return to the pool.
+func unpooledPicture(w, h int) *Picture {
+	uvw, uvh := (w+1)>>1, (h+1)>>1
+	ySize := w * h
+	uvSize := uvw * uvh
+	n := ySize + 2*uvSize
+	buf := make([]byte, n)
+	return &Picture{
+		Width: w, Height: h,
+		Y:       buf[:ySize:ySize],
+		U:       buf[ySize : ySize+uvSize : ySize+uvSize],
+		V:       buf[ySize+uvSize : n : n],
+		YStride: w, UVStride: uvw,
+	}
+}
+
 // Release returns the picture's storage to an internal pool. The picture
 // must not be used afterwards. It is safe to call on pictures not created
 // by this package (it then does nothing) and on nil.
@@ -411,13 +428,31 @@ func cleanupTransparentArea(pic *Picture, a []byte, aStride int) {
 // the same fixed-point coefficients as libwebp's RGB->YUV matrix
 // (Y' = 16 + Y*219/255, C' = 128 + (C-128)*224/255). Chroma planes with a
 // subsampling other than 4:2:0 are averaged down to 4:2:0.
+//
+// The returned picture may be pooled: call Release when done with it.
 func FromYCbCr(img *image.YCbCr) *Picture {
+	return fromYCbCr(img, true)
+}
+
+// SnapshotYCbCr is FromYCbCr with storage that is never pooled: the picture
+// can be kept indefinitely (and encoded several times) without a Release,
+// which is then a no-op.
+func SnapshotYCbCr(img *image.YCbCr) *Picture {
+	return fromYCbCr(img, false)
+}
+
+func fromYCbCr(img *image.YCbCr, pooled bool) *Picture {
 	b := img.Rect
 	w, h := b.Dx(), b.Dy()
 	if w <= 0 || h <= 0 {
 		return &Picture{}
 	}
-	pic := newPicture(w, h)
+	var pic *Picture
+	if pooled {
+		pic = newPicture(w, h)
+	} else {
+		pic = unpooledPicture(w, h)
+	}
 	var lumaLUT, chromaLUT [256]uint8
 	for v := 0; v < 256; v++ {
 		lumaLUT[v] = uint8((56318*v + (16 << 16) + (1 << 15)) >> 16)
