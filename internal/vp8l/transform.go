@@ -269,7 +269,6 @@ func inversePredictor(t *transform, y0, y1 int, in, c []uint32, o int) {
 		y0++
 	}
 	bits := t.bits
-	tileW := 1 << bits
 	tilesPerRow := subSampleSize(width, bits)
 	for y := y0; y < y1; y++ {
 		modes := t.data[(y>>bits)*tilesPerRow : (y>>bits+1)*tilesPerRow]
@@ -277,14 +276,25 @@ func inversePredictor(t *transform, y0, y1 int, in, c []uint32, o int) {
 		up := c[o-width : o+1]
 		inr := in[i : i+width]
 		out[0] = addPixels(inr[0], up[0])
-		x := 1
-		for tx := 0; x < width; tx++ {
-			xEnd := min(x&^(tileW-1)+tileW, width)
-			predictRun(modes[tx]>>8&0xf, inr, out, up, x, xEnd)
-			x = xEnd
-		}
+		predictRow(modes, inr, out, up, bits)
 		o += width
 		i += width
+	}
+}
+
+// predictRowGo is the reference of predictRow (dsp_*.go): it undoes the
+// predictor transform for the pixels 1 to len(out)-1 of a row whose pixel
+// 0 is already done, with the mode of each tile of 1<<bits pixels in
+// modes. up is the previous output row extended by out[0] (see
+// predictRun). in may alias out.
+func predictRowGo(modes, in, out, up []uint32, bits int) {
+	width := len(out)
+	tileW := 1 << bits
+	x := 1
+	for tx := 0; x < width; tx++ {
+		xEnd := min(x&^(tileW-1)+tileW, width)
+		predictRun(modes[tx]>>8&0xf, in, out, up, x, xEnd)
+		x = xEnd
 	}
 }
 
@@ -297,37 +307,48 @@ func colorTransformDelta(pred, color int8) int32 {
 func inverseCrossColor(t *transform, y0, y1 int, in, out []uint32) {
 	width := t.xsize
 	bits := t.bits
-	tileW := 1 << bits
 	tilesPerRow := subSampleSize(width, bits)
 	i := 0
 	for y := y0; y < y1; y++ {
 		mults := t.data[(y>>bits)*tilesPerRow : (y>>bits+1)*tilesPerRow]
-		src := in[i : i+width]
-		dst := out[i : i+width]
-		for tx, m := range mults {
-			g2r := int8(m)
-			g2b := int8(m >> 8)
-			r2b := int8(m >> 16)
-			x0 := tx << bits
-			x1 := min(x0+tileW, width)
-			s := src[x0:x1]
-			d := dst[x0:x1]
-			d = d[:len(s)]
-			for k, argb := range s {
-				green := int8(argb >> 8)
-				r := int32(argb>>16) + colorTransformDelta(g2r, green)
-				r &= 0xff
-				b := int32(argb) + colorTransformDelta(g2b, green) + colorTransformDelta(r2b, int8(r))
-				b &= 0xff
-				d[k] = argb&0xff00ff00 | uint32(r)<<16 | uint32(b)
-			}
-		}
+		crossColorRow(mults, in[i:i+width], out[i:i+width], bits)
 		i += width
 	}
 }
 
-// addGreen undoes the subtract-green transform. in may alias out.
-func addGreen(in, out []uint32) {
+// crossColorRowGo is the reference of crossColorRow (dsp_*.go): it undoes
+// the cross-color transform on one row src into dst, with the multipliers
+// of each tile of 1<<bits pixels in mults. src may alias dst.
+func crossColorRowGo(mults, src, dst []uint32, bits int) {
+	width := len(src)
+	dst = dst[:width]
+	tileW := 1 << bits
+	for tx, m := range mults {
+		g2r := int8(m)
+		g2b := int8(m >> 8)
+		r2b := int8(m >> 16)
+		x0 := tx << bits
+		if x0 >= width {
+			break
+		}
+		x1 := min(x0+tileW, width)
+		s := src[x0:x1]
+		d := dst[x0:x1]
+		d = d[:len(s)]
+		for k, argb := range s {
+			green := int8(argb >> 8)
+			r := int32(argb>>16) + colorTransformDelta(g2r, green)
+			r &= 0xff
+			b := int32(argb) + colorTransformDelta(g2b, green) + colorTransformDelta(r2b, int8(r))
+			b &= 0xff
+			d[k] = argb&0xff00ff00 | uint32(r)<<16 | uint32(b)
+		}
+	}
+}
+
+// addGreenGo is the reference of addGreen (dsp_*.go): it undoes the
+// subtract-green transform. in may alias out.
+func addGreenGo(in, out []uint32) {
 	out = out[:len(in)]
 	for i, argb := range in {
 		g := argb >> 8 & 0xff
@@ -420,13 +441,13 @@ func inverseColorIndexAlpha(t *transform, tab *alphaTables, height int, in, out 
 	in = in[:pw*height]
 	out = out[:width*height]
 	for y := 0; y < height; y++ {
-		expandBundledRow(&tab.bundle, t.bits, in[y*pw:(y+1)*pw], out[y*width:(y+1)*width])
+		expandBundledRow(tab, t.bits, in[y*pw:(y+1)*pw], out[y*width:(y+1)*width])
 	}
 }
 
-// lookupBytes sets out[i] = pal[in[i]] (len(out) >= len(in)), 8 bytes per
-// step.
-func lookupBytes(pal *[256]byte, in, out []byte) {
+// lookupBytesGo is the reference of lookupBytes (dsp_*.go): it sets
+// out[i] = pal[in[i]] (len(out) >= len(in)), 8 bytes per step.
+func lookupBytesGo(pal *[256]byte, in, out []byte) {
 	out = out[:len(in)]
 	i := 0
 	for ; i+8 <= len(in); i += 8 {
@@ -442,10 +463,12 @@ func lookupBytes(pal *[256]byte, in, out []byte) {
 	}
 }
 
-// expandBundledRow expands one row of bundled indices (each byte of src
-// holds 1<<bits of them) into the output bytes dst, with one 2-, 4- or
-// 8-byte store per packed byte.
-func expandBundledRow(tab *[256]uint64, bits int, src, dst []byte) {
+// expandBundledRowGo is the reference of expandBundledRow (dsp_*.go): it
+// expands one row of bundled indices (each byte of src holds 1<<bits of
+// them, bits 1 to 3) into the output bytes dst, with one 2-, 4- or 8-byte
+// store per packed byte from a.bundle.
+func expandBundledRowGo(a *alphaTables, bits int, src, dst []byte) {
+	tab := &a.bundle
 	ppb := 1 << bits
 	full := min(len(dst)>>bits, len(src)) // packed bytes expanded whole
 	switch bits {
