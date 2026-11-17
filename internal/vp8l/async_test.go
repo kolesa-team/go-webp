@@ -339,3 +339,33 @@ func TestJobPixels(t *testing.T) {
 	check(t, jobPixels(256*1024, 1<<30) >= 1)
 	check(t, jobPixels(1, 0) == 1)
 }
+
+// FuzzDecodeAsync compares the two-stage decode (forced for every image,
+// with small jobs) with the sequential one on arbitrary streams: the same
+// error, the same rows committed and the same pixels.
+func FuzzDecodeAsync(f *testing.F) {
+	addSeeds(f, func(p []byte, _, _ int) { f.Add(p, uint16(0), uint8(1)) })
+	f.Fuzz(func(t *testing.T, data []byte, need uint16, job uint8) {
+		w, h, _, err := DecodeHeader(data)
+		if err != nil || w*h > 1<<20 {
+			return
+		}
+		n := h
+		if need > 0 {
+			n = min(int(need), h)
+		}
+		ref := &rowSink{img: image.NewNRGBA(image.Rect(0, 0, w, h)), need: n}
+		wantErr := Decode(data, ref)
+		defer workers.SetLimitForTest(workers.SetLimitForTest(2))
+		withAsync(int(job)*w+1, func(*int) {
+			s := &rowSink{img: image.NewNRGBA(image.Rect(0, 0, w, h)), need: n}
+			err := DecodeWithOptions(data, s, &Options{UseThreads: true})
+			if fmt.Sprint(err) != fmt.Sprint(wantErr) {
+				t.Fatalf("error %v, want %v", err, wantErr)
+			}
+			if s.next != ref.next || !bytes.Equal(s.img.Pix, ref.img.Pix) {
+				t.Fatalf("committed %d rows, want %d (or pixels differ)", s.next, ref.next)
+			}
+		})
+	})
+}
