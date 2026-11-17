@@ -36,7 +36,7 @@ Animated WebP is not supported (as in v1, decoding reports
 go get github.com/kolesa-team/go-webp/v2
 ```
 
-Requires Go 1.21 or newer. Nothing else.
+Requires Go 1.27 or newer. Nothing else.
 
 The cgo/libwebp based v1 remains available at tag `v1.0.5` (module path
 `github.com/kolesa-team/go-webp`).
