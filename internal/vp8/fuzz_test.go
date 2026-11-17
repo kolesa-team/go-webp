@@ -42,6 +42,8 @@ func FuzzDecode(f *testing.F) {
 		if ri, err := extractVP8(data); err == nil {
 			f.Add(ri.vp8, uint8(0))
 			f.Add(ri.vp8, uint8(16|4|2))
+			f.Add(ri.vp8, uint8(4))
+			f.Add(ri.vp8, uint8(32|8|4))
 		}
 	}
 	f.Fuzz(func(t *testing.T, data []byte, mode uint8) {
@@ -59,6 +61,10 @@ func FuzzDecode(f *testing.F) {
 		}
 		if mode&8 != 0 {
 			opts.DitheringStrength = 100
+		}
+		if opts.UseThreads {
+			// Small batches, so that small inputs use the helper too.
+			setBatch(t, 1+47*int(mode>>5&1))
 		}
 		if mode&16 != 0 {
 			r := image.Rect(w/3, h/3, w/3+w/2+1, h/3+h/2+1).Intersect(image.Rect(0, 0, w, h))
