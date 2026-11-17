@@ -32,9 +32,14 @@ var pixPool sync.Pool // of *[]byte, NRGBA snapshot storage
 func pooledNRGBA(w, h int) (*image.NRGBA, *[]byte) {
 	n := 4 * w * h
 	var pp *[]byte
-	if p, ok := pixPool.Get().(*[]byte); ok && cap(*p) >= n {
-		pp = p
-	} else {
+	// A picture too large to be pooled leaves the pooled buffers alone
+	// (taking one would discard it).
+	if n <= 4*maxPooledPixels {
+		if p, ok := pixPool.Get().(*[]byte); ok && cap(*p) >= n {
+			pp = p
+		}
+	}
+	if pp == nil {
 		b := make([]byte, n)
 		pp = &b
 	}
