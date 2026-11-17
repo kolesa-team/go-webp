@@ -275,13 +275,7 @@ func (d *Decoder) decodeLossy(parsed *container.Image, cl call) (*image.NRGBA, e
 	// broken VP8 stream never pays for a full-frame alpha decode.
 	var la *lazyAlpha
 	if parsed.ALPH != nil {
-		la = &lazyAlpha{alph: parsed.ALPH, w: w, h: h, crop: crop, dithering: c.AlphaDitheringStrength}
-		// With UseThreads the plane is first needed on the worker
-		// goroutine, while release runs on this one: a sync.Pool Get on
-		// another P misses the plane put back by the previous decode. Take
-		// a pooled plane here (without allocating one: the allocation stays
-		// lazy, see grow).
-		la.prefetch()
+		la = newLazyAlpha(parsed.ALPH, w, h, crop, c)
 		defer la.release()
 		opts.Alpha = la.get
 	}
@@ -328,6 +322,25 @@ type lazyAlpha struct {
 	err     error
 }
 
+// newLazyAlpha returns the alpha decoder of a w x h frame whose output
+// region is crop. It must be released (on the calling goroutine).
+func newLazyAlpha(alph []byte, w, h int, crop image.Rectangle, c *Config) *lazyAlpha {
+	a := &lazyAlpha{alph: alph, w: w, h: h, crop: crop, dithering: c.AlphaDitheringStrength}
+	// With UseThreads the plane is first needed on the worker goroutine,
+	// while release runs on this one: a sync.Pool Get on another P misses
+	// the plane put back by the previous decode. Take a pooled plane here
+	// (without allocating one: the allocation stays lazy, see grow).
+	a.prefetch()
+	if c.UseThreads {
+		// Likewise the lossless alpha decoder (vp8l pools its state): set
+		// it up here, so that it comes from and returns to this goroutine's
+		// pool. An error is kept for the first get, which keeps the VP8
+		// errors that come before the first emitted row first.
+		a.start()
+	}
+	return a
+}
+
 // get returns the alpha plane with at least its first rowEnd rows decoded
 // (the slice may change between calls).
 func (a *lazyAlpha) get(rowEnd int) ([]byte, error) {
@@ -335,8 +348,7 @@ func (a *lazyAlpha) get(rowEnd int) ([]byte, error) {
 		return nil, a.err
 	}
 	if !a.started {
-		a.started = true
-		if a.err = a.init(); a.err != nil {
+		if a.start(); a.err != nil {
 			return nil, a.err
 		}
 	}
@@ -351,6 +363,12 @@ func (a *lazyAlpha) get(rowEnd int) ([]byte, error) {
 		return nil, a.err
 	}
 	return a.plane, nil
+}
+
+// start initializes the alpha decoder, keeping a failure in a.err.
+func (a *lazyAlpha) start() {
+	a.started = true
+	a.err = a.init()
 }
 
 // init validates the ALPH header like libwebp's ALPHInit, which
