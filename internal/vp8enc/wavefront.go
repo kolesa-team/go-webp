@@ -134,6 +134,20 @@ type wfWorker struct {
 	sizeP0, dist uint64
 }
 
+// wfSeen holds the last values of the row above's progress and of the
+// epoch a worker saw: it reads the shared counters again only when it
+// needs more, rather than for every macroblock.
+type wfSeen struct{ above, epoch int32 }
+
+// wfRow is the progress of a row, alone in its cache line (128 bytes on
+// Apple CPUs): the worker of the row writes prog after every macroblock,
+// and only the worker of the row below reads it.
+type wfRow struct {
+	prog atomic.Int32 // macroblocks coded
+	want atomic.Int32 // progress the worker of the row below sleeps for
+	_    [120]byte
+}
+
 // wfSlot holds the coded but not yet committed part of a row.
 type wfSlot struct {
 	tokens   tokenBuffer
@@ -160,8 +174,7 @@ type wfState struct {
 	stopped     atomic.Bool  // interrupted, or a worker panicked
 	interrupted atomic.Bool
 
-	prog  []atomic.Int32 // per row: macroblocks coded
-	want  []atomic.Int32 // per row: progress the worker of the row below sleeps for
+	rows  []wfRow
 	slots []wfSlot
 
 	mu      sync.Mutex
@@ -267,14 +280,13 @@ func (wf *wfState) init(e *encoder, nw int, isLastPass bool, maxCount int) {
 	wf.committed.Store(0)
 	wf.stopped.Store(false)
 	wf.interrupted.Store(false)
-	if cap(wf.prog) < wf.mbH {
-		wf.prog = make([]atomic.Int32, wf.mbH)
-		wf.want = make([]atomic.Int32, wf.mbH)
+	if cap(wf.rows) < wf.mbH {
+		wf.rows = make([]wfRow, wf.mbH)
 	}
-	wf.prog, wf.want = wf.prog[:wf.mbH], wf.want[:wf.mbH]
-	for r := range wf.mbH {
-		wf.prog[r].Store(0)
-		wf.want[r].Store(noWant)
+	wf.rows = wf.rows[:wf.mbH]
+	for r := range wf.rows {
+		wf.rows[r].prog.Store(0)
+		wf.rows[r].want.Store(noWant)
 	}
 	nslots := min(nw+2, wf.mbH)
 	if cap(wf.slots) < nslots {
@@ -334,6 +346,11 @@ func (wf *wfState) run(w *wfWorker) {
 	it := w.it
 	rd := &it.rd
 	nslots := len(wf.slots)
+	// The sums stay in registers rather than in w, next to the other
+	// workers' fields.
+	var sizeP0, dist uint64
+	defer func() { w.sizeP0, w.dist = sizeP0, dist }()
+	var seen wfSeen
 	for {
 		r := int(wf.nextRow.Add(1)) - 1
 		if r >= wf.mbH || wf.stopped.Load() {
@@ -358,17 +375,18 @@ func (wf *wfState) run(w *wfWorker) {
 		s.mbEnd[0] = 0
 		s.lf = s.lf[:0]
 		s.lfPos, s.commitX = 0, 0
+		seen.above = 0
 		it.setRow(r)
 		for x := range wf.mbW {
-			if !wf.awaitMB(w, r, x) {
+			if !wf.awaitMB(w, r, x, &seen) {
 				return
 			}
 			it.importMB()
 			it.decimate(rd, wf.rdOpt)
 			it.recordTokens(rd, &s.tokens, &s.stats)
 			s.mbEnd[x+1] = int32(s.tokens.len())
-			w.sizeP0 += uint64(rd.H)
-			w.dist += uint64(rd.D)
+			sizeP0 += uint64(rd.H)
+			dist += uint64(rd.D)
 			if wf.lf {
 				s.lf = it.appendFilterSSIMs(s.lf)
 			}
@@ -384,7 +402,7 @@ func (wf *wfState) run(w *wfWorker) {
 // coded macroblock x+1 and the cost tables are those of the macroblock's
 // epoch. At a refresh point it refreshes them. It returns false if the
 // pass stopped.
-func (wf *wfState) awaitMB(w *wfWorker, r, x int) bool {
+func (wf *wfState) awaitMB(w *wfWorker, r, x int, seen *wfSeen) bool {
 	epoch := int32(0)
 	if wf.period > 0 {
 		i := r*wf.mbW + x
@@ -394,10 +412,23 @@ func (wf *wfState) awaitMB(w *wfWorker, r, x int) bool {
 		}
 	}
 	need := int32(min(x+2, wf.mbW))
-	if (r == 0 || wf.prog[r-1].Load() >= need) && wf.epoch.Load() >= epoch && !wf.stopped.Load() {
+	if r > 0 && seen.above < need {
+		seen.above = wf.rows[r-1].prog.Load()
+	}
+	if seen.epoch < epoch {
+		seen.epoch = wf.epoch.Load()
+	}
+	if (r == 0 || seen.above >= need) && seen.epoch >= epoch && !wf.stopped.Load() {
 		return true
 	}
-	return wf.await(w, r-1, need, min(int32(x)+wf.gap, int32(wf.mbW)), epoch, 0)
+	if !wf.await(w, r-1, need, min(int32(x)+wf.gap, int32(wf.mbW)), epoch, 0) {
+		return false
+	}
+	if r > 0 {
+		seen.above = wf.rows[r-1].prog.Load()
+	}
+	seen.epoch = wf.epoch.Load()
+	return true
 }
 
 // refresh refreshes the cost tables before macroblock x of row r, a
@@ -422,10 +453,11 @@ func (wf *wfState) refresh(w *wfWorker, r, x int, epoch int32) bool {
 // publish records that row r has coded n macroblocks, waking the worker of
 // row r+1 if it sleeps until then.
 func (wf *wfState) publish(r int, n int32) {
-	wf.prog[r].Store(n)
-	if n >= wf.want[r].Load() {
+	row := &wf.rows[r]
+	row.prog.Store(n)
+	if n >= row.want.Load() {
 		wf.mu.Lock()
-		wf.want[r].Store(noWant)
+		row.want.Store(noWant)
 		wf.wakeReadyLocked()
 		wf.mu.Unlock()
 	}
@@ -494,7 +526,7 @@ func (wf *wfState) ready(w *wfWorker) bool {
 	if wf.stopped.Load() {
 		return true
 	}
-	return (w.above < 0 || wf.prog[w.above].Load() >= w.need) &&
+	return (w.above < 0 || wf.rows[w.above].prog.Load() >= w.need) &&
 		wf.epoch.Load() >= w.epochNeed && wf.committed.Load() >= w.commitNeed
 }
 
@@ -509,7 +541,7 @@ func (wf *wfState) await(w *wfWorker, above int, need, target, epochNeed, commit
 		// Stored before ready loads the progress, which publish stores
 		// before loading want: either this wait sees the progress or
 		// publish sees want.
-		wf.want[above].Store(target)
+		wf.rows[above].want.Store(target)
 	}
 	for !wf.ready(w) {
 		w.sleeping = true
@@ -517,7 +549,7 @@ func (wf *wfState) await(w *wfWorker, above int, need, target, epochNeed, commit
 	}
 	w.sleeping = false
 	if above >= 0 {
-		wf.want[above].Store(noWant)
+		wf.rows[above].want.Store(noWant)
 	}
 	wf.mu.Unlock()
 	return !wf.stopped.Load()
