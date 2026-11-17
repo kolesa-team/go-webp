@@ -463,26 +463,38 @@ func toRGBA(c uint32) uint32 {
 	return c&0xff00ff00 | c>>16&0xff | (c&0xff)<<16
 }
 
+// emitRGBA converts the ARGB pixels src to RGBA bytes in dst (as many
+// pixels as fit), two pixels per 64-bit word.
 func emitRGBA(src []uint32, dst []byte) {
-	for _, c := range src {
-		if len(dst) < 4 {
-			return
-		}
-		binary.LittleEndian.PutUint32(dst, toRGBA(c))
-		dst = dst[4:]
+	for len(src) >= 2 && len(dst) >= 8 {
+		c := uint64(src[0]) | uint64(src[1])<<32
+		binary.LittleEndian.PutUint64(dst, swapRB2(c))
+		src, dst = src[2:], dst[8:]
 	}
+	if len(src) > 0 && len(dst) >= 4 {
+		binary.LittleEndian.PutUint32(dst, toRGBA(src[0]))
+	}
+}
+
+// swapRB2 swaps the red and blue bytes of the two ARGB pixels in c.
+func swapRB2(c uint64) uint64 {
+	return c&0xff00ff00ff00ff00 | c>>16&0x000000ff000000ff | c&0x000000ff000000ff<<16
 }
 
 // emitAddGreen fuses the inverse subtract-green transform with emitRGBA.
 func emitAddGreen(src []uint32, dst []byte) {
-	for _, c := range src {
-		if len(dst) < 4 {
-			return
-		}
+	for len(src) >= 2 && len(dst) >= 8 {
+		c := uint64(src[0]) | uint64(src[1])<<32
+		g := c & 0x0000ff000000ff00
+		rb := (c&0x00ff00ff00ff00ff + (g>>8 | g<<8)) & 0x00ff00ff00ff00ff
+		binary.LittleEndian.PutUint64(dst, swapRB2(c&0xff00ff00ff00ff00|rb))
+		src, dst = src[2:], dst[8:]
+	}
+	if len(src) > 0 && len(dst) >= 4 {
+		c := src[0]
 		g := c >> 8 & 0xff
 		rb := (c&0x00ff00ff + (g<<16 | g)) & 0x00ff00ff
 		binary.LittleEndian.PutUint32(dst, toRGBA(c&0xff00ff00|rb))
-		dst = dst[4:]
 	}
 }
 
