@@ -165,14 +165,21 @@ func readFull(r io.Reader, b []byte, hint int) ([]byte, error) {
 
 // Decode picture from reader
 func (d *Decoder) Decode() (image.Image, error) {
-	img, err := d.decode()
+	img, err := d.decode(call{})
 	if err != nil {
 		return nil, &statusError{prefix: "cannot decode picture", err: err}
 	}
 	return img, nil
 }
 
-func (d *Decoder) decode() (*image.NRGBA, error) {
+// call holds the per-call arguments of the Decode variants.
+type call struct {
+	// dst lends its pixel memory to the output image (DecodeInto); nil
+	// allocates a new image.
+	dst *image.NRGBA
+}
+
+func (d *Decoder) decode(c call) (*image.NRGBA, error) {
 	parsed, err := container.Parse(d.data)
 	if err != nil {
 		return nil, err
@@ -181,9 +188,9 @@ func (d *Decoder) decode() (*image.NRGBA, error) {
 		return nil, status.Unsupported("animated WebP is not supported")
 	}
 	if parsed.VP8L != nil {
-		return d.decodeLossless(parsed)
+		return d.decodeLossless(parsed, c)
 	}
-	return d.decodeLossy(parsed)
+	return d.decodeLossy(parsed, c)
 }
 
 // GetFeatures return information about picture: width, height ...
@@ -197,13 +204,14 @@ func (d *Decoder) GetFeatures() utils.BitstreamFeatures {
 	}
 }
 
-func (d *Decoder) decodeLossless(parsed *container.Image) (*image.NRGBA, error) {
+func (d *Decoder) decodeLossless(parsed *container.Image, cl call) (*image.NRGBA, error) {
 	c := d.config
 	p := pipeline.Params{
 		SrcW:        parsed.Width,
 		SrcH:        parsed.Height,
 		Flip:        c.Flip,
 		Premultiply: true,
+		Dst:         cl.dst,
 	}
 	if c.UseCropping {
 		p.Crop = image.Rect(c.CropLeft, c.CropTop, c.CropLeft+c.CropWidth, c.CropTop+c.CropHeight)
@@ -221,7 +229,7 @@ func (d *Decoder) decodeLossless(parsed *container.Image) (*image.NRGBA, error) 
 	return result(), nil
 }
 
-func (d *Decoder) decodeLossy(parsed *container.Image) (*image.NRGBA, error) {
+func (d *Decoder) decodeLossy(parsed *container.Image, cl call) (*image.NRGBA, error) {
 	c := d.config
 	w, h := parsed.Width, parsed.Height
 
@@ -258,7 +266,7 @@ func (d *Decoder) decodeLossy(parsed *container.Image) (*image.NRGBA, error) {
 			opts.BypassFiltering = true
 		}
 	}
-	if sink, result, err = pipeline.NewSink(pipeline.Params{SrcW: cw, SrcH: ch, ScaleW: sw, ScaleH: sh, Flip: c.Flip}); err != nil {
+	if sink, result, err = pipeline.NewSink(pipeline.Params{SrcW: cw, SrcH: ch, ScaleW: sw, ScaleH: sh, Flip: c.Flip, Dst: cl.dst}); err != nil {
 		return nil, err
 	}
 
