@@ -83,8 +83,10 @@ type params struct {
 	// RGB residual of a fully transparent pixel is zeroed and the pixel
 	// replaced by its prediction (only set when such pixels exist).
 	cleanTransparent bool
-	parallel         bool
-	paletteSorts     [2][]uint32
+	// opaque: every pixel has alpha 0xff (see predictorImage).
+	opaque       bool
+	parallel     bool
+	paletteSorts [2][]uint32
 }
 
 func clampInt(v, lo, hi int) int {
@@ -169,7 +171,7 @@ func EncodeWithHeadroom(img *image.NRGBA, cfg *Config, headroom int) ([]byte, er
 		colors.add(dst) // (a no-op past 256 colors)
 	}
 	var palBuf [maxPaletteSize]uint32
-	info := imageInfo{known: true, transparent: transparent, palette: colors.palette(palBuf[:0])}
+	info := imageInfo{known: true, transparent: transparent, opaque: !hasAlpha, palette: colors.palette(palBuf[:0])}
 	out, _ := encodeARGB(argb, w, h, cfg, true, headroom+5, nil, nil, &info)
 	hdr := out[headroom : headroom+5]
 	hdr[0] = vp8lSignature
@@ -324,6 +326,7 @@ func getTransformBits(method, histoBits int) int {
 type imageInfo struct {
 	known       bool     // the fields below are set
 	transparent bool     // some pixel is fully transparent (alpha 0)
+	opaque      bool     // every pixel has alpha 0xff
 	palette     []uint32 // the sorted distinct colors, nil if more than 256
 }
 
@@ -350,11 +353,14 @@ func encodeARGB(argb []uint32, w, h int, cfg *Config, useCache bool, prefix int,
 	var palette []uint32
 	if info != nil && info.known {
 		p.cleanTransparent = !cfg.Exact && info.transparent
+		p.opaque = info.opaque
 		palette = info.palette
 	} else {
-		if !cfg.Exact {
-			for _, c := range argb[:n] {
-				if c < 0x01000000 {
+		p.opaque = true
+		for _, c := range argb[:n] {
+			if c < 0xff000000 {
+				p.opaque = false
+				if c < 0x01000000 && !cfg.Exact {
 					p.cleanTransparent = true
 					break
 				}
@@ -633,7 +639,9 @@ func encodeStream(src []uint32, mutable bool, w, h int, p *params, cc crunchConf
 		if !usePalette && p.nearLossless < 100 {
 			maxQuant = 1 << uint(nearLosslessBits(p.nearLossless))
 		}
-		bits := predictorImage(width, h, minBits, maxBits, p.lowEffort, maxQuant, useSubGreen, p.cleanTransparent, cur, modes, sc,
+		// (Palette indices are opaque.)
+		opaque := p.opaque || usePalette
+		bits := predictorImage(width, h, minBits, maxBits, p.lowEffort, maxQuant, useSubGreen, p.cleanTransparent, opaque, cur, modes, sc,
 			p.stageHelpers(width*h))
 		tw, th := subSampleSize(width, bits), subSampleSize(h, bits)
 		bw.putBits(1, 1)
