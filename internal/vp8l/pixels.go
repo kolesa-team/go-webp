@@ -22,6 +22,66 @@ func prefixValue(sym int, val uint64) (int, uint) {
 
 func errTruncated() error { return status.NotEnoughData("vp8l: truncated pixel data") }
 
+// Color cache maintenance.
+//
+// libwebp inserts every decoded pixel into the color cache: at the end of
+// each row, after each backward reference and before each cache lookup.
+// Only lookups read the cache, so decodePixels defers the insertions: the
+// pixels buf[lastCached:p] are pending, and they are inserted in order (a
+// forward loop) before the next lookup, before the window slides (which
+// moves them) or, for caches of more than lazyCacheMaxBits bits, at the
+// same points as libwebp.
+//
+// Small caches (palette images use 2 to 4 bits) are settled backwards
+// instead when many pixels are pending: the last pending pixel hashing to a
+// slot is the value that slot ends up with, so the scan can stop as soon as
+// every slot has been seen, usually after a handful of pixels instead of
+// the whole range. Both orders leave the cache in the same state.
+var (
+	// lazyCacheMaxBits is the largest cache (in bits) maintained lazily; at
+	// most 6 (settleCache tracks the slots in a uint64). A variable so that
+	// tests can compare against eager maintenance (0).
+	lazyCacheMaxBits = 4
+	// lazyCacheMinRun is the smallest pending range settled backwards;
+	// shorter ranges are inserted forwards. A variable for tests.
+	lazyCacheMinRun = 256
+)
+
+// insertCache inserts px into the color cache in order. shift is
+// 32-cacheBits.
+func insertCache(cache *[1 << maxCacheBits]uint32, px []uint32, shift uint) {
+	for _, c := range px {
+		cache[(c*colorCacheMult)>>(shift&31)&(1<<maxCacheBits-1)] = c
+	}
+}
+
+// settleCache leaves a color cache of at most 64 slots (full has one bit
+// per slot) in the state inserting px in order would: scanning backwards,
+// the first pixel seen for a slot is its final value, and the scan stops
+// once every slot is settled. Runs of equal pixels are skipped.
+func settleCache(cache *[1 << maxCacheBits]uint32, px []uint32, shift uint, full uint64) {
+	if len(px) == 0 {
+		return
+	}
+	var seen uint64
+	prev := ^px[len(px)-1]
+	for i := len(px) - 1; i >= 0; i-- {
+		c := px[i]
+		if c == prev {
+			continue
+		}
+		prev = c
+		h := (c * colorCacheMult) >> (shift & 31)
+		if bit := uint64(1) << (h & 63); seen&bit == 0 {
+			seen |= bit
+			cache[h&(1<<maxCacheBits-1)] = c
+			if seen == full {
+				return
+			}
+		}
+	}
+}
+
 // decodePixels entropy-decodes a w*h image into buf.
 //
 // For level0, rows are passed through the inverse transforms to the output
@@ -37,21 +97,32 @@ func (d *decoder) decodePixels(md *metadata, buf []uint32, w, h int, level0, sli
 	if level0 {
 		lastPixel = w * d.needRows
 	}
-	var cache []uint32
+	var cache *[1 << maxCacheBits]uint32
 	var cacheShift uint
+	var cacheSize int
+	// eager: insert pending pixels at the same points as libwebp; lazy:
+	// only before lookups and window slides (see above).
+	eager, lazy := false, false
+	var cacheFull uint64
+	minRun := lazyCacheMinRun
 	if md.cacheBits > 0 {
-		n := 1 << md.cacheBits
-		if cap(d.colorCache) < n {
-			d.colorCache = make([]uint32, 1<<maxCacheBits)
+		if d.colorCache == nil {
+			d.colorCache = new([1 << maxCacheBits]uint32)
 		}
-		cache = d.colorCache[:n]
+		cache = d.colorCache
+		cacheSize = 1 << md.cacheBits
 		if !st.started {
-			clear(cache)
+			clear(cache[:cacheSize])
 		}
 		cacheShift = 32 - uint(md.cacheBits)
+		lazy = md.cacheBits <= min(lazyCacheMaxBits, 6)
+		eager = !lazy
+		if lazy {
+			cacheFull = 1<<cacheSize - 1
+		}
 	}
 	const lenCodeLimit = numLiteralCodes + numLengthCodes
-	cacheLimit := lenCodeLimit + len(cache)
+	cacheLimit := lenCodeLimit + cacheSize
 	mask := md.huffMask
 
 	data := d.br.data
@@ -189,19 +260,19 @@ outer:
 					if col&mask != 0 {
 						g = md.group(groups, col, row)
 					}
-					if cache != nil {
-						for ; lastCached < p; lastCached++ {
-							c := buf[lastCached]
-							cache[(c*colorCacheMult)>>cacheShift] = c
-						}
+					if eager {
+						insertCache(cache, buf[lastCached:p], cacheShift)
+						lastCached = p
 					}
 					continue
 				case code < cacheLimit:
-					for ; lastCached < p; lastCached++ {
-						c := buf[lastCached]
-						cache[(c*colorCacheMult)>>cacheShift] = c
+					if lazy && p-lastCached >= minRun {
+						settleCache(cache, buf[lastCached:p], cacheShift, cacheFull)
+					} else {
+						insertCache(cache, buf[lastCached:p], cacheShift)
 					}
-					buf[p] = cache[code-lenCodeLimit]
+					lastCached = p
+					buf[p] = cache[(code-lenCodeLimit)&(1<<maxCacheBits-1)]
 				default:
 					err = status.Bitstream("vp8l: invalid green symbol")
 					break outer
@@ -217,11 +288,9 @@ outer:
 						break outer
 					}
 				}
-				if cache != nil {
-					for ; lastCached < p; lastCached++ {
-						c := buf[lastCached]
-						cache[(c*colorCacheMult)>>cacheShift] = c
-					}
+				if eager {
+					insertCache(cache, buf[lastCached:p], cacheShift)
+					lastCached = p
 				}
 				if bpos > len(data) && isEOS(len(data), bpos, nbits) {
 					err = errTruncated()
@@ -233,12 +302,11 @@ outer:
 			break
 		}
 		// Slide the window: keep the LZ77 window and the rows not yet
-		// emitted.
-		if cache != nil {
-			for ; lastCached < p; lastCached++ {
-				c := buf[lastCached]
-				cache[(c*colorCacheMult)>>cacheShift] = c
-			}
+		// emitted. The pending cache pixels move, so settle them first.
+		if lazy && p-lastCached >= minRun {
+			settleCache(cache, buf[lastCached:p], cacheShift, cacheFull)
+		} else if cache != nil {
+			insertCache(cache, buf[lastCached:p], cacheShift)
 		}
 		keep := min(base+p-window, d.lastRow*w)
 		n := copy(buf, buf[keep-base:p])
