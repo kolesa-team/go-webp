@@ -121,3 +121,31 @@ func TestConcurrentAcquireNeverExceedsLimit(t *testing.T) {
 		t.Fatalf("InUse = %d after all releases", InUse())
 	}
 }
+
+// TestSpawnGoexitIsReported: a helper that calls runtime.Goexit (such as
+// t.FailNow in a callback) did not finish its work; Wait must re-raise that
+// on the caller instead of reporting success.
+func TestSpawnGoexitIsReported(t *testing.T) {
+	defer SetLimitForTest(SetLimitForTest(4))
+	task := Spawn(func() error {
+		runtime.Goexit()
+		return nil
+	})
+	if task == nil {
+		t.Fatal("Spawn returned nil with free budget")
+	}
+	if !task.Panicked() {
+		t.Fatal("Panicked = false after runtime.Goexit")
+	}
+	defer func() {
+		pe, ok := recover().(*PanicError)
+		if !ok || !errors.Is(pe, ErrGoexit) {
+			t.Fatalf("Wait re-raised %v, want a *PanicError wrapping ErrGoexit", pe)
+		}
+		if n := InUse(); n != 0 {
+			t.Fatalf("InUse = %d, want 0", n)
+		}
+	}()
+	task.Wait()
+	t.Fatal("Wait returned after runtime.Goexit")
+}
