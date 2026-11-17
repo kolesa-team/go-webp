@@ -3,6 +3,7 @@ package vp8
 // Algorithm adapted from libwebp (BSD-3-Clause): src/dec/frame_dec.c (mt_method 2 worker split).
 
 import (
+	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -35,6 +36,9 @@ import (
 // the process-wide budget of internal/workers; without a free slot the frame
 // is decoded on the calling goroutine (and without a second one, the
 // conversion stays on the reconstruction helper).
+//
+// Every wait is a blocking channel receive. A stage that wakes a blocked
+// one hands it the processor (see parked.handOff).
 
 // mtSlots is the number of macroblock row batches in the UseThreads ring:
 // the parser fills one batch while the helper reconstructs the other. It is
@@ -79,9 +83,10 @@ type mtJob struct {
 // rows [y, y+n) that the reconstruction helper leaves in the row cache
 // slots[slot].
 type mtEmitter struct {
-	task *workers.Task
-	jobs chan mtEmitJob // closed by its owner
-	free chan int       // slots the emit helper has converted
+	task   *workers.Task
+	jobs   chan mtEmitJob // closed by its owner
+	free   chan int       // slots the emit helper has converted
+	parked parked         // the emit helper waits for a batch
 	// owned is set when the reconstruction helper has received the
 	// emitter: it then closes jobs when it returns. Until then the parser
 	// does, after the reconstruction helper has returned.
@@ -97,11 +102,14 @@ type mtCache struct{ y, u, v []byte }
 
 // mtState is the state shared by the stages of decodeFrameThreaded.
 type mtState struct {
-	jobs   chan mtJob
-	free   chan struct{}
-	stop   atomic.Bool // set when a stage stops early: the others stop too
-	blocks []mbBlock   // ring of parsed row batches
-	caches [mtSlots]mtCache
+	jobs chan mtJob
+	free chan struct{}
+	stop atomic.Bool // set when a stage stops early: the others stop too
+	// The parser waits for a free batch, the reconstruction helper for a
+	// batch or a free row cache.
+	parserParked, reconParked parked
+	blocks                    []mbBlock // ring of parsed row batches
+	caches                    [mtSlots]mtCache
 
 	// Mode parsing: rows [0, modeNext) of the first partition are parsed,
 	// into modes (a ring of modeRows rows of macroblock modes; eof tells
@@ -115,6 +123,36 @@ type mtState struct {
 	modeRows  int
 	modes     []mbModes
 	eof       []bool
+}
+
+// parked is set while a pipeline stage is blocked waiting for another
+// stage.
+//
+// When a goroutine wakes a blocked one (a channel send) and keeps running,
+// the runtime queues the woken goroutine in the waker's own next-to-run
+// slot, from which other threads only take it after a back-off: the woken
+// stage then starts tens of microseconds late on darwin, and hundreds on
+// Linux (measured: a median of 160-440 us in Docker linux/arm64 with 4
+// CPUs, against 7-9 us with handOff). The waker therefore yields once
+// after waking a parked stage, so that the woken stage runs at once on
+// this thread while the waker continues on another one (idle threads take
+// it from the global run queue without the back-off). This is no wait:
+// Gosched returns at once when nothing else is runnable.
+type parked struct{ atomic.Bool }
+
+// wait runs the blocking receive f with p set.
+func (p *parked) wait(f func()) {
+	p.Store(true)
+	f()
+	p.Store(false)
+}
+
+// handOff is called after a send that may have woken the stage that p
+// belongs to.
+func (p *parked) handOff() {
+	if p.Load() {
+		runtime.Gosched()
+	}
 }
 
 // testHookTokenRow, if set (tests), runs before the token parser parses a
@@ -184,9 +222,15 @@ parse:
 					// waiting for the helper to wake up.
 					waits++
 				}
-				select {
-				case <-m.free:
-				case <-t.Done():
+				done := false
+				m.parserParked.wait(func() {
+					select {
+					case <-m.free:
+					case <-t.Done():
+						done = true
+					}
+				})
+				if done {
 					break parse
 				}
 			}
@@ -212,6 +256,7 @@ parse:
 		select {
 		case m.jobs <- j:
 			sendEmit = false
+			m.reconParked.handOff()
 		case <-t.Done():
 			break parse
 		}
@@ -334,16 +379,16 @@ func (d *decoder) parseTokenRow(mbY int, blocks []mbBlock) error {
 }
 
 // nextJob receives the next value from jobs. While none is ready, the
-// caller (an idle helper) parses modes ahead for the token parser.
-func nextJob[T any](d *decoder, jobs <-chan T) (T, bool) {
+// caller (an idle helper, p) parses modes ahead for the token parser.
+func nextJob[T any](d *decoder, jobs <-chan T, p *parked) (j T, ok bool) {
 	for {
 		select {
-		case j, ok := <-jobs:
+		case j, ok = <-jobs:
 			return j, ok
 		default:
 		}
 		if !d.parseModesAhead() {
-			j, ok := <-jobs
+			p.wait(func() { j, ok = <-jobs })
 			return j, ok
 		}
 	}
@@ -371,7 +416,7 @@ func (d *decoder) reconBatches() error {
 	// modifies (on top of the last row cache used).
 	carry := mtCache{cacheY, cacheU, cacheV}
 	for {
-		j, ok := nextJob(d, m.jobs)
+		j, ok := nextJob(d, m.jobs, &m.reconParked)
 		if !ok {
 			done = true
 			return nil
@@ -391,12 +436,17 @@ func (d *decoder) reconBatches() error {
 				}
 			}
 			m.free <- struct{}{} // never blocks: at most mtSlots batches are in flight
+			m.parserParked.handOff()
 			continue
 		}
-		var s int
-		select {
-		case s = <-e.free:
-		case <-e.task.Done():
+		s := -1
+		m.reconParked.wait(func() {
+			select {
+			case s = <-e.free:
+			case <-e.task.Done():
+			}
+		})
+		if s < 0 {
 			return nil // stopped early (stop is set) or panicked
 		}
 		c := &m.caches[s]
@@ -414,8 +464,10 @@ func (d *decoder) reconBatches() error {
 			d.reconRow(j.y+i, j.blocks[i*d.mbW:][:d.mbW])
 		}
 		m.free <- struct{}{}
+		m.parserParked.handOff()
 		carry = mtCache{c.y[16*j.n*d.cacheYStride:], c.u[8*j.n*d.cacheUVStride:], c.v[8*j.n*d.cacheUVStride:]}
 		e.jobs <- mtEmitJob{y: j.y, n: j.n, slot: s} // never blocks: the slot was free
+		e.parked.handOff()
 	}
 }
 
@@ -448,7 +500,7 @@ func (d *decoder) emitBatches(e *mtEmitter) error {
 	m := d.mt
 	defer m.stop.Store(true)
 	for {
-		j, ok := nextJob(d, e.jobs)
+		j, ok := nextJob(d, e.jobs, &e.parked)
 		if !ok {
 			return nil
 		}
@@ -463,6 +515,7 @@ func (d *decoder) emitBatches(e *mtEmitter) error {
 			}
 		}
 		e.free <- j.slot // never blocks
+		m.reconParked.handOff()
 	}
 }
 
