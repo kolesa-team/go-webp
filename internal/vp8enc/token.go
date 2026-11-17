@@ -1,7 +1,5 @@
 package vp8enc
 
-import "sync"
-
 // Token buffer: records the coefficient coding events before the final
 // probabilities are known, then emits them.
 // Algorithm adapted from libwebp (BSD-3-Clause).
@@ -21,7 +19,7 @@ func tokenID(t, b, ctx int) int {
 // Tokens are stored in fixed-size pages, like libwebp's VP8TBuffer: the
 // buffer grows one page at a time without ever copying, its footprint
 // follows the actual number of tokens, and pages are recycled through
-// tokenPagePool across encodes.
+// tokenPagePool across encodes (1.5-2.5 B/px of pages for photos).
 const (
 	tokenPageShift = 13
 	tokenPageSize  = 1 << tokenPageShift
@@ -29,8 +27,6 @@ const (
 )
 
 type tokenPage = [tokenPageSize]uint16
-
-var tokenPagePool = sync.Pool{New: func() any { return new(tokenPage) }}
 
 // tokenBuffer is a paged list of tokens. Tokens are addressed by a global
 // index; index i lives in pages[i>>tokenPageShift][i&tokenPageMask].
@@ -52,7 +48,7 @@ func (tb *tokenBuffer) reset() {
 // release returns all pages to the pool.
 func (tb *tokenBuffer) release() {
 	for i, pg := range tb.pages {
-		tokenPagePool.Put(pg)
+		tokenPagePool.Put(pg[:])
 		tb.pages[i] = nil
 	}
 	tb.pages = tb.pages[:0]
@@ -69,7 +65,8 @@ func (tb *tokenBuffer) nextPage() {
 		tb.n++
 	}
 	if tb.n == len(tb.pages) {
-		tb.pages = append(tb.pages, tokenPagePool.Get().(*tokenPage))
+		// Pages are written before they are read: no clearing needed.
+		tb.pages = append(tb.pages, (*tokenPage)(tokenPagePool.Get(tokenPageSize)))
 	}
 	tb.cur = tb.pages[tb.n][:0]
 }

@@ -5,6 +5,7 @@ import (
 	"math"
 	"sync"
 
+	"github.com/kolesa-team/go-webp/v2/internal/bufpool"
 	"github.com/kolesa-team/go-webp/v2/internal/status"
 )
 
@@ -19,28 +20,23 @@ type Picture struct {
 	buf []byte // pooled backing storage, if any
 }
 
-var pictureBufPool sync.Pool // of *[]byte
-
-// maxPooledPixels bounds the picture size whose buffers (pictures, encoder
-// state) are pooled: the memory of larger encodes is left to the garbage
-// collector instead of being retained between calls.
-const maxPooledPixels = 2 << 20
+// Reusable buffers of all sizes, under the process-wide retained-bytes
+// budget of internal/bufpool.
+var (
+	bytePool      bufpool.Pool[byte]   // pictures, prediction modes, bit writers
+	int32Pool     bufpool.Pool[int32]  // macroblock token offsets, RGB import
+	uint16Pool    bufpool.Pool[uint16] // sharp YUV luma
+	int16Pool     bufpool.Pool[int16]  // sharp YUV chroma
+	mbInfoPool    bufpool.Pool[mbInfo] // macroblock decisions
+	tokenPagePool bufpool.Pool[uint16] // token pages, all of tokenPageSize
+)
 
 func newPicture(w, h int) *Picture {
 	uvw, uvh := (w+1)>>1, (h+1)>>1
 	ySize := w * h
 	uvSize := uvw * uvh
 	n := ySize + 2*uvSize
-	var buf []byte
-	if v := pictureBufPool.Get(); v != nil {
-		b := *(v.(*[]byte))
-		if cap(b) >= n {
-			buf = b[:n]
-		}
-	}
-	if buf == nil {
-		buf = make([]byte, n)
-	}
+	buf := bytePool.Get(n) // every sample is written by the conversions
 	return &Picture{
 		Width: w, Height: h,
 		Y:       buf[:ySize:ySize],
@@ -68,20 +64,21 @@ func unpooledPicture(w, h int) *Picture {
 	}
 }
 
-// Release returns the picture's storage to an internal pool. The picture
-// must not be used afterwards. It is safe to call on pictures not created
-// by this package (it then does nothing) and on nil.
+// Release returns the storage of a picture made by FromNRGBA,
+// FromNRGBADithered or FromYCbCr to an internal pool (bounded by the
+// retained-bytes budget of internal/bufpool, whatever the picture size).
+// The picture must not be used afterwards. Calling it is optional: a
+// picture that is never released is garbage collected like any other
+// value. It does nothing on pictures not created by this package, on
+// SnapshotYCbCr pictures, on nil and when called again.
 func (p *Picture) Release() {
 	if p == nil || p.buf == nil {
 		return
 	}
-	b := p.buf[:0]
+	b := p.buf
 	p.buf = nil
 	p.Y, p.U, p.V = nil, nil, nil
-	if p.Width*p.Height > maxPooledPixels {
-		return
-	}
-	pictureBufPool.Put(&b)
+	bytePool.Put(b)
 }
 
 func (p *Picture) validate() error {
@@ -242,7 +239,8 @@ func rowsOpaque(pix []byte, stride, w, n int) bool {
 // VP8Random, in the same draw order).
 func importRGBA(pix []byte, stride, w, h int, hasAlpha bool, pic *Picture, rg *vp8Random) {
 	uvw := (w + 1) >> 1
-	tmp := make([]int32, 4*uvw) // r,g,b accumulators
+	tmp := int32Pool.Get(4 * uvw) // r,g,b accumulators, written before use
+	defer int32Pool.Put(tmp)
 	for y := 0; y < h; y += 2 {
 		rows := 2
 		rs := stride // stride to the second row

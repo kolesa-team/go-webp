@@ -43,9 +43,16 @@ func (bw *bitWriter) init(capHint int) {
 	bw.run = 0
 	bw.nbBits = -8
 	if cap(bw.buf) < capHint {
-		bw.buf = make([]byte, 0, capHint)
+		bytePool.Put(bw.buf)
+		bw.buf = bytePool.Get(capHint)
 	}
 	bw.buf = bw.buf[:0]
+}
+
+// release returns the output buffer to its pool.
+func (bw *bitWriter) release() {
+	bytePool.Put(bw.buf)
+	bw.buf = nil
 }
 
 func (bw *bitWriter) flush() {
