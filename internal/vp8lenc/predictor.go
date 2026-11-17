@@ -303,6 +303,9 @@ func predictorImage(width, height, minBits, maxBits int, lowEffort bool, maxQuan
 		ps := predSearch{width: width, height: height, minBits: minBits, maxBits: maxBits,
 			maxQuant: maxQuant, md: md, usedSubGreen: usedSubGreen, clean: clean, slow: slow, argb: argb, sc: sc}
 		bits = ps.run(modes)
+		if sc.interrupted() { // the modes may be incomplete
+			return bits
+		}
 	}
 	// Replace the image by residuals, row by row, keeping the original (or,
 	// with near-lossless, reconstructed) previous row.
@@ -447,6 +450,9 @@ func (ps *predSearch) run(modes []uint32) int {
 			if tileX == tilesPerRow-1 {
 				maxTileX = 0
 				maxTileY++
+				if sc.interrupted() {
+					break
+				}
 			} else {
 				maxTileX++
 			}
