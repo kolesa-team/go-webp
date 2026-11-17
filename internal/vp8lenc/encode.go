@@ -30,7 +30,11 @@ type Config struct {
 	// LowMemory reduces peak memory (smaller LZ77 window, fewer candidate
 	// encodings kept in memory) at some cost in size.
 	LowMemory bool
-	// ThreadLevel allows evaluating candidate encodings concurrently.
+	// ThreadLevel allows helper goroutines from the process-wide budget of
+	// internal/workers (see parallel.go): candidate encodings are evaluated
+	// two at a time (up to 8 MP), and the match search, the predictor mode
+	// search and the histogram remap of large images are split among
+	// helpers. The output does not depend on it. Ignored with LowMemory.
 	ThreadLevel bool
 	// ImageHint is libwebp's WebPImageHint (0 default, 1 picture, 2 photo,
 	// 3 graph). With 3 (graph), palette images additionally try the
