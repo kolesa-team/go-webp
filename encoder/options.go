@@ -140,7 +140,21 @@ type Config struct {
 	PartitionLimit int
 	// EmulateJPEGSize maps the quality like a JPEG encoder would (lossy).
 	EmulateJPEGSize bool
-	// ThreadLevel allows the encoder to use more than one goroutine.
+	// ThreadLevel allows the encoder to use helper goroutines from the
+	// process-wide budget of GOMAXPROCS-1 helpers shared by all concurrent
+	// Encode and Decode calls:
+	//   - lossy: the analysis pass runs in row bands (pictures of at least
+	//     384 macroblocks, 1024 at methods 0-1), and the compressed alpha
+	//     plane of a transparent picture (64K pixels or more) is coded
+	//     while the VP8 frame is;
+	//   - lossless and compressed alpha (256K pixels or more): the
+	//     hash-chain match search, the predictor search (methods 0-4) and
+	//     the histogram remap are split among helpers, and level 9 codes at
+	//     most two candidate configurations at a time (one above 8 MP).
+	// When no helper slot is free the calling goroutine does the work. The
+	// output is byte-identical with or without ThreadLevel and for any
+	// budget. ThreadLevel lowers latency at some extra CPU cost; servers
+	// that already encode concurrently may prefer to leave it off.
 	ThreadLevel bool
 	// LowMemory reduces memory usage at some cost in speed or size
 	// (lossless). For lossy coding it only re-enables Partitions at
