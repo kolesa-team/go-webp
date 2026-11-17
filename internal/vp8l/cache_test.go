@@ -54,7 +54,7 @@ func TestSettleCacheMatchesInsert(t *testing.T) {
 		}
 		b = a
 		insertCache(&a, px, shift)
-		settleCache(&b, px, shift, uint64(1)<<(1<<bits)-1)
+		settleCache(&b, px, shift)
 		if a != b {
 			t.Fatalf("iter %d: bits %d, %d pixels: settle differs from insert", iter, bits, len(px))
 		}

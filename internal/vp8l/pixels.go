@@ -55,29 +55,23 @@ func insertCache(cache *[1 << maxCacheBits]uint32, px []uint32, shift uint) {
 	}
 }
 
-// settleCache leaves a color cache of at most 64 slots (full has one bit
-// per slot) in the state inserting px in order would: scanning backwards,
-// the first pixel seen for a slot is its final value, and the scan stops
-// once every slot is settled. Runs of equal pixels are skipped.
-func settleCache(cache *[1 << maxCacheBits]uint32, px []uint32, shift uint, full uint64) {
-	if len(px) == 0 {
-		return
-	}
+// settleCache leaves a color cache of at most 64 slots (shift >= 26) in
+// the state inserting px in order would: scanning backwards, the first
+// pixel seen for a slot is its final value, and the scan stops once every
+// slot is settled.
+//
+// It is small enough to be inlined: a call on the cache lookup path of
+// decodePixels makes the register allocator spill around it even when the
+// branch is not taken, which costs more than 10% on photos.
+func settleCache(cache *[1 << maxCacheBits]uint32, px []uint32, shift uint) {
+	full := ^uint64(0) >> (64 - 1<<(32-shift&31)) // one bit per slot
 	var seen uint64
-	prev := ^px[len(px)-1]
-	for i := len(px) - 1; i >= 0; i-- {
+	for i := len(px) - 1; i >= 0 && seen != full; i-- {
 		c := px[i]
-		if c == prev {
-			continue
-		}
-		prev = c
-		h := (c * colorCacheMult) >> (shift & 31)
-		if bit := uint64(1) << (h & 63); seen&bit == 0 {
-			seen |= bit
-			cache[h&(1<<maxCacheBits-1)] = c
-			if seen == full {
-				return
-			}
+		h := (c * colorCacheMult) >> (shift & 31) & 63
+		if seen>>h&1 == 0 {
+			seen |= 1 << h
+			cache[h] = c
 		}
 	}
 }
@@ -100,11 +94,9 @@ func (d *decoder) decodePixels(md *metadata, buf []uint32, w, h int, level0, sli
 	var cache *[1 << maxCacheBits]uint32
 	var cacheShift uint
 	var cacheSize int
-	// eager: insert pending pixels at the same points as libwebp; lazy:
-	// only before lookups and window slides (see above).
-	eager, lazy := false, false
-	var cacheFull uint64
-	minRun := lazyCacheMinRun
+	// eager: insert the pending pixels at the same points as libwebp,
+	// otherwise only before lookups and window slides (see above).
+	eager := false
 	if md.cacheBits > 0 {
 		if d.colorCache == nil {
 			d.colorCache = new([1 << maxCacheBits]uint32)
@@ -115,11 +107,7 @@ func (d *decoder) decodePixels(md *metadata, buf []uint32, w, h int, level0, sli
 			clear(cache[:cacheSize])
 		}
 		cacheShift = 32 - uint(md.cacheBits)
-		lazy = md.cacheBits <= min(lazyCacheMaxBits, 6)
-		eager = !lazy
-		if lazy {
-			cacheFull = 1<<cacheSize - 1
-		}
+		eager = md.cacheBits > min(lazyCacheMaxBits, 6)
 	}
 	const lenCodeLimit = numLiteralCodes + numLengthCodes
 	cacheLimit := lenCodeLimit + cacheSize
@@ -266,8 +254,8 @@ outer:
 					}
 					continue
 				case code < cacheLimit:
-					if lazy && p-lastCached >= minRun {
-						settleCache(cache, buf[lastCached:p], cacheShift, cacheFull)
+					if !eager && p-lastCached >= lazyCacheMinRun {
+						settleCache(cache, buf[lastCached:p], cacheShift)
 					} else {
 						insertCache(cache, buf[lastCached:p], cacheShift)
 					}
@@ -303,8 +291,8 @@ outer:
 		}
 		// Slide the window: keep the LZ77 window and the rows not yet
 		// emitted. The pending cache pixels move, so settle them first.
-		if lazy && p-lastCached >= minRun {
-			settleCache(cache, buf[lastCached:p], cacheShift, cacheFull)
+		if cache != nil && !eager && p-lastCached >= lazyCacheMinRun {
+			settleCache(cache, buf[lastCached:p], cacheShift)
 		} else if cache != nil {
 			insertCache(cache, buf[lastCached:p], cacheShift)
 		}
