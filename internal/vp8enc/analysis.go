@@ -256,9 +256,11 @@ const (
 	// maxAnalysisBands bounds the number of row bands the analysis pass is
 	// split into with ThreadLevel.
 	maxAnalysisBands = 8
-	// minBandMBs is the smallest band worth handing to a helper goroutine:
-	// about 0.5 ms of analysis.
-	minBandMBs = 192
+	// minBandMBs is the smallest band worth handing to a helper goroutine,
+	// about 0.5 ms of analysis: methods 0-1 analyze a macroblock in about
+	// 1 us, the others in about 2.7 us (Apple M5, source.jpg).
+	minBandMBs     = 192
+	minBandMBsFast = 512
 )
 
 var sideIteratorPool = sync.Pool{New: func() any { return new(iterator) }}
@@ -272,7 +274,11 @@ func (e *encoder) analysisBands() int {
 	if !e.cfg.ThreadLevel {
 		return 1
 	}
-	return max(1, min(maxAnalysisBands, e.mbH, e.mbW*e.mbH/minBandMBs))
+	minMBs := minBandMBs
+	if e.method <= 1 {
+		minMBs = minBandMBsFast
+	}
+	return max(1, min(maxAnalysisBands, e.mbH, e.mbW*e.mbH/minMBs))
 }
 
 // analyze decides the segmentation and complexity, and assigns a first

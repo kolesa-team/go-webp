@@ -93,15 +93,17 @@ func TestAnalysisBandsIdentical(t *testing.T) {
 
 func TestAnalysisBandsCount(t *testing.T) {
 	for _, tc := range []struct {
-		w, h, want int
+		w, h, method, want int
 	}{
-		{1, 1, 1}, {16, 16 * 300, 1}, {64 * 16, 3 * 16, 1}, {64 * 16, 6 * 16, 2},
-		{960, 1280, 8}, {4000, 3000, 8}, {16 * 400, 16, 1}, {16 * 192, 32, 2},
+		{1, 1, 4, 1}, {16, 16 * 300, 4, 1}, {64 * 16, 3 * 16, 4, 1}, {64 * 16, 6 * 16, 4, 2},
+		{960, 1280, 4, 8}, {4000, 3000, 6, 8}, {16 * 400, 16, 2, 1}, {16 * 192, 32, 4, 2},
+		// methods 0-1: bands of at least 512 macroblocks
+		{64 * 16, 6 * 16, 0, 1}, {640, 480, 1, 2}, {960, 1280, 0, 8}, {16 * 512, 32, 0, 2},
 	} {
-		e := &encoder{mbW: (tc.w + 15) >> 4, mbH: (tc.h + 15) >> 4}
+		e := &encoder{mbW: (tc.w + 15) >> 4, mbH: (tc.h + 15) >> 4, method: tc.method}
 		e.cfg.ThreadLevel = true
 		if got := e.analysisBands(); got != tc.want {
-			t.Errorf("%dx%d: %d bands, want %d", tc.w, tc.h, got, tc.want)
+			t.Errorf("%dx%d m%d: %d bands, want %d", tc.w, tc.h, tc.method, got, tc.want)
 		}
 		e.cfg.ThreadLevel = false
 		if got := e.analysisBands(); got != 1 {
