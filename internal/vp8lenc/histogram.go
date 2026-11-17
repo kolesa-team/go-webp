@@ -728,7 +728,7 @@ func (c *clusterer) remap(out *histoSet, helpers int) {
 		// also on the helpers; an interrupted remap leaves every tile in
 		// cluster 0 (a valid, if useless, clustering).
 		chunks := (len(orig) + remapChunk - 1) / remapChunk
-		if helpers > 0 && chunks > 1 && len(orig)*len(set) >= minParallelRemap {
+		if helpers > 0 && c.crew != nil && chunks > 1 && len(orig)*len(set) >= minParallelRemap {
 			c.crew.run(chunks, helpers, func(_ int, claim func() (int, bool)) {
 				for {
 					k, ok := claim()

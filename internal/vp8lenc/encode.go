@@ -858,12 +858,20 @@ func parseRefs(typ, w, n int, argb []uint32, sc *scratch, refs []pixOrCopy) []pi
 	return backwardRefsLz77(n, argb, &sc.hcBox, refs)
 }
 
-// bestRefs is getBackwardRefs without tryNoCache, keeping a single parse in
-// memory (in sc.refs[0]; a parse takes up to 8 bytes per pixel): every
-// parse type is evaluated in the same buffer, and the best one is computed
-// again (the parses are deterministic) when a later candidate has
-// overwritten it. Usually it has not: the last candidate (the RLE parse,
-// which a spatially predicted image favors), or the cost-based parse, wins.
+// sparseRefs: a parse estimated at no more than one entry per sparseRefs
+// pixels is sparse (see bestRefs).
+const sparseRefs = 8
+
+// bestRefs is getBackwardRefs without tryNoCache. A dense parse (a photo:
+// up to one entry, 8 bytes, per pixel) is kept in a single buffer
+// (sc.refs[0]): every parse type is evaluated in the same buffer, and the
+// best one is computed again (the parses are deterministic) when a later
+// candidate has overwritten it. Usually it has not: the last candidate
+// (the RLE parse, which the residuals of a photo favor), or the cost-based
+// parse, wins. A sparse parse (graphics: at most one entry per sparseRefs
+// pixels, estimated) costs little memory but as much to recompute (a pass
+// over all the pixels): the best one so far keeps its buffer (sc.refs[0] or
+// sc.refs[1]) and the next candidate goes to the other one.
 func bestRefs(argb []uint32, w, n, quality int, types []int, trace bool, cacheBitsMax, refsCap int, cacheBuf []uint32, sc *scratch) refsCandidate {
 	if refsCap < n && slices.Contains(types, lz77RLE) {
 		// The buffer holds the RLE parse in turn, often the longest one:
@@ -872,17 +880,30 @@ func bestRefs(argb []uint32, w, n, quality int, types []int, trace bool, cacheBi
 		e := rleRefsEstimate(argb, w, n/w)
 		refsCap = max(refsCap, min(n, e+e/8+4096))
 	}
-	r := sc.refsBuf(0, refsCap)
+	sparse := refsCap <= n/sparseRefs
+	var bufs [2][]pixOrCopy
+	var inBuf [2]int // parse type in bufs[k] (0: none)
+	cur, best := 0, 0
+	buf := func(k int) []pixOrCopy {
+		if bufs[k] == nil {
+			bufs[k] = sc.refsBuf(k, refsCap)
+		}
+		return bufs[k]
+	}
 	bestCost := math.Inf(1)
-	bestType, bestCB, inBuf := 0, 0, 0
+	bestType, bestCB := 0, 0
 	for _, typ := range types {
-		r = parseRefs(typ, w, n, argb, sc, r)
+		r := parseRefs(typ, w, n, argb, sc, buf(cur))
+		bufs[cur], inBuf[cur] = r, typ
 		cb := bestCacheBits(argb, quality, r, cacheBitsMax, sc)
 		applyColorCache(argb, cb, r, cacheBuf)
 		cost := histoCost(r, w, cb, trace, sc)
-		inBuf = typ
 		if cost < bestCost || bestType == 0 {
 			bestCost, bestType, bestCB = cost, typ, cb
+			best = cur
+		}
+		if sparse {
+			cur = 1 - best
 		}
 	}
 	redo := func(r []pixOrCopy) []pixOrCopy {
@@ -890,7 +911,8 @@ func bestRefs(argb []uint32, w, n, quality int, types []int, trace bool, cacheBi
 		applyColorCache(argb, bestCB, r, cacheBuf)
 		return r
 	}
-	if inBuf != bestType {
+	r := bufs[best]
+	if inBuf[best] != bestType {
 		r = redo(r)
 	}
 	// Improve on the simple LZ77 with the cost-based parse (only for high
@@ -901,14 +923,32 @@ func bestRefs(argb []uint32, w, n, quality int, types []int, trace bool, cacheBi
 			hc = &sc.hcBox
 		}
 		// traceBackwards reads its input parse only before it writes its
-		// output: both can share the buffer.
-		r = traceBackwards(w, n, argb, bestCB, hc, r, r[:0], sc)
-		applyColorCache(argb, bestCB, r, cacheBuf)
-		if !(histoCost(r, w, bestCB, true, sc) < bestCost) {
-			r = redo(r)
+		// output: both can share the buffer of a dense parse.
+		out := r[:0]
+		if sparse {
+			out = buf(1 - best)[:0]
+		}
+		t := traceBackwards(w, n, argb, bestCB, hc, r, out, sc)
+		applyColorCache(argb, bestCB, t, cacheBuf)
+		switch {
+		case histoCost(t, w, bestCB, true, sc) < bestCost:
+			if sparse {
+				bufs[1-best] = t
+				best = 1 - best
+			}
+			r = t
+		case sparse:
+			bufs[1-best] = t // (keeps its capacity)
+		default:
+			r = redo(t)
+		}
+		bufs[best] = r
+	}
+	for k := range bufs {
+		if bufs[k] != nil {
+			sc.refs[k] = bufs[k]
 		}
 	}
-	sc.refs[0] = r
 	// (A cost-based parse only replaces a candidate when cheaper, so
 	// bestCost bounds the estimate of the returned parse.)
 	return refsCandidate{r, bestCB, bestCost}
