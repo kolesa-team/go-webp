@@ -44,10 +44,15 @@ func benchDecode(b *testing.B, name string, opts *Options) {
 	b.SetBytes(int64(w * h * 4))
 	b.ReportAllocs()
 	b.ResetTimer()
+	cpu0, cpuOK := processCPU()
 	for i := 0; i < b.N; i++ {
 		if err := Decode(vp8, nil, opts, sink); err != nil {
 			b.Fatal(err)
 		}
+	}
+	if cpu1, ok := processCPU(); cpuOK && ok {
+		// CPU time of the whole process (all goroutines, GC) per decode.
+		b.ReportMetric(float64(cpu1-cpu0)/float64(b.N), "cpu-ns/op")
 	}
 }
 
