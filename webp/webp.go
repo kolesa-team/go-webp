@@ -148,5 +148,7 @@ func Encode(w io.Writer, src image.Image, options *encoder.Options) error {
 	if err != nil {
 		return err
 	}
+	// One shot: the snapshot of src goes back to the pools right away.
+	defer enc.Release()
 	return enc.Encode(w)
 }

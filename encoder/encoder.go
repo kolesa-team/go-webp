@@ -28,6 +28,8 @@ import (
 	"fmt"
 	"image"
 	"io"
+	"runtime"
+	"sync"
 
 	"github.com/kolesa-team/go-webp/v2/internal/container"
 	"github.com/kolesa-team/go-webp/v2/internal/vp8enc"
@@ -36,6 +38,9 @@ import (
 
 // maxDimension is the largest width or height of a WebP image.
 const maxDimension = 16383
+
+// ErrReleased is returned by Encode when it is called after Release.
+var ErrReleased = errors.New("encoder: Encode called after Release")
 
 // Encoder stores information to encode image
 type Encoder struct {
@@ -49,12 +54,35 @@ type Encoder struct {
 	img *image.NRGBA
 	// pic is set instead of img for *image.YCbCr sources encoded lossy:
 	// they are converted in NewEncoder straight to the encoder's YUV 4:2:0
-	// (cheaper than going through NRGBA). Its storage is not pooled, so
-	// nothing needs releasing when Encode is never called, and Encode can
-	// be called more than once.
+	// (cheaper than going through NRGBA).
 	pic *vp8enc.Picture
 	// bounds of the source image
 	bounds image.Rectangle
+
+	// mu is held for reading by every encode and for writing by Release,
+	// which therefore waits for the encodes in progress.
+	mu       sync.RWMutex
+	released bool
+	// snap is the pooled storage of the snapshot (img's pixels or pic), if
+	// any. Release hands it back to the pools; if Release is never called,
+	// cleanup does so once the Encoder is unreachable.
+	snap    *snapshot
+	cleanup runtime.Cleanup
+}
+
+// snapshot is the pooled storage of an Encoder's copy of its source. It
+// must not reference the Encoder: it is the argument of the Encoder's
+// cleanup.
+type snapshot struct {
+	pix *[]byte         // storage of Encoder.img, from pooledNRGBA
+	pic *vp8enc.Picture // Encoder.pic, from vp8enc.FromYCbCr
+}
+
+func (s *snapshot) release() {
+	putPix(s.pix)
+	s.pix = nil
+	s.pic.Release()
+	s.pic = nil
 }
 
 // NewEncoder return new encoder instance
@@ -78,12 +106,23 @@ func NewEncoder(src image.Image, options *Options) (e *Encoder, err error) {
 		return e, nil
 	}
 
-	if ycc, ok := src.(*image.YCbCr); ok && !config.Lossless {
-		e.pic = vp8enc.SnapshotYCbCr(ycc)
+	// The snapshot's storage comes from pools. Encode does not consume it
+	// (Encode may be called several times); Release returns it, and so does
+	// a cleanup, as a safety net, when the Encoder becomes unreachable.
+	s := &snapshot{}
+	if v, ok := src.(*image.NRGBA); ok {
+		e.img = v
+	} else if ycc, ok := src.(*image.YCbCr); ok && !config.Lossless {
+		e.pic = vp8enc.FromYCbCr(ycc)
+		s.pic = e.pic
 	} else {
-		e.img = toNRGBA(src)
+		e.img, s.pix = pooledNRGBA(e.bounds.Dx(), e.bounds.Dy())
+		convertNRGBA(e.img, src)
 	}
-
+	if s.pix != nil || s.pic != nil {
+		e.snap = s
+		e.cleanup = runtime.AddCleanup(e, (*snapshot).release, s)
+	}
 	return e, nil
 }
 
@@ -94,8 +133,52 @@ func validDimensions(r image.Rectangle) bool {
 
 // Encode picture and flush to io.Writer
 func (e *Encoder) Encode(w io.Writer) error {
+	out, err := e.encode()
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(out)
+	return err
+}
+
+// Release hands the Encoder's copy of its source picture back to internal
+// pools, so that later encodes can reuse the memory. Encode returns
+// ErrReleased afterwards. Release waits for the encodes in progress on
+// other goroutines; calling it again does nothing.
+//
+// Calling Release is optional: otherwise the memory is reclaimed by the
+// garbage collector (and returned to the pools once the Encoder is
+// unreachable), as with v1, which had no Release.
+func (e *Encoder) Release() {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.released {
+		return
+	}
+	e.released = true
+	if e.snap != nil {
+		e.cleanup.Stop()
+		e.snap.release()
+		e.snap = nil
+	}
+	e.img, e.pic = nil, nil
+}
+
+// encode returns the WebP file.
+func (e *Encoder) encode() ([]byte, error) {
+	// Holding the read lock until the snapshot is no longer used also keeps
+	// e reachable meanwhile, so that its cleanup cannot recycle the storage
+	// under the encoders.
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.released {
+		return nil, ErrReleased
+	}
 	if !validDimensions(e.bounds) {
-		return &encodeError{fmt.Errorf("bad dimension %dx%d", e.bounds.Dx(), e.bounds.Dy())}
+		return nil, &encodeError{fmt.Errorf("bad dimension %dx%d", e.bounds.Dx(), e.bounds.Dy())}
 	}
 
 	var (
@@ -108,11 +191,9 @@ func (e *Encoder) Encode(w io.Writer) error {
 		out, err = e.encodeLossy()
 	}
 	if err != nil {
-		return &encodeError{err}
+		return nil, &encodeError{err}
 	}
-
-	_, err = w.Write(out)
-	return err
+	return out, nil
 }
 
 // encodeError reports an encoding failure with exactly v1's message,
@@ -155,26 +236,7 @@ func (e *Encoder) encodeLossless() ([]byte, error) {
 
 func (e *Encoder) encodeLossy() ([]byte, error) {
 	c := e.config
-
-	var (
-		pic  *vp8enc.Picture
-		alph []byte
-		err  error
-	)
-	if e.pic != nil {
-		pic = e.pic // owned by e, not pooled
-	} else {
-		if hasTransparency(e.img) {
-			if alph, err = encodeAlpha(e.img, c); err != nil {
-				return nil, err
-			}
-		}
-		dithering := vp8enc.DitheringFor(&vp8enc.Config{Quality: c.Quality, Preprocessing: c.Preprocessing})
-		pic = vp8enc.FromNRGBADithered(e.img, c.UseSharpYUV || c.Preprocessing&4 != 0, c.Exact, dithering)
-		defer pic.Release()
-	}
-
-	payload, err := vp8enc.Encode(pic, &vp8enc.Config{
+	cfg := vp8enc.Config{
 		Quality:         c.Quality,
 		Method:          c.Method,
 		ImageHint:       int(c.ImageHint),
@@ -193,7 +255,26 @@ func (e *Encoder) encodeLossy() ([]byte, error) {
 		EmulateJPEGSize: c.EmulateJPEGSize,
 		ThreadLevel:     c.ThreadLevel,
 		LowMemory:       c.LowMemory,
-	})
+	}
+
+	var (
+		payload []byte
+		alph    []byte
+		err     error
+	)
+	if e.pic != nil {
+		payload, err = vp8enc.Encode(e.pic, &cfg)
+	} else {
+		if hasTransparency(e.img) {
+			if alph, err = encodeAlpha(e.img, c); err != nil {
+				return nil, err
+			}
+		}
+		dithering := vp8enc.DitheringFor(&vp8enc.Config{Quality: c.Quality, Preprocessing: c.Preprocessing})
+		pic := vp8enc.FromNRGBADithered(e.img, c.UseSharpYUV || c.Preprocessing&4 != 0, c.Exact, dithering)
+		payload, err = vp8enc.Encode(pic, &cfg)
+		pic.Release()
+	}
 	if err != nil {
 		return nil, err
 	}
