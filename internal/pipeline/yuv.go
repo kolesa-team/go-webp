@@ -61,8 +61,21 @@ func (s *scaleSink) initYUV(hasAlpha bool) error {
 	q.uvLeft = (s.left4 / 4) >> 1
 	q.uvTop = s.top >> 1
 	q.uvH = (ch + 1) >> 1
+	// The RGBA rescaler is not used on this path: reset it (a zero
+	// Rescaler does nothing) and reuse its work buffer for the planes.
+	s.rs = resample.Rescaler{}
 	ws := resample.BufferSize(dw, 1)
-	work := make([]uint32, 4*ws)
+	planes := 3
+	if hasAlpha {
+		planes = 4
+	}
+	if s.work == nil {
+		s.work = getWork(0)
+	}
+	if cap(*s.work) < planes*ws {
+		*s.work = make([]uint32, planes*ws)
+	}
+	work := (*s.work)[:planes*ws]
 	err := q.ry.Init(cw, ch, dw, dh, 1, work[0:ws:ws])
 	if err == nil {
 		err = q.ru.Init(q.cuw, q.uvH, dw, dh, 1, work[ws:2*ws:2*ws])
@@ -178,6 +191,7 @@ func (s *scaleSink) CommitYUV(y, n int, yp []byte, yStride int, u, v []byte, uvS
 	if q.ry.OutputDone() {
 		s.done = true
 		s.release()
+		s.releaseWork()
 	}
 	return nil
 }

@@ -208,8 +208,9 @@ func (r *Rescaler) shrinkRow(src []byte, acc []uint32) {
 	}
 }
 
-// asmRows returns frow and acc cut to the row length, and the pointer to
-// pass for acc. It panics if the kernel geometry does not fit the row.
+// asmRows returns src, frow and acc cut to the row lengths, and the
+// pointer to pass for acc (nil when not accumulating). It panics if the
+// kernel geometry does not fit the row.
 func (r *Rescaler) asmRows(src []byte, acc []uint32) ([]byte, []uint32, []uint32, *uint32) {
 	ch, a := r.numChannels, &r.arch
 	src = src[:ch*r.srcWidth]
