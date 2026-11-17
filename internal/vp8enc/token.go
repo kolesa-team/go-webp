@@ -244,10 +244,11 @@ var kNorm256, kNewRange256 = func() (norm, newRange [256]uint8) {
 	return
 }()
 
-// emitTokens codes the tokens with the final probabilities. It is
-// bitWriter.putBitInt for every token, with the coder state kept in locals
-// and the bit update and renormalization done without branches; only the
-// byte output (flush) goes through the bitWriter. The output is identical.
+// emitTokens codes the tokens with the final probabilities. It is libwebp's
+// VP8PutBit for every token, with the coder state kept in locals and the
+// bit update and renormalization done without branches; only the byte
+// output (flush) goes through the bitWriter. TestEmitTokensExact checks it
+// against the straightforward coder.
 func emitTokens(bw *bitWriter, toks []uint16, probas *[numProbaSlots]uint8) {
 	rng, value, nbBits := bw.rng, bw.value, bw.nbBits
 	for _, t := range toks {
