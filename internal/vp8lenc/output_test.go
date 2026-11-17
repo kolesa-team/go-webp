@@ -184,7 +184,7 @@ func TestOutputCapacity(t *testing.T) {
 		}
 	}
 	for _, bits := range []float64{0, 1, 1e6, 1e15, math.Inf(1), math.NaN()} {
-		if r := mainImageReserve(bits); r < 4096 || r > 1<<31 {
+		if r := mainImageReserve(bits); r < 4096 || int64(r) > 1<<31 {
 			t.Fatalf("mainImageReserve(%v) = %d", bits, r)
 		}
 	}
