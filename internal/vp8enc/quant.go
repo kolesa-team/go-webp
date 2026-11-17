@@ -396,17 +396,21 @@ type trellisNode struct {
 	level int16
 }
 
-type scoreState struct {
-	score int64
-	costs *levelCostTable
-}
-
 func rdScoreTrellis(lambda int, rate, distortion int64) int64 {
 	return rate*int64(lambda) + rdDistoMult*distortion
 }
 
+// trellisLevelCost is levelCost for 0 <= level <= maxLevel, without
+// branches.
+func trellisLevelCost(table *levelCostTable, level int) int64 {
+	return int64(levelFixedCosts[level&maxLevel]) + int64(table[min(uint(level), maxVariableLevel)])
+}
+
+// trellisQuantizeBlock is libwebp's TrellisQuantizeBlock. At each position
+// it keeps two nodes, for levels level0 and level0+1; their state (best
+// score so far and the level cost table of the context they leave) is held
+// in scalars rather than arrays, so that it stays in registers.
 func (it *iterator) trellisQuantizeBlock(in *[16]int16, out *[16]int16, ctx0 int, coeffType int, mtx *matrix, lambda int) bool {
-	const numNodes = 2 // MIN_DELTA = 0, MAX_DELTA = 1
 	e := it.enc
 	probas := &e.proba.coeffs[coeffType]
 	costs := &e.proba.levelCost[coeffType]
@@ -414,13 +418,14 @@ func (it *iterator) trellisQuantizeBlock(in *[16]int16, out *[16]int16, ctx0 int
 	if coeffType == typeI16AC {
 		first = 1
 	}
-	var nodes [16][numNodes]trellisNode
-	var states [2][numNodes]scoreState
-	ssCur := &states[0]
-	ssPrev := &states[1]
+	lambda64 := int64(lambda)
+	var nodes [16][2]trellisNode
 	bestPath := [3]int{-1, -1, -1}
 	var bestScore int64
 	last := first - 1
+	// State of the two nodes of the previous position.
+	var score0, score1 int64
+	var costs0, costs1 *levelCostTable
 	{
 		thresh := int32(mtx.q[1] * mtx.q[1] / 4)
 		lastProba := probas[encBands[first]][ctx0][0]
@@ -441,83 +446,93 @@ func (it *iterator) trellisQuantizeBlock(in *[16]int16, out *[16]int16, ctx0 int
 		if ctx0 == 0 {
 			rate = int64(bitCost(1, lastProba))
 		}
-		for m := 0; m < numNodes; m++ {
-			ssCur[m].score = rdScoreTrellis(lambda, rate, 0)
-			ssCur[m].costs = &costs[encBands[first]][ctx0]
-		}
+		score0 = rdScoreTrellis(lambda, rate, 0)
+		score1 = score0
+		costs0 = &costs[encBands[first]][ctx0]
+		costs1 = costs0
 	}
 
 	for n := first; n <= last; n++ {
-		j := kZigzag[n] & 15
-		Q := mtx.q[j]
+		j := kZigzag[n&15] & 15
+		Q := int64(mtx.q[j])
 		iQ := mtx.iq[j]
-		B := biasOf(0x00)
 		v := int32(in[j])
 		sign := v < 0
-		if sign {
-			v = -v
-		}
-		coeff0 := uint32(v) + mtx.sharpen[j]
-		level0 := int(quantDiv(coeff0, iQ, B))
-		threshLevel := int(quantDiv(coeff0, iQ, biasOf(0x80)))
-		if threshLevel > maxLevel {
-			threshLevel = maxLevel
-		}
-		if level0 > maxLevel {
-			level0 = maxLevel
-		}
-		ssCur, ssPrev = ssPrev, ssCur
-
+		neg := v >> 31
+		coeff0 := uint32((v^neg)-neg) + mtx.sharpen[j] // |v| + sharpen
+		// quantDiv results are >= 0
+		level0 := min(int(quantDiv(coeff0, iQ, biasOf(0x00))), maxLevel)
+		threshLevel := min(int(quantDiv(coeff0, iQ, biasOf(0x80))), maxLevel)
 		band := encBands[n+1]
-		for m := 0; m < numNodes; m++ {
-			cur := &nodes[n][m]
-			level := level0 + m
-			ctx := level
-			if ctx > 2 {
-				ctx = 2
-			}
-			ssCur[m].costs = &costs[band][ctx]
-			if level < 0 || level > threshLevel {
-				ssCur[m].score = maxCost
-				continue
-			}
-			var baseScore int64
-			{
-				newError := int64(coeff0) - int64(level)*int64(Q)
-				deltaError := int64(kWeightTrellis[j]) * (newError*newError - int64(coeff0)*int64(coeff0))
-				baseScore = rdScoreTrellis(lambda, 0, deltaError)
-			}
-			cost := int64(levelCost(ssPrev[0].costs, level))
-			bestCurScore := ssPrev[0].score + rdScoreTrellis(lambda, cost, 0)
+		bandCosts := &costs[band&7]
+		cur := &nodes[n]
+		if level0|threshLevel == 0 {
+			// Common case: only the level 0 node is possible. Its
+			// distortion delta is 0 and it cannot end the block.
+			bestCurScore := score0 + trellisLevelCost(costs0, 0)*lambda64
 			bestPrev := 0
-			{
-				cost = int64(levelCost(ssPrev[1].costs, level))
-				score := ssPrev[1].score + rdScoreTrellis(lambda, cost, 0)
-				if score < bestCurScore {
-					bestCurScore = score
-					bestPrev = 1
-				}
+			if s := score1 + trellisLevelCost(costs1, 0)*lambda64; s < bestCurScore {
+				bestCurScore = s
+				bestPrev = 1
+			}
+			cur[0] = trellisNode{prev: int8(bestPrev), sign: sign}
+			score0, score1 = bestCurScore, maxCost
+			costs0, costs1 = &bandCosts[0], &bandCosts[1]
+			continue
+		}
+		bandProbas := &probas[band&7]
+		weight := int64(kWeightTrellis[j])
+		coeff0Sq := int64(coeff0) * int64(coeff0)
+
+		next0, next1 := maxCost, maxCost
+		if level := level0; level <= threshLevel {
+			newError := int64(coeff0) - int64(level)*Q
+			baseScore := rdDistoMult * (weight * (newError*newError - coeff0Sq))
+			bestCurScore := score0 + trellisLevelCost(costs0, level)*lambda64
+			bestPrev := 0
+			if s := score1 + trellisLevelCost(costs1, level)*lambda64; s < bestCurScore {
+				bestCurScore = s
+				bestPrev = 1
 			}
 			bestCurScore += baseScore
-			cur.sign = sign
-			cur.level = int16(level)
-			cur.prev = int8(bestPrev)
-			ssCur[m].score = bestCurScore
-
+			cur[0] = trellisNode{prev: int8(bestPrev), sign: sign, level: int16(level)}
+			next0 = bestCurScore
 			if level != 0 && bestCurScore < bestScore {
 				lastPosCost := int64(0)
 				if n < 15 {
-					lastPosCost = int64(bitCost(0, probas[band][ctx][0]))
+					lastPosCost = int64(bitCost(0, bandProbas[min(level, 2)][0]))
 				}
-				score := bestCurScore + rdScoreTrellis(lambda, lastPosCost, 0)
-				if score < bestScore {
+				if score := bestCurScore + lastPosCost*lambda64; score < bestScore {
 					bestScore = score
-					bestPath[0] = n
-					bestPath[1] = m
-					bestPath[2] = bestPrev
+					bestPath = [3]int{n, 0, bestPrev}
 				}
 			}
 		}
+		if level := level0 + 1; level <= threshLevel {
+			newError := int64(coeff0) - int64(level)*Q
+			baseScore := rdDistoMult * (weight * (newError*newError - coeff0Sq))
+			bestCurScore := score0 + trellisLevelCost(costs0, level)*lambda64
+			bestPrev := 0
+			if s := score1 + trellisLevelCost(costs1, level)*lambda64; s < bestCurScore {
+				bestCurScore = s
+				bestPrev = 1
+			}
+			bestCurScore += baseScore
+			cur[1] = trellisNode{prev: int8(bestPrev), sign: sign, level: int16(level)}
+			next1 = bestCurScore
+			if bestCurScore < bestScore { // level != 0
+				lastPosCost := int64(0)
+				if n < 15 {
+					lastPosCost = int64(bitCost(0, bandProbas[min(level, 2)][0]))
+				}
+				if score := bestCurScore + lastPosCost*lambda64; score < bestScore {
+					bestScore = score
+					bestPath = [3]int{n, 1, bestPrev}
+				}
+			}
+		}
+		score0, score1 = next0, next1
+		costs0, costs1 = &bandCosts[min(level0, 2)], &bandCosts[min(level0+1, 2)]
 	}
 
 	if coeffType == typeI16AC {
