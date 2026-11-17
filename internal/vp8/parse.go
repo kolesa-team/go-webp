@@ -4,6 +4,8 @@ package vp8
 // (ParseIntraMode), dec/vp8_dec.c (GetCoeffs, ParseResiduals) and
 // dec/frame_dec.c (ReconstructRow).
 
+import "encoding/binary"
+
 // kZigzag maps the coefficient scan order to raster positions.
 var kZigzag = [16]uint8{0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15}
 
@@ -349,80 +351,55 @@ func (d *decoder) initRowEdges(mbY int) {
 // reconstructMB predicts the macroblock, adds the residuals and copies the
 // result into the row cache.
 func (d *decoder) reconstructMB(mbX, mbY int, blk *mbBlock) {
-	b := d.yuvB[:]
-	if mbX > 0 {
-		// Rotate in the left samples from the previous block.
-		for j := -1; j < 16; j++ {
-			o := yOff + j*bps
-			*(*[4]byte)(b[o-4:]) = *(*[4]byte)(b[o+12:])
-		}
-		for j := -1; j < 8; j++ {
-			o := uOff + j*bps
-			*(*[4]byte)(b[o-4:]) = *(*[4]byte)(b[o+4:])
-			o = vOff + j*bps
-			*(*[4]byte)(b[o-4:]) = *(*[4]byte)(b[o+4:])
-		}
-	}
-	top := &d.yuvT[mbX]
-	if mbY > 0 {
-		*(*[16]byte)(b[yOff-bps:]) = top.y
-		*(*[8]byte)(b[uOff-bps:]) = top.u
-		*(*[8]byte)(b[vOff-bps:]) = top.v
-	}
-	coeffs := &blk.coeffs
-	bits := blk.nonZeroY
-	if blk.isI4x4 {
-		tr := yOff - bps + 16
-		if mbY > 0 {
-			if mbX >= d.mbW-1 { // on rightmost edge
-				v := top.y[15]
-				b[tr], b[tr+1], b[tr+2], b[tr+3] = v, v, v, v
-			} else {
-				*(*[4]byte)(b[tr:]) = *(*[4]byte)(d.yuvT[mbX+1].y[:4])
-			}
-		}
-		// replicate the top-right pixels below
-		for k := 1; k <= 3; k++ {
-			*(*[4]byte)(b[tr+4*k*bps:]) = *(*[4]byte)(b[tr:])
-		}
-		for n := 0; n < 16; n++ {
-			o := yOff + kScan[n]
-			predLuma4(blk.imodes[n], b, o)
-			doTransform(bits>>30, (*[16]int16)(coeffs[n*16:]), b, o)
-			bits <<= 2
-		}
-	} else {
-		predLuma16(checkMode(mbX, mbY, blk.imodes[0]), b)
-		if bits != 0 {
-			for n := 0; n < 16; n++ {
-				doTransform(bits>>30, (*[16]int16)(coeffs[n*16:]), b, yOff+kScan[n])
-				bits <<= 2
-			}
-		}
-	}
-	// Chroma
-	uvMode := checkMode(mbX, mbY, blk.uvmode)
-	predChroma8(uvMode, b, uOff)
-	predChroma8(uvMode, b, vOff)
-	doUVTransform(blk.nonZeroUV>>0, coeffs, 16*16, b, uOff)
-	doUVTransform(blk.nonZeroUV>>8, coeffs, 20*16, b, vOff)
+	d.loadMBEdges(mbX, mbY, blk.isI4x4)
+	reconBlock(&d.yuvB, mbX, mbY, blk)
+	d.storeMB(mbX, mbY)
+}
 
-	// stash away top samples for next block
+// reconBlock runs the prediction and residual kernels of the macroblock on
+// the work buffer, whose edges loadMBEdges has set up.
+func reconBlock(b *[yuvSize]byte, mbX, mbY int, blk *mbBlock) {
+	if blk.isI4x4 {
+		reconI4(b, &blk.coeffs, blk.nonZeroY, &blk.imodes)
+	} else {
+		reconI16(b, &blk.coeffs, blk.nonZeroY, checkMode(mbX, mbY, blk.imodes[0]))
+	}
+	reconUV(b, &blk.coeffs, blk.nonZeroUV, checkMode(mbX, mbY, blk.uvmode))
+}
+
+// loadMBEdges sets up the left, top and (for intra 4x4) top-right samples
+// of the macroblock in the work buffer.
+func (d *decoder) loadMBEdges(mbX, mbY int, isI4x4 bool) {
+	top := &d.yuvT[mbX]
+	var flags, tr uint32
+	if mbX > 0 {
+		flags |= edgeRotate
+	}
+	if mbY > 0 {
+		flags |= edgeTop
+	}
+	if isI4x4 {
+		flags |= edgeI4
+		if mbY > 0 {
+			flags |= edgeTopRight
+			if mbX >= d.mbW-1 { // on rightmost edge
+				tr = uint32(top.y[15]) * 0x01010101
+			} else {
+				tr = binary.LittleEndian.Uint32(d.yuvT[mbX+1].y[:4])
+			}
+		}
+	}
+	loadEdges(&d.yuvB, top, tr, flags)
+}
+
+// storeMB saves the bottom samples of the reconstructed macroblock for the
+// next row and copies it into the row cache.
+func (d *decoder) storeMB(mbX, mbY int) {
+	var top *topSamples
 	if mbY < d.mbH-1 {
-		top.y = *(*[16]byte)(b[yOff+15*bps:])
-		top.u = *(*[8]byte)(b[uOff+7*bps:])
-		top.v = *(*[8]byte)(b[vOff+7*bps:])
+		top = &d.yuvT[mbX]
 	}
-	// Transfer reconstructed samples to the row cache.
-	ys := d.cacheYStride
 	yo := d.cacheYOff + mbX*16
-	for j := 0; j < 16; j++ {
-		*(*[16]byte)(d.cacheY[yo+j*ys:]) = *(*[16]byte)(b[yOff+j*bps:])
-	}
-	uvs := d.cacheUVStride
 	uvo := d.cacheUVOff + mbX*8
-	for j := 0; j < 8; j++ {
-		*(*[8]byte)(d.cacheU[uvo+j*uvs:]) = *(*[8]byte)(b[uOff+j*bps:])
-		*(*[8]byte)(d.cacheV[uvo+j*uvs:]) = *(*[8]byte)(b[vOff+j*bps:])
-	}
+	storeMBRows(&d.yuvB, top, d.cacheY[yo:], d.cacheU[uvo:], d.cacheV[uvo:], d.cacheYStride, d.cacheUVStride)
 }
