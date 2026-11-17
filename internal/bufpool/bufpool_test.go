@@ -138,6 +138,9 @@ func TestTrimIdle(t *testing.T) {
 	var p Pool[byte]
 	old := make([]byte, 100)
 	p.Put(old)
+	// Sleep on both sides of the cutoff: trim keeps a buffer put at the
+	// cutoff itself, which a coarse clock could otherwise produce.
+	time.Sleep(time.Millisecond)
 	cut := now()
 	time.Sleep(time.Millisecond)
 	young := make([]byte, 100)
