@@ -92,7 +92,7 @@ func TestCleanFastPath(t *testing.T) {
 					cleanFastPath = fast
 					argb := slices.Clone(src)
 					modes := make([]uint32, subSampleSize(c.w, bits)*subSampleSize(c.h, bits))
-					b := predictorImage(c.w, c.h, bits, maxBits, false, 1, true, true, argb, modes, new(scratch), helpers)
+					b := predictorImage(c.w, c.h, bits, maxBits, false, 1, true, true, false, argb, modes, new(scratch), helpers)
 					return argb, modes, b
 				}
 				wantArgb, wantModes, wantBits := run(false, 0)
@@ -148,7 +148,7 @@ func TestPredictorParallel(t *testing.T) {
 						run := func(helpers int) ([]uint32, []uint32, int) {
 							argb := slices.Clone(in.argb)
 							modes := make([]uint32, subSampleSize(in.w, bits)*subSampleSize(in.h, bits))
-							b := predictorImage(in.w, in.h, bits, bits, false, maxQuant, subGreen, clean, argb, modes, new(scratch), helpers)
+							b := predictorImage(in.w, in.h, bits, bits, false, maxQuant, subGreen, clean, false, argb, modes, new(scratch), helpers)
 							return argb, modes, b
 						}
 						wantArgb, wantModes, wantBits := run(0)
@@ -172,6 +172,66 @@ func TestPredictorParallel(t *testing.T) {
 								t.Fatalf("%s bits %d: search with an exhausted budget differs", in.name, bits)
 							}
 						}()
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestPredictorOpaque checks the opaque shortcut of the mode search: for
+// opaque images, every alpha residual is 0 (for every mode, with and
+// without near-lossless), so the search with opaque set chooses the same
+// modes and produces the same residuals.
+func TestPredictorOpaque(t *testing.T) {
+	rng := rand.New(rand.NewSource(5))
+	inputs := predInputs()
+	noise := make([]uint32, 61*39)
+	for i := range noise {
+		noise[i] = 0xff000000 | rng.Uint32()
+	}
+	inputs = append(inputs, struct {
+		name string
+		argb []uint32
+		w, h int
+	}{"opaque noise", noise, 61, 39})
+	for _, in := range inputs {
+		if slices.ContainsFunc(in.argb, func(p uint32) bool { return p < 0xff000000 }) {
+			continue
+		}
+		for mode := 0; mode < numPredModes; mode++ {
+			out := make([]uint32, in.w)
+			for y := 0; y < in.h; y++ {
+				var up []uint32
+				if y > 0 {
+					up = in.argb[(y-1)*in.w : y*in.w+1]
+				}
+				residualRow(mode, in.argb[y*in.w:(y+1)*in.w], up, y, 0, in.w, out)
+				for x, r := range out {
+					if r>>24 != 0 {
+						t.Fatalf("%s mode %d: alpha residual %#x at (%d,%d)", in.name, mode, r, x, y)
+					}
+				}
+			}
+		}
+		for _, bits := range []int{2, 3, 5} {
+			for _, maxBits := range []int{bits, min(bits+2, maxTransformBits)} {
+				for _, maxQuant := range []int{1, 8} {
+					for _, subGreen := range []bool{false, true} {
+						run := func(opaque bool, helpers int) ([]uint32, []uint32, int) {
+							argb := slices.Clone(in.argb)
+							modes := make([]uint32, subSampleSize(in.w, bits)*subSampleSize(in.h, bits))
+							b := predictorImage(in.w, in.h, bits, maxBits, false, maxQuant, subGreen, false, opaque, argb, modes, new(scratch), helpers)
+							return argb, modes, b
+						}
+						wantArgb, wantModes, wantBits := run(false, 0)
+						for _, helpers := range []int{0, 3} {
+							argb, modes, b := run(true, helpers)
+							if b != wantBits || !slices.Equal(modes, wantModes) || !slices.Equal(argb, wantArgb) {
+								t.Fatalf("%s bits %d..%d maxQuant %d subGreen %v helpers %d: opaque search differs",
+									in.name, bits, maxBits, maxQuant, subGreen, helpers)
+							}
+						}
 					}
 				}
 			}

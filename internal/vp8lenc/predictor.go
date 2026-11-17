@@ -352,11 +352,14 @@ func predictionCostSpatialHistogram(acc, tile *histo4, ae *[4]accEntropy) float6
 // residuals.
 //
 // clean enables libwebp's exact=0 handling of fully transparent pixels
-// (ignored with lowEffort, as in libwebp).
+// (ignored with lowEffort, as in libwebp). opaque tells that every pixel of
+// argb has alpha 0xff: the predictions and (near-lossless) reconstructions
+// are then opaque too, so the alpha residuals are all 0 and the mode search
+// skips their histogram.
 //
 // With helpers > 0, the single-sampling mode search (minBits == maxBits)
 // is spread over helper goroutines (see predSearch.runPar).
-func predictorImage(width, height, minBits, maxBits int, lowEffort bool, maxQuant int, usedSubGreen, clean bool,
+func predictorImage(width, height, minBits, maxBits int, lowEffort bool, maxQuant int, usedSubGreen, clean, opaque bool,
 	argb []uint32, modes []uint32, sc *scratch, helpers int) int {
 	n := width * height
 	var md []uint8
@@ -387,7 +390,8 @@ func predictorImage(width, height, minBits, maxBits int, lowEffort bool, maxQuan
 		}
 	} else {
 		ps := predSearch{width: width, height: height, minBits: minBits, maxBits: maxBits,
-			maxQuant: maxQuant, md: md, mask: mask, usedSubGreen: usedSubGreen, clean: clean, slow: slow, argb: argb, sc: sc}
+			maxQuant: maxQuant, md: md, mask: mask, usedSubGreen: usedSubGreen, clean: clean, slow: slow, opaque: opaque,
+			argb: argb, sc: sc}
 		if helpers > 0 && minBits == maxBits {
 			bits = ps.runPar(modes, helpers)
 		} else {
@@ -454,6 +458,7 @@ type predSearch struct {
 	mask             []uint8 // see cleanMask (nil: every pixel takes the slow path)
 	usedSubGreen     bool
 	clean, slow      bool
+	opaque           bool // every alpha residual is 0 (see predictorImage)
 	argb             []uint32
 	sc               *scratch
 
@@ -516,10 +521,7 @@ func (ps *predSearch) run(modes []uint32) int {
 			r := resid[:maxX*maxY]
 			ps.tileResiduals(mode, sx, sy, maxX, maxY, slow, r, rowCur, rowUp)
 			for l := 0; l <= updateUpTo; l++ {
-				h := &ps.hist[l*numPredModes+mode]
-				for _, p := range r {
-					h.add(p)
-				}
+				ps.addResiduals(&ps.hist[l*numPredModes+mode], r)
 			}
 		}
 		// Update all the super-tiles that are complete.
@@ -640,10 +642,7 @@ func (ps *predSearch) runPar(modes []uint32, helpers int) int {
 			slow := ps.tileSlow(sx, sy, maxX, maxY)
 			for mode := range hs {
 				ps.tileResiduals(mode, sx, sy, maxX, maxY, slow, r, w.rowCur, w.rowUp)
-				h := &hs[mode]
-				for _, p := range r {
-					h.add(p)
-				}
+				ps.addResiduals(&hs[mode], r)
 			}
 		}
 	}
@@ -674,6 +673,23 @@ func (ps *predSearch) runPar(modes []uint32, helpers int) int {
 		})
 	}
 	return ps.finish(modes)
+}
+
+// addResiduals adds the residuals r to h. For an opaque image, their alpha
+// is 0 (see predictorImage): it is counted at once.
+func (ps *predSearch) addResiduals(h *histo4, r []uint32) {
+	if !ps.opaque {
+		for _, p := range r {
+			h.add(p)
+		}
+		return
+	}
+	h[0][0] += int32(len(r))
+	for _, p := range r {
+		h[1][(p>>16)&0xff]++
+		h[2][(p>>8)&0xff]++
+		h[3][p&0xff]++
+	}
 }
 
 // bestForTile chooses the mode of the (super-)tile (tx, ty) at level sub
