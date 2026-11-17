@@ -47,6 +47,9 @@ func TestLargeEncodeReusesBuffers(t *testing.T) {
 // budget too small for most buffers and with the default budget.
 func TestPoolBudgetDoesNotChangeOutput(t *testing.T) {
 	img := synthImage(333, 251, 3, 5)
+	if testing.Short() {
+		img = synthImage(133, 71, 3, 5)
+	}
 	cfgs := []Config{DefaultConfig(), DefaultConfig(), DefaultConfig()}
 	cfgs[1].Method = 0
 	cfgs[2].Method, cfgs[2].ThreadLevel, cfgs[2].Pass, cfgs[2].TargetSize = 6, true, 3, 5000
