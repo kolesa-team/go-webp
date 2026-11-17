@@ -142,7 +142,8 @@ func paletteXBits(n int) int {
 }
 
 // applyPalette maps argb (width x height) to bundled palette indices in dst
-// (packed width x height).
+// (packed width x height). dst may be argb itself: each row is read entirely
+// (into idxRow) before its bundled row, which starts no later, is written.
 func applyPalette(argb []uint32, width, height int, palette []uint32, dst []uint32, idxRow []uint8) {
 	xbits := paletteXBits(len(palette))
 	pw := subSampleSize(width, xbits)
