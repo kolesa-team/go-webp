@@ -654,22 +654,6 @@ func quantizeBlock(in *[16]int16, out *[16]int16, m *matrix) bool {
 	return nz != 0
 }
 
-// isFlat returns true if the number of non-zero AC levels is <= thresh.
-func isFlat(levels []([16]int16), thresh int) bool {
-	score := 0
-	for b := range levels {
-		l := &levels[b]
-		for i := 1; i < 16; i++ {
-			v := uint16(l[i])
-			score += int((v | -v) >> 15)
-		}
-		if score > thresh {
-			return false
-		}
-	}
-	return true
-}
-
 func isFlatSource16(src []byte) bool {
 	v := src[0]
 	for y := 0; y < 16; y++ {
@@ -703,10 +687,50 @@ const maxCoeffThresh = 31
 // collectHistogram returns the (maxValue, lastNonZero) of the histogram of
 // DCT coefficients of ref-pred over the blocks of t (tabY16 or tabUV).
 func collectHistogram(ref, pred []byte, t *pairTable) (int, int) {
-	var distribution [maxCoeffThresh + 1]int
 	var coeffs [16][16]int16
-	fTransformPairs(ref, pred, t, coeffs[:])
-	for _, out := range coeffs[:2*t.n] {
+	n := 2 * t.n
+	fTransformPairs(ref, pred, t, coeffs[:n])
+	return histogramStats(coeffs[:n])
+}
+
+// coeffBin is the histogram bin of a DCT coefficient: min(|v| >> 3, 31).
+func coeffBin(v int16) int {
+	a := int32(v)
+	s := a >> 31
+	return int(min((a^s-s)>>3, maxCoeffThresh)) & maxCoeffThresh
+}
+
+// histogramStats returns the largest bin count and the last non-empty bin
+// of the histogram of coeffBin over the coefficients (at most 4096 of
+// them). Most coefficients fall in bin 0, so the counting uses four
+// interleaved sub-histograms: the increments do not form one serial chain
+// through memory.
+func histogramStats(coeffs [][16]int16) (int, int) {
+	var dist [4][maxCoeffThresh + 1]uint16
+	for b := range coeffs {
+		c := &coeffs[b]
+		for k := 0; k < 16; k += 4 {
+			dist[0][coeffBin(c[k])]++
+			dist[1][coeffBin(c[k+1])]++
+			dist[2][coeffBin(c[k+2])]++
+			dist[3][coeffBin(c[k+3])]++
+		}
+	}
+	maxValue, lastNonZero := 0, 1
+	for k := 0; k <= maxCoeffThresh; k++ {
+		value := int(dist[0][k]) + int(dist[1][k]) + int(dist[2][k]) + int(dist[3][k])
+		if value > 0 {
+			maxValue = max(maxValue, value)
+			lastNonZero = k
+		}
+	}
+	return maxValue, lastNonZero
+}
+
+// histogramStatsRef is the straightforward version of histogramStats.
+func histogramStatsRef(coeffs [][16]int16) (int, int) {
+	var distribution [maxCoeffThresh + 1]int
+	for _, out := range coeffs {
 		for k := 0; k < 16; k++ {
 			v := int32(out[k])
 			s := v >> 31

@@ -186,11 +186,66 @@ func TestQuantizeBlocksExact(t *testing.T) {
 			}
 		}
 		outRef = out
-		nz := quantizeBlocks(in[:n], out[:], m)
-		nzRef := quantizeBlocksRef(inRef[:n], outRef[:], m)
+		var info, infoRef [16]uint16
+		info[n-1] = 0xdead // must be overwritten
+		var infoArg []uint16
+		if iter%4 != 0 {
+			infoArg = info[:]
+		}
+		nz := quantizeBlocks(in[:n], out[:], m, infoArg)
+		nzRef := quantizeBlocksRef(inRef[:n], outRef[:], m, infoRef[:])
 		if nz != nzRef || in != inRef || out != outRef {
 			t.Fatalf("iter %d (n %d, matrix %+v): nz %#x/%#x\nin  %v\nwant %v\nout %v\nwant %v",
 				iter, n, *m, nz, nzRef, in, inRef, out, outRef)
+		}
+		if infoArg != nil {
+			if info != infoRef {
+				t.Fatalf("iter %d: info %v, want %v", iter, info, infoRef)
+			}
+		} else if info[n-1] != 0xdead {
+			t.Fatalf("iter %d: info written although nil", iter)
+		}
+	}
+}
+
+// isFlat is libwebp's IsFlat, the reference for flatInfo: true if the
+// number of non-zero AC levels is <= thresh.
+func isFlat(levels []([16]int16), thresh int) bool {
+	score := 0
+	for b := range levels {
+		l := &levels[b]
+		for i := 1; i < 16; i++ {
+			v := uint16(l[i])
+			score += int((v | -v) >> 15)
+		}
+		if score > thresh {
+			return false
+		}
+	}
+	return true
+}
+
+// TestLevelInfo checks levelInfoOf against lastNonZero and isFlat.
+func TestLevelInfo(t *testing.T) {
+	rng := rand.New(rand.NewSource(8))
+	for iter := 0; iter < 100000; iter++ {
+		var c [16]int16
+		for i := range c {
+			if rng.Intn(3) == 0 {
+				c[i] = int16(rng.Intn(65536))
+			}
+		}
+		if iter&1 == 0 {
+			c[rng.Intn(16)] = -32768
+		}
+		info := levelInfoOf(&c)
+		if got, want := infoLast(info), lastNonZero(&c); got != want {
+			t.Fatalf("%v: last %d, want %d", c, got, want)
+		}
+		for thresh := 0; thresh <= 15; thresh++ {
+			if got, want := flatInfo([]uint16{info}, thresh), isFlat([][16]int16{c}, thresh); got != want {
+				t.Fatalf("%v: flat(%d) %v, want %v", c, thresh, got, want)
+			}
 		}
 	}
 }
@@ -268,7 +323,8 @@ func TestVecBounds(t *testing.T) {
 	m.q[0], m.q[1] = 8, 8
 	expandMatrix(&m, 0)
 	in := make([][16]int16, 4)
-	mustPanic("quantizeBlocks", func() { quantizeBlocks(in, in[:3], &m) })
+	mustPanic("quantizeBlocks", func() { quantizeBlocks(in, in[:3], &m, nil) })
+	mustPanic("quantizeBlocks info", func() { quantizeBlocks(in, in[:], &m, make([]uint16, 3)) })
 }
 
 // fuzzTable builds a pair table from fuzz bytes: up to 8 pairs at offsets
@@ -381,14 +437,16 @@ func FuzzQuantizeBlocks(f *testing.F) {
 		inRef := append([][16]int16(nil), in...)
 		out := make([][16]int16, n)
 		outRef := make([][16]int16, n)
-		nz := quantizeBlocks(in, out, &m)
-		nzRef := quantizeBlocksRef(inRef, outRef, &m)
+		info := make([]uint16, n)
+		infoRef := make([]uint16, n)
+		nz := quantizeBlocks(in, out, &m, info)
+		nzRef := quantizeBlocksRef(inRef, outRef, &m, infoRef)
 		if nz != nzRef {
 			t.Fatalf("nz %#x, want %#x", nz, nzRef)
 		}
 		for b := range in {
-			if in[b] != inRef[b] || out[b] != outRef[b] {
-				t.Fatalf("block %d: %v %v, want %v %v", b, in[b], out[b], inRef[b], outRef[b])
+			if in[b] != inRef[b] || out[b] != outRef[b] || info[b] != infoRef[b] {
+				t.Fatalf("block %d: %v %v %#x, want %v %v %#x", b, in[b], out[b], info[b], inRef[b], outRef[b], infoRef[b])
 			}
 		}
 	})
@@ -444,6 +502,7 @@ func BenchmarkVecKernels(b *testing.B) {
 	fillPixels(rng, src)
 	fillPixels(rng, ref)
 	var coeffs, levels [16][16]int16
+	var info [16]uint16
 	var res [16]int32
 	var m matrix
 	m.q[0], m.q[1] = uint32(kDcTable[40]), uint32(kAcTable[40])
@@ -462,14 +521,14 @@ func BenchmarkVecKernels(b *testing.B) {
 	run("FTransformI4/go", func() { fTransformPairsRef(src, ref, &tabI4Src, coeffs[:]) })
 	run("QuantizeY16/vec", func() {
 		c := coeffs
-		quantizeBlocks(c[:], levels[:], &m)
+		quantizeBlocks(c[:], levels[:], &m, info[:])
 	})
 	run("QuantizeY16/go", func() {
 		c := coeffs
-		quantizeBlocksRef(c[:], levels[:], &m)
+		quantizeBlocksRef(c[:], levels[:], &m, info[:])
 	})
 	c := coeffs
-	quantizeBlocksRef(c[:], levels[:], &m)
+	quantizeBlocksRef(c[:], levels[:], &m, info[:])
 	run("ITransformY16/vec", func() { iTransformPairs(ref, c[:], dst, &tabY16) })
 	run("ITransformY16/go", func() { iTransformPairsRef(ref, c[:], dst, &tabY16) })
 	run("TTransformY16/vec", func() { tTransformPairs(src, &tabY16, res[:]) })
@@ -478,4 +537,60 @@ func BenchmarkVecKernels(b *testing.B) {
 	run("SSE4x4I4/go", func() { sse4x4PairsRef(src, ref, &tabI4Src, res[:]) })
 	run("SSE16x16/vec", func() { sse16x16(src, ref) })
 	run("SSE16x16/go", func() { sse16x16Ref(src, ref) })
+}
+
+func TestHistogramExact(t *testing.T) {
+	rng := rand.New(rand.NewSource(6))
+	src := make([]byte, 16*bps)
+	ref := make([]byte, 16*bps)
+	var coeffs [16][16]int16
+	for iter := 0; iter < vecIters(t, 20000); iter++ {
+		fillPixels(rng, src)
+		fillPixels(rng, ref)
+		for _, tc := range []*pairTable{&tabY16, &tabUV} {
+			m, l := collectHistogram(src, ref, tc)
+			fTransformPairsRef(src, ref, tc, coeffs[:])
+			mr, lr := histogramStatsRef(coeffs[:2*tc.n])
+			if m != mr || l != lr {
+				t.Fatalf("iter %d: got (%d, %d), want (%d, %d)", iter, m, l, mr, lr)
+			}
+		}
+		// arbitrary coefficients, including the extremes
+		n := 1 + rng.Intn(16)
+		for b := 0; b < n; b++ {
+			fillCoeffs(rng, coeffs[b][:])
+		}
+		m, l := histogramStats(coeffs[:n])
+		mr, lr := histogramStatsRef(coeffs[:n])
+		if m != mr || l != lr {
+			t.Fatalf("iter %d: got (%d, %d), want (%d, %d) for %v", iter, m, l, mr, lr, coeffs[:n])
+		}
+	}
+}
+
+func BenchmarkHistogram(b *testing.B) {
+	rng := rand.New(rand.NewSource(7))
+	src := make([]byte, 16*bps)
+	ref := make([]byte, 16*bps)
+	for i := range src {
+		src[i] = byte(128 + rng.Intn(9) - 4)
+		ref[i] = byte(128 + rng.Intn(9) - 4)
+	}
+	var coeffs [16][16]int16
+	fTransformPairsRef(src, ref, &tabY16, coeffs[:])
+	b.Run("collect", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			collectHistogram(src, ref, &tabY16)
+		}
+	})
+	b.Run("stats", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			histogramStats(coeffs[:])
+		}
+	})
+	b.Run("statsRef", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			histogramStatsRef(coeffs[:])
+		}
+	})
 }
