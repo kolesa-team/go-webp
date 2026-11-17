@@ -435,11 +435,12 @@ func (d *decoder) emitPaletteIdx8(t *transform, src, dst []byte) {
 		lookupRGBA(d.paletteRGBA(t), src, dst)
 		return
 	}
-	expandBundledRGBA(d.bundleTable(t), t.bits, src, dst)
+	expandBundledRGBA(d.paletteRGBA(t), d.bundleTable(t), t.bits, src, dst)
 }
 
 // lookupRGBA writes the RGBA words pal[src[i]] to dst (as many pixels as
-// fit), 8 pixels per step.
+// fit), 8 pixels per step. (A 256-color palette does not fit NEON tables,
+// and scalar assembly measured only 1.08x faster than this loop.)
 func lookupRGBA(pal *[256]uint32, src, dst []byte) {
 	n := min(len(src), len(dst)/4)
 	src, dst = src[:n], dst[:4*n]
@@ -457,10 +458,12 @@ func lookupRGBA(pal *[256]uint32, src, dst []byte) {
 	}
 }
 
-// expandBundledRGBA expands one row of bundled palette indices (each byte
-// of src holds 1<<bits of them, bits 1 to 3) into the RGBA bytes dst, from
-// tab, the pixels of each packed byte two per word (see bundleTable).
-func expandBundledRGBA(tab []uint64, bits int, src, dst []byte) {
+// expandBundledRGBAGo is the reference of expandBundledRGBA (dsp_*.go): it
+// expands one row of bundled palette indices (each byte of src holds
+// 1<<bits of them, bits 1 to 3) into the RGBA bytes dst (as many pixels as
+// fit), from tab, the pixels of each packed byte two per word (see
+// bundleTable).
+func expandBundledRGBAGo(tab []uint64, bits int, src, dst []byte) {
 	n := 4 << bits // bytes per packed byte
 	full := min(len(dst)/n, len(src))
 	switch bits {
