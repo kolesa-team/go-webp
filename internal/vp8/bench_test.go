@@ -3,21 +3,39 @@ package vp8
 import (
 	"image"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/kolesa-team/go-webp/v2/internal/pipeline"
 )
 
-func benchDecode(b *testing.B, path string, opts *Options) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		b.Skip(err)
+// benchVP8 returns the VP8 payload of a benchmark image. Images that are not
+// in the repository (large photos) are looked up in $WEBP_BENCH_CORPUS; the
+// benchmark is skipped when the file is not found.
+func benchVP8(b *testing.B, name string) []byte {
+	b.Helper()
+	paths := []string{filepath.Join("..", "..", "test_data", "images", name)}
+	if dir := os.Getenv("WEBP_BENCH_CORPUS"); dir != "" {
+		paths = append(paths, filepath.Join(dir, name))
 	}
-	ri, err := extractVP8(data)
-	if err != nil {
-		b.Fatal(err)
+	for _, p := range paths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		ri, err := extractVP8(data)
+		if err != nil {
+			b.Fatal(err)
+		}
+		return ri.vp8
 	}
-	w, h, err := DecodeHeader(ri.vp8)
+	b.Skipf("%s not found (set WEBP_BENCH_CORPUS)", name)
+	return nil
+}
+
+func benchDecode(b *testing.B, name string, opts *Options) {
+	vp8 := benchVP8(b, name)
+	w, h, err := DecodeHeader(vp8)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -26,32 +44,71 @@ func benchDecode(b *testing.B, path string, opts *Options) {
 	b.SetBytes(int64(w * h * 4))
 	b.ReportAllocs()
 	b.ResetTimer()
+	cpu0, cpuOK := processCPU()
 	for i := 0; i < b.N; i++ {
-		if err := Decode(ri.vp8, nil, opts, sink); err != nil {
+		if err := Decode(vp8, nil, opts, sink); err != nil {
 			b.Fatal(err)
+		}
+	}
+	if cpu1, ok := processCPU(); cpuOK && ok {
+		// CPU time of the whole process (all goroutines, GC) per decode.
+		b.ReportMetric(float64(cpu1-cpu0)/float64(b.N), "cpu-ns/op")
+	}
+}
+
+const (
+	benchM4      = "m4_q75.webp"
+	benchLogo    = "webp-logo-lossy.webp"
+	benchPhoto4K = "photo4k_q75.webp"
+	benchTile4K  = "photo4k_tile_q75.webp"
+)
+
+var threadsOpts = &Options{UseThreads: true}
+
+func BenchmarkDecodeM4(b *testing.B)        { benchDecode(b, benchM4, nil) }
+func BenchmarkDecodeM4Threads(b *testing.B) { benchDecode(b, benchM4, threadsOpts) }
+func BenchmarkDecodeM4NoFancy(b *testing.B) {
+	benchDecode(b, benchM4, &Options{NoFancyUpsampling: true})
+}
+func BenchmarkDecodeLogo(b *testing.B)           { benchDecode(b, benchLogo, nil) }
+func BenchmarkDecodeLogoThreads(b *testing.B)    { benchDecode(b, benchLogo, threadsOpts) }
+func BenchmarkDecodePhoto4K(b *testing.B)        { benchDecode(b, benchPhoto4K, nil) }
+func BenchmarkDecodePhoto4KThreads(b *testing.B) { benchDecode(b, benchPhoto4K, threadsOpts) }
+func BenchmarkDecodeTile4K(b *testing.B)         { benchDecode(b, benchTile4K, nil) }
+func BenchmarkDecodeTile4KThreads(b *testing.B)  { benchDecode(b, benchTile4K, threadsOpts) }
+
+// benchParse measures the bitstream parsing alone (modes and coefficient
+// tokens of every macroblock, no reconstruction or output).
+func benchParse(b *testing.B, name string) {
+	vp8 := benchVP8(b, name)
+	d := new(decoder)
+	blocks := []mbBlock(nil)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := d.parseHeaders(vp8); err != nil {
+			b.Fatal(err)
+		}
+		d.cropLeft, d.cropTop, d.cropRight, d.cropBottom = 0, 0, d.width, d.height
+		d.outW = d.width
+		d.enterCritical()
+		d.initFrame()
+		if cap(blocks) < d.mbW {
+			blocks = make([]mbBlock, d.mbW)
+		}
+		blocks = blocks[:d.mbW]
+		for mbY := 0; mbY < d.mbH; mbY++ {
+			if err := d.parseRow(mbY, blocks); err != nil {
+				b.Fatal(err)
+			}
 		}
 	}
 }
 
-func BenchmarkDecodeM4(b *testing.B) {
-	benchDecode(b, "../../test_data/images/m4_q75.webp", nil)
-}
-
-func BenchmarkDecodeM4NoFancy(b *testing.B) {
-	benchDecode(b, "../../test_data/images/m4_q75.webp", &Options{NoFancyUpsampling: true})
-}
-
-func BenchmarkDecodeM4Threads(b *testing.B) {
-	benchDecode(b, "../../test_data/images/m4_q75.webp", &Options{UseThreads: true})
-}
-
-func BenchmarkDecodeLogo(b *testing.B) {
-	benchDecode(b, "../../test_data/images/webp-logo-lossy.webp", nil)
-}
-
-func BenchmarkDecodeLogoThreads(b *testing.B) {
-	benchDecode(b, "../../test_data/images/webp-logo-lossy.webp", &Options{UseThreads: true})
-}
+func BenchmarkParseM4(b *testing.B)      { benchParse(b, benchM4) }
+func BenchmarkParseLogo(b *testing.B)    { benchParse(b, benchLogo) }
+func BenchmarkParsePhoto4K(b *testing.B) { benchParse(b, benchPhoto4K) }
+func BenchmarkParseTile4K(b *testing.B)  { benchParse(b, benchTile4K) }
 
 func BenchmarkUpsamplePair(b *testing.B) {
 	const w = 1024

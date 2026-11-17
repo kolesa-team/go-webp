@@ -30,9 +30,12 @@ type Options struct {
 	// dithering on macroblocks quantized hard enough (dwebp -dither).
 	DitheringStrength int
 	// UseThreads parses the bitstream in the calling goroutine while a
-	// second goroutine reconstructs, filters and converts the previously
-	// parsed macroblock row (libwebp's mt_method 2). Output is identical
-	// either way.
+	// helper goroutine reconstructs, filters and converts the previously
+	// parsed batch of macroblock rows (libwebp's mt_method 2). The helper
+	// comes from the process-wide budget of internal/workers; when none is
+	// free, or the picture is too small to gain from it (less than 1024
+	// macroblocks, about 512x512 pixels), the frame is decoded on the
+	// calling goroutine. Output is identical either way.
 	UseThreads bool
 	// Alpha, if not nil and no alpha plane is passed to Decode or
 	// DecodeRegion, is called before each batch of output rows is emitted
@@ -118,7 +121,7 @@ type decoder struct {
 	nzL, nzDCL             uint8
 	yuvT                   []topSamples
 	blk                    mbBlock
-	rowBlocks              [numRowSlots][]mbBlock // UseThreads row ring
+	mtBlocks               []mbBlock // UseThreads ring of parsed row batches
 	yuvB                   [yuvSize]byte
 	cacheY, cacheU, cacheV []byte
 	cacheYStride           int
