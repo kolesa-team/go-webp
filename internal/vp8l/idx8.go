@@ -414,28 +414,71 @@ func (d *decoder) emitIdx8(idx []byte, y0, row int) error {
 // emitPaletteIdx8 is emitPalette for one row of index bytes.
 func (d *decoder) emitPaletteIdx8(t *transform, src, dst []byte) {
 	if t.bits == 0 {
-		pal := d.paletteRGBA(t)
-		src = src[:min(len(src), len(dst)/4)]
-		dst = dst[:4*len(src)]
-		i := 0
-		for ; i+2 <= len(src); i += 2 {
-			binary.LittleEndian.PutUint64(dst[4*i:], uint64(pal[src[i]])|uint64(pal[src[i+1]])<<32)
-		}
-		if i < len(src) {
-			binary.LittleEndian.PutUint32(dst[4*i:], pal[src[i]])
-		}
+		lookupRGBA(d.paletteRGBA(t), src, dst)
 		return
 	}
-	// Bundled indices: expand a whole packed byte at once.
-	tab := d.bundleTable(t)
-	n := 4 << t.bits // bytes per packed byte
-	for _, c := range src {
-		e := tab[int(c)*n:]
-		if len(dst) < n {
-			copy(dst, e[:len(dst)])
-			return
+	expandBundledRGBA(d.bundleTable(t), t.bits, src, dst)
+}
+
+// lookupRGBA writes the RGBA words pal[src[i]] to dst (as many pixels as
+// fit), 8 pixels per step.
+func lookupRGBA(pal *[256]uint32, src, dst []byte) {
+	n := min(len(src), len(dst)/4)
+	src, dst = src[:n], dst[:4*n]
+	i := 0
+	for ; i+8 <= n; i += 8 {
+		v := binary.LittleEndian.Uint64(src[i : i+8])
+		o := dst[4*i : 4*i+32]
+		binary.LittleEndian.PutUint64(o[0:], uint64(pal[byte(v)])|uint64(pal[byte(v>>8)])<<32)
+		binary.LittleEndian.PutUint64(o[8:], uint64(pal[byte(v>>16)])|uint64(pal[byte(v>>24)])<<32)
+		binary.LittleEndian.PutUint64(o[16:], uint64(pal[byte(v>>32)])|uint64(pal[byte(v>>40)])<<32)
+		binary.LittleEndian.PutUint64(o[24:], uint64(pal[byte(v>>48)])|uint64(pal[byte(v>>56)])<<32)
+	}
+	for ; i < n; i++ {
+		binary.LittleEndian.PutUint32(dst[4*i:], pal[src[i]])
+	}
+}
+
+// expandBundledRGBA expands one row of bundled palette indices (each byte
+// of src holds 1<<bits of them, bits 1 to 3) into the RGBA bytes dst, from
+// tab, the pixels of each packed byte two per word (see bundleTable).
+func expandBundledRGBA(tab []uint64, bits int, src, dst []byte) {
+	n := 4 << bits // bytes per packed byte
+	full := min(len(dst)/n, len(src))
+	switch bits {
+	case 1:
+		t := tab[:256]
+		d := dst[:8*full]
+		for k, b := range src[:full] {
+			binary.LittleEndian.PutUint64(d[8*k:], t[b])
 		}
-		copy(dst[:n], e[:n])
-		dst = dst[n:]
+	case 2:
+		t := tab[:512]
+		d := dst[:16*full]
+		for k, b := range src[:full] {
+			e := t[2*int(b) : 2*int(b)+2]
+			o := d[16*k : 16*k+16]
+			binary.LittleEndian.PutUint64(o[0:], e[0])
+			binary.LittleEndian.PutUint64(o[8:], e[1])
+		}
+	default:
+		t := tab[:1024]
+		d := dst[:32*full]
+		for k, b := range src[:full] {
+			e := t[4*int(b) : 4*int(b)+4]
+			o := d[32*k : 32*k+32]
+			binary.LittleEndian.PutUint64(o[0:], e[0])
+			binary.LittleEndian.PutUint64(o[8:], e[1])
+			binary.LittleEndian.PutUint64(o[16:], e[2])
+			binary.LittleEndian.PutUint64(o[24:], e[3])
+		}
+	}
+	if x := full * n; x < len(dst) && full < len(src) {
+		// The last packed byte of the row holds fewer pixels.
+		e := tab[int(src[full])<<bits>>1:]
+		for j := 0; x+4 <= len(dst); j++ {
+			binary.LittleEndian.PutUint32(dst[x:], uint32(e[j>>1]>>(32*(j&1))))
+			x += 4
+		}
 	}
 }

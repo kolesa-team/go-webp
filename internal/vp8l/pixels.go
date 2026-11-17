@@ -515,15 +515,19 @@ func (d *decoder) emitPalette(t *transform, src []uint32, dst []byte) {
 	// Bundled indices: expand a whole packed byte at once from a table of
 	// the 256 possible byte values.
 	tab := d.bundleTable(t)
-	n := 4 << t.bits // bytes per packed byte
+	wpb := 1 << t.bits >> 1 // words per packed byte
 	for _, c := range src {
-		e := tab[(c>>8&0xff)*uint32(n):]
-		if len(dst) < n {
-			copy(dst, e[:len(dst)])
-			return
+		k := int(c>>8&0xff) * wpb
+		for _, v := range tab[k : k+wpb] {
+			if len(dst) < 8 {
+				if len(dst) >= 4 {
+					binary.LittleEndian.PutUint32(dst, uint32(v))
+				}
+				return
+			}
+			binary.LittleEndian.PutUint64(dst, v)
+			dst = dst[8:]
 		}
-		copy(dst[:n], e[:n])
-		dst = dst[n:]
 	}
 }
 
@@ -550,9 +554,10 @@ func (d *decoder) paletteRGBA(t *transform) *[256]uint32 {
 	return &d.pal
 }
 
-// bundleTable returns, for each packed index byte, the RGBA bytes of the
-// 1<<t.bits pixels it holds.
-func (d *decoder) bundleTable(t *transform) []byte {
+// bundleTable returns, for each packed index byte, the RGBA words of the
+// 1<<t.bits pixels it holds, two pixels per little-endian 64-bit word
+// (1<<t.bits/2 words per byte).
+func (d *decoder) bundleTable(t *transform) []uint64 {
 	if d.bundleReady {
 		return d.bundle
 	}
@@ -560,15 +565,18 @@ func (d *decoder) bundleTable(t *transform) []byte {
 	ppb := 1 << t.bits
 	bpp := uint(8 >> t.bits)
 	mask := 1<<bpp - 1
-	n := 256 * ppb * 4
+	wpb := ppb / 2
+	n := 256 * wpb
 	if cap(d.bundle) < n {
-		d.bundle = make([]byte, 256*8*4)
+		d.bundle = make([]uint64, 256*4)
 	}
 	tab := d.bundle[:n]
 	for v := 0; v < 256; v++ {
-		e := tab[v*ppb*4 : (v+1)*ppb*4]
-		for k := 0; k < ppb; k++ {
-			binary.LittleEndian.PutUint32(e[4*k:], pal[v>>(uint(k)*bpp)&mask])
+		e := tab[v*wpb : (v+1)*wpb]
+		for k := range e {
+			lo := pal[v>>(uint(2*k)*bpp)&mask]
+			hi := pal[v>>(uint(2*k+1)*bpp)&mask]
+			e[k] = uint64(lo) | uint64(hi)<<32
 		}
 	}
 	d.bundle = tab
