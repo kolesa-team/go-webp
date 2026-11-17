@@ -100,7 +100,9 @@ func (br *bitReader) bitNL(prob uint8) bool {
 func decodeBit(value uint64, rng uint32, nbits int, prob uint8) (uint64, uint32, int, bool) {
 	split := (rng * uint32(prob)) >> 8
 	pos := uint(nbits) & 63
-	m := uint32(int32(split-uint32(value>>pos)) >> 31) // all ones if bit
+	// Unsigned "value > split" as in libwebp's VP8GetBit: a 32-bit signed
+	// difference would disagree on corrupt streams where value-split >= 2^31.
+	m := uint32(int64(uint64(split)-uint64(uint32(value>>pos))) >> 63) // all ones if bit
 	rng = split + 1 + ((rng - 2*split - 1) & m)
 	value -= uint64((split+1)&m) << pos
 	e := kRenorm[uint8(rng)]

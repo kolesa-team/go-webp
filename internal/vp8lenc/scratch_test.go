@@ -51,22 +51,33 @@ func TestRefsSizing(t *testing.T) {
 		noise[i] = seed
 	}
 	sc := new(scratch)
-	getBackwardRefs(flat, w, h, 75, false, 0, false, 0, sc, nil)
-	for i := 0; i < 2; i++ {
-		if c := cap(sc.refs[i]); c > n/16 {
-			t.Errorf("flat refs[%d]: cap %d, want <= %d", i, c, n/16)
+	// The parse buffers in use (the slots holding a parse) must be sized
+	// to the parse.
+	check := func(name string, noise bool) {
+		used := 0
+		for i := range sc.refs {
+			if len(sc.refs[i]) == 0 {
+				continue
+			}
+			used++
+			if c := cover(sc.refs[i]); c != n {
+				t.Errorf("%s refs[%d] covers %d pixels, want %d", name, i, c, n)
+			}
+			if !noise && cap(sc.refs[i]) > n/16 {
+				t.Errorf("%s refs[%d]: cap %d, want <= %d", name, i, cap(sc.refs[i]), n/16)
+			}
+			if noise && (len(sc.refs[i]) < n/2 || cap(sc.refs[i]) > n) {
+				t.Errorf("%s refs[%d]: len %d cap %d, n %d", name, i, len(sc.refs[i]), cap(sc.refs[i]), n)
+			}
 		}
-		if c := cover(sc.refs[i]); c != n {
-			t.Errorf("flat refs[%d] covers %d pixels, want %d", i, c, n)
+		if used < 2 {
+			t.Errorf("%s: %d parse buffers in use, want at least 2", name, used)
 		}
 	}
-	getBackwardRefs(noise, w, h, 75, false, 0, false, 0, sc, nil)
-	for i := 0; i < 2; i++ {
-		if len(sc.refs[i]) < n/2 || cap(sc.refs[i]) > n {
-			t.Errorf("noise refs[%d]: len %d cap %d, n %d", i, len(sc.refs[i]), cap(sc.refs[i]), n)
-		}
-		if c := cover(sc.refs[i]); c != n {
-			t.Errorf("noise refs[%d] covers %d pixels, want %d", i, c, n)
-		}
-	}
+	sc.hc.fill(flat, w, h, 75, false, 0)
+	getBackwardRefs(flat, w, h, 75, false, false, 0, false, sc, nil)
+	check("flat", false)
+	sc.hc.fill(noise, w, h, 75, false, 0)
+	getBackwardRefs(noise, w, h, 75, false, false, 0, false, sc, nil)
+	check("noise", true)
 }

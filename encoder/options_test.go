@@ -22,11 +22,22 @@ func TestNilOptions(t *testing.T) {
 
 func TestNewLossyEncoderOptions(t *testing.T) {
 	t.Run("invalid quality", func(t *testing.T) {
-		for _, q := range []float32{-1, 100.5, float32(math.NaN())} {
+		for _, q := range []float32{-1, 100.5} {
 			options, err := NewLossyEncoderOptions(PresetDefault, q)
 			require.Error(t, err)
 			assert.Nil(t, options)
 		}
+	})
+	t.Run("NaN quality is accepted like libwebp", func(t *testing.T) {
+		// WebPValidateConfig's range checks are comparisons, false for NaN;
+		// v1 (cgo) accepts it.
+		options, err := NewLossyEncoderOptions(PresetDefault, float32(math.NaN()))
+		require.NoError(t, err)
+		_, err = options.GetConfig()
+		require.NoError(t, err)
+		options.TargetPsnr = float32(math.NaN())
+		_, err = options.GetConfig()
+		require.NoError(t, err)
 	})
 	t.Run("create lossy encoder options is success", func(t *testing.T) {
 		options, err := NewLossyEncoderOptions(PresetDefault, 75)

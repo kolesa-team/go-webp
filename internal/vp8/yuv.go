@@ -1,6 +1,9 @@
 package vp8
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"math/bits"
+)
 
 // Algorithm adapted from libwebp (BSD-3-Clause): dsp/yuv.h (14-bit fixed
 // point YUV->RGB), dsp/upsampling.c (fancy upsampler) and dsp/yuv.c
@@ -12,7 +15,7 @@ import "encoding/binary"
 func clipY(v int) uint32 {
 	v >>= 6
 	if uint(v) > 255 {
-		v = int(^uint(v>>63) & 255)
+		v = int(^uint(v>>(bits.UintSize-1)) & 255) // 0 if v < 0, else 255
 	}
 	return uint32(v)
 }

@@ -126,8 +126,10 @@ func GetFeatures(data []byte) (Features, error) {
 // to be final, i.e. to equal GetFeatures of the whole file: parsing reached
 // the VP8/VP8L frame header (and checked it against the VP8X canvas), found
 // an animation, or failed with an error other than NotEnoughData. When done
-// is false the caller should read more data, or use the result as is at the
-// end of the input.
+// is false the caller should read more data, or call GetFeatures at the end
+// of the input. For a raw VP8 bitstream (no RIFF header), whose size is that
+// of the whole input, the prefix must extend past the first partition
+// length declared in the frame header before the result is final.
 func GetFeaturesPrefix(prefix []byte) (f Features, done bool, err error) {
 	var img Image
 	err = parse(prefix, false, &img, &done)
@@ -281,6 +283,9 @@ func parseHeaders(data []byte, haveAll bool, img *Image, anim *Features, reached
 	}
 	var compressedSize uint64
 	lossless := false
+	// raw is set for a bitstream without a chunk header, whose size is the
+	// size of the input.
+	raw := false
 	if isVP8, isVP8L := tagIs(data, "VP8 "), tagIs(data, "VP8L"); isVP8 || isVP8L {
 		size := binary.LittleEndian.Uint32(data[4:])
 		const minimalSize = tagSize + chunkHeaderSize
@@ -296,6 +301,7 @@ func parseHeaders(data []byte, haveAll bool, img *Image, anim *Features, reached
 	} else {
 		lossless = isVP8LSignature(data)
 		compressedSize = uint64(len(data))
+		raw = true
 	}
 	if compressedSize > uint64(maxChunkPayload) {
 		return status.Bitstream("image chunk too large")
@@ -315,6 +321,15 @@ func parseHeaders(data []byte, haveAll bool, img *Image, anim *Features, reached
 		}
 		var ok bool
 		if w, h, ok = vp8Info(data, compressedSize); !ok {
+			if raw && reached != nil {
+				// GetFeaturesPrefix: the size of a raw bitstream is that
+				// of the whole input, which may be longer than this
+				// prefix. If only the first partition length check
+				// failed, more data is needed to decide.
+				if _, _, valid := vp8Info(data, ^uint64(0)); valid {
+					return status.NotEnoughData("raw VP8 bitstream shorter than its first partition so far")
+				}
+			}
 			return status.Bitstream("invalid VP8 frame header")
 		}
 	} else {

@@ -76,6 +76,7 @@ type params struct {
 	transBits    int
 	useCache     bool
 	tryNoCache   bool
+	tryBox       bool // also try the box LZ77 parse (at most 16 colors)
 	rbZero       bool // red and blue always zero (skip cross color)
 	windowCap    int
 	nearLossless int
@@ -179,7 +180,8 @@ func EncodeWithHeadroom(img *image.NRGBA, cfg *Config, headroom int) ([]byte, er
 // a headerless VP8L image stream whose green channel carries the alpha values.
 // method (0..6) and quality (0..100) map like libwebp's alpha encoder: the
 // lossless quality is 8*method, or 100 when method is 6 and quality is 100.
-// The color cache is disabled, as in libwebp.
+// As in libwebp 1.6 (whose VP8LEncodeStream no longer has a use_cache
+// argument), the color cache may be used.
 func EncodeAlpha(plane []byte, width, height, stride int, method int, quality float32) ([]byte, error) {
 	var a AlphaEncoder
 	defer a.Release()
@@ -216,18 +218,20 @@ func (a *AlphaEncoder) Encode(plane []byte, width, height, stride int, method in
 		a.argb = getU32(n)
 	}
 	argb := a.argb[:n]
+	// Like libwebp's WebPDispatchAlphaToGreen, the alpha, red and blue
+	// channels are left to 0 (the alpha channel is not transmitted).
 	for y := 0; y < height; y++ {
 		row := plane[y*stride : y*stride+width]
 		dst := argb[y*width : (y+1)*width]
 		for x, a := range row {
-			dst[x] = argbBlack | uint32(a)<<8
+			dst[x] = uint32(a) << 8
 		}
 	}
 	if a.sc == nil {
 		a.sc = getScratch()
 	}
 	cfg := &Config{Quality: q, Method: method, Exact: true, NearLossless: 100}
-	out, spare := encodeARGB(argb, width, height, cfg, false, 0, a.sc, a.spare)
+	out, spare := encodeARGB(argb, width, height, cfg, true, 0, a.sc, a.spare)
 	a.spare = spare
 	return out, nil
 }
@@ -256,18 +260,32 @@ func (a *AlphaEncoder) Release() {
 	a.spare = nil
 }
 
+// clampBits clamps histogram and transform bits (libwebp ClampBits): bits
+// is raised until the sub-image has at most imageSizeMax pixels, then
+// lowered to the smallest value still giving a 1-pixel sub-image.
+func clampBits(width, height, bits, minBits, maxBits, imageSizeMax int) int {
+	bits = clampInt(bits, minBits, maxBits)
+	size := subSampleSize(width, bits) * subSampleSize(height, bits)
+	for bits < maxBits && size > imageSizeMax {
+		bits++
+		size = subSampleSize(width, bits) * subSampleSize(height, bits)
+	}
+	for bits > minBits && size == 1 {
+		size = subSampleSize(width, bits-1) * subSampleSize(height, bits-1)
+		if size != 1 {
+			break
+		}
+		bits--
+	}
+	return bits
+}
+
 func getHistoBits(method int, usePalette bool, width, height int) int {
 	hb := 7 - method
 	if usePalette {
 		hb = 9 - method
 	}
-	for {
-		if subSampleSize(width, hb)*subSampleSize(height, hb) <= maxHuffImageSize {
-			break
-		}
-		hb++
-	}
-	return clampInt(hb, minHuffmanBits, maxHuffmanBits)
+	return clampBits(width, height, hb, minHuffmanBits, maxHuffmanBits, maxHuffImageSize)
 }
 
 func getTransformBits(method, histoBits int) int {
@@ -343,7 +361,8 @@ func encodeARGB(argb []uint32, w, h int, cfg *Config, useCache bool, prefix int,
 				}
 				configs = append(configs, crunchConfig{m, sortDefault})
 			}
-			p.rbZero = false
+			// As in libwebp 1.6, rbZero (from the analysis of the guessed
+			// best mode) also applies to the brute-force configurations.
 		} else {
 			configs = append(configs, crunchConfig{best, sortMinimizeDelta})
 			if quality >= 75 && method == 5 {
@@ -359,6 +378,9 @@ func encodeARGB(argb []uint32, w, h int, cfg *Config, useCache bool, prefix int,
 	if cfg.LowMemory {
 		p.tryNoCache = false
 	}
+	// Like libwebp, images with few colors also try the box LZ77 parse
+	// (which needs a second match table: skipped with LowMemory).
+	p.tryBox = !p.lowEffort && !cfg.LowMemory && usePalette && len(palette) <= 16
 	if usePalette {
 		p.paletteSorts[sortDefault] = palette
 		p.paletteSorts[sortMinimizeDelta] = paletteSortMinimizeDeltas(palette, make([]uint32, 0, len(palette)))
@@ -572,7 +594,7 @@ func encodeStream(src []uint32, mutable bool, w, h int, p *params, cc crunchConf
 		for i := 1; i < len(pal); i++ {
 			delta[i] = subPixels(pal[i], pal[i-1])
 		}
-		encodeImageNoHuffman(bw, delta, len(pal), 1, 20, sc.child())
+		encodeImageNoHuffman(bw, delta, len(pal), 1, 20, p.lowEffort, sc.child())
 		if p.useCache && len(pal) < 1<<maxColorCacheBits {
 			cacheBitsMax = log2Floor(uint32(len(pal))) + 1
 		}
@@ -595,28 +617,31 @@ func encodeStream(src []uint32, mutable bool, w, h int, p *params, cc crunchConf
 		bw.putBits(subtractGreenTransform, 2)
 	}
 	if usePredict {
-		bits := p.transBits
-		tw, th := subSampleSize(width, bits), subSampleSize(h, bits)
-		modes := make([]uint32, tw*th)
+		// As in libwebp 1.6 (ApplyPredictFilter), methods 5 and 6 also
+		// search smaller predictor tiles.
+		maxBits := clampBits(width, h, p.transBits, minTransformBits, maxTransformBits, maxPredictorImageSize)
+		minBits := clampBits(width, h, maxBits-2*max(p.method-4, 0), minTransformBits, maxTransformBits, maxPredictorImageSize)
+		modes := make([]uint32, subSampleSize(width, minBits)*subSampleSize(h, minBits))
 		maxQuant := 1
 		if !usePalette && p.nearLossless < 100 {
 			maxQuant = 1 << uint(nearLosslessBits(p.nearLossless))
 		}
-		predictorImage(width, h, bits, p.lowEffort, maxQuant, useSubGreen, p.cleanTransparent, cur, modes, sc)
+		bits := predictorImage(width, h, minBits, maxBits, p.lowEffort, maxQuant, useSubGreen, p.cleanTransparent, cur, modes, sc)
+		tw, th := subSampleSize(width, bits), subSampleSize(h, bits)
 		bw.putBits(1, 1)
 		bw.putBits(predictorTransform, 2)
-		bw.putBits(uint32(bits-2), 3)
-		encodeImageNoHuffman(bw, modes, tw, th, quality, sc.child())
+		bw.putBits(uint32(bits-minTransformBits), 3)
+		encodeImageNoHuffman(bw, modes[:tw*th], tw, th, quality, p.lowEffort, sc.child())
 	}
 	if useCrossColor {
 		bits := p.transBits
+		img := make([]uint32, subSampleSize(width, bits)*subSampleSize(h, bits))
+		bits = colorSpaceTransform(width, h, bits, quality, cur, img, sc)
 		tw, th := subSampleSize(width, bits), subSampleSize(h, bits)
-		img := make([]uint32, tw*th)
-		colorSpaceTransform(width, h, bits, quality, cur, img, sc)
 		bw.putBits(1, 1)
 		bw.putBits(crossColorTransform, 2)
-		bw.putBits(uint32(bits-2), 3)
-		encodeImageNoHuffman(bw, img, tw, th, quality, sc.child())
+		bw.putBits(uint32(bits-minTransformBits), 3)
+		encodeImageNoHuffman(bw, img[:tw*th], tw, th, quality, p.lowEffort, sc.child())
 	}
 	bw.putBits(0, 1) // no more transforms
 	encodeImageInternal(bw, cur, width, h, p, cacheBitsMax, sc)
@@ -633,89 +658,147 @@ type refsCandidate struct {
 	cacheBits int
 }
 
-func histoCost(refs []pixOrCopy, xsize, cacheBits int, sc *scratch) float64 {
+// histoCost estimates the size of a parse. With raw set, distances are
+// counted as linear distances like libwebp does when it compares candidate
+// parses (see addRefsRawDist); this decides, as in libwebp, whether the
+// cost-based parse is tried. Otherwise they are counted as the plane codes
+// actually written, a better estimate used when no cost-based parse
+// follows.
+func histoCost(refs []pixOrCopy, xsize, cacheBits int, raw bool, sc *scratch) float64 {
 	h := sc.tmpHisto(cacheBits)
-	sc.tmpSet.addRefs(h, refs, xsize)
+	if raw {
+		sc.tmpSet.addRefsRawDist(h, refs)
+	} else {
+		sc.tmpSet.addRefs(h, refs, xsize)
+	}
 	return sc.tmpSet.estimate(h)
 }
 
-// getBackwardRefs computes the best references for argb. It returns one or
-// two candidates (the second without color cache when tryNoCache).
-func getBackwardRefs(argb []uint32, w, h int, quality int, lowEffort bool, cacheBitsMax int,
-	tryNoCache bool, windowCap int, sc *scratch, cands []refsCandidate) []refsCandidate {
+// Parse types (libwebp VP8LLZ77Type).
+const (
+	lz77Standard = 1
+	lz77RLE      = 2
+	lz77Box      = 4
+)
+
+// getBackwardRefs computes the best references for argb, like libwebp 1.6's
+// VP8LGetBackwardReferences (except for lowEffort, see below), from the
+// matches of sc.hc (which the caller fills). With box, only the "box" LZ77
+// parse (matches restricted to short 2D distances) is tried, otherwise the
+// standard LZ77 and RLE ones. It returns the best parse with its color
+// cache size and, when tryNoCache is set and that cache size is not 0, the
+// best parse without color cache (searched separately).
+func getBackwardRefs(argb []uint32, w, h int, quality int, lowEffort, box bool, cacheBitsMax int,
+	tryNoCache bool, sc *scratch, cands []refsCandidate) []refsCandidate {
 	n := w * h
-	sc.hc.fill(argb, w, h, quality, lowEffort, windowCap)
-	// Buffer 0: LZ77 standard, buffer 1: RLE.
 	refsCap := initRefsCap(argb, w, h)
-	r0 := backwardRefsLz77(n, argb, &sc.hc, sc.refsBuf(0, refsCap))
-	sc.refs[0] = r0
-	r1 := backwardRefsRle(w, n, argb, sc.refsBuf(1, refsCap))
-	sc.refs[1] = r1
-
-	cb0 := bestCacheBits(argb, quality, r0, cacheBitsMax, sc)
-	applyColorCache(argb, cb0, r0, sc.cacheBuf(1<<maxColorCacheBits))
-	cost0 := histoCost(r0, w, cb0, sc)
-	cb1 := bestCacheBits(argb, quality, r1, cacheBitsMax, sc)
-	applyColorCache(argb, cb1, r1, sc.cacheBuf(1<<maxColorCacheBits))
-	cost1 := histoCost(r1, w, cb1, sc)
-
-	bestIdx, bestCB, bestCost := 0, cb0, cost0
-	if cost1 < cost0 {
-		bestIdx, bestCB, bestCost = 1, cb1, cost1
+	types := []int{lz77Standard, lz77RLE}
+	if box {
+		types = []int{lz77Box}
+		sc.hcBox.fillBox(argb, w, n, &sc.hc, sc)
 	}
-	best := sc.refs[bestIdx]
-	if bestIdx == 0 && quality >= 25 && !lowEffort {
-		r2 := traceBackwards(w, n, argb, bestCB, &sc.hc, best, sc.refsBuf(2, 0), quality, sc)
-		applyColorCache(argb, bestCB, r2, sc.cacheBuf(1<<maxColorCacheBits))
-		sc.refs[2] = r2
-		if c := histoCost(r2, w, bestCB, sc); c < bestCost {
-			best = r2
-			bestIdx = 2
+	// Unlike libwebp, the low effort mode also tries the RLE parse and a
+	// color cache (but not the cost-based parse): the low-effort hash chain
+	// does not find runs, and this keeps method 0 output much smaller than
+	// libwebp's for a small cost.
+	cacheBuf := sc.cacheBuf(1 << maxColorCacheBits)
+	trace := quality >= 25 && !lowEffort
+	// sc.refs slots: best[0] with cache, best[1] without (tryNoCache), tmp.
+	best := [2]int{0, 1}
+	tmp := 2
+	bestCost := [2]float64{math.Inf(1), math.Inf(1)}
+	bestType := [2]int{0, 0}
+	bestCB := 0
+	for _, typ := range types {
+		var r []pixOrCopy
+		switch typ {
+		case lz77Standard:
+			r = backwardRefsLz77(n, argb, &sc.hc, sc.refsBuf(tmp, refsCap))
+		case lz77RLE:
+			r = backwardRefsRle(w, n, argb, sc.refsBuf(tmp, refsCap))
+		default:
+			r = backwardRefsLz77(n, argb, &sc.hcBox, sc.refsBuf(tmp, refsCap))
 		}
-	}
-	cands = append(cands[:0], refsCandidate{best, bestCB})
-	if tryNoCache && bestCB > 0 {
-		// Recompute the same parse without color cache.
-		var r3 []pixOrCopy
-		if bestIdx == 1 {
-			r3 = backwardRefsRle(w, n, argb, sc.refsBuf(3, len(best)))
-		} else {
-			r3 = sc.refsBuf(3, len(best))
-			// Undo the cache: cache references become literals again.
-			pos := 0
-			for _, r := range best {
-				if r.mode() == modeCache {
-					r3 = append(r3, mkLiteral(argb[pos]))
-				} else {
-					r3 = append(r3, r)
-				}
-				pos += r.length()
+		sc.refs[tmp] = r
+		var noCacheCost float64
+		if tryNoCache {
+			noCacheCost = histoCost(r, w, 0, trace, sc)
+			if noCacheCost < bestCost[1] {
+				sc.refs[best[1]] = append(sc.refsBuf(best[1], len(r)), r...)
+				bestCost[1] = noCacheCost
+				bestType[1] = typ
 			}
 		}
-		sc.refs[3] = r3
-		cands = append(cands, refsCandidate{r3, 0})
+		cb := bestCacheBits(argb, quality, r, cacheBitsMax, sc)
+		var cost float64
+		if tryNoCache && cb == 0 {
+			cost = noCacheCost
+		} else {
+			applyColorCache(argb, cb, r, cacheBuf)
+			cost = histoCost(r, w, cb, trace, sc)
+		}
+		if cost < bestCost[0] {
+			best[0], tmp = tmp, best[0]
+			bestCost[0] = cost
+			bestType[0] = typ
+			bestCB = cb
+		}
+	}
+	// Improve on the simple LZ77 with the cost-based parse (only for high
+	// quality, as it is costly).
+	for i := 1; i >= 0; i-- {
+		if i == 1 && !tryNoCache {
+			continue
+		}
+		cb := 0
+		if i == 0 {
+			cb = bestCB
+		}
+		if (bestType[i] == lz77Standard || bestType[i] == lz77Box) && trace {
+			hc := &sc.hc
+			if bestType[i] == lz77Box {
+				hc = &sc.hcBox
+			}
+			r := traceBackwards(w, n, argb, cb, hc, sc.refs[best[i]], sc.refsBuf(tmp, 0), sc)
+			applyColorCache(argb, cb, r, cacheBuf)
+			sc.refs[tmp] = r
+			if c := histoCost(r, w, cb, true, sc); c < bestCost[i] {
+				best[i], tmp = tmp, best[i]
+			}
+		}
+		if i == 1 && bestType[0] == bestType[1] && bestCB == 0 {
+			// Same parse type without cache: use the no-cache result.
+			sc.refs[best[0]] = append(sc.refsBuf(best[0], len(sc.refs[best[1]])), sc.refs[best[1]]...)
+			break
+		}
+	}
+	cands = append(cands[:0], refsCandidate{sc.refs[best[0]], bestCB})
+	if tryNoCache && bestCB > 0 {
+		cands = append(cands, refsCandidate{sc.refs[best[1]], 0})
 	}
 	return cands
 }
 
 // encodeImageNoHuffman encodes a sub-image (transform data, entropy image or
-// palette) without color cache and meta Huffman codes.
-func encodeImageNoHuffman(bw *bitWriter, argb []uint32, w, h int, quality int, sc *scratch) {
+// palette) without color cache and meta Huffman codes. As in libwebp,
+// lowEffort only affects the match search (hash chain).
+func encodeImageNoHuffman(bw *bitWriter, argb []uint32, w, h int, quality int, lowEffort bool, sc *scratch) {
 	n := w * h
-	sc.hc.fill(argb, w, h, quality, false, 0)
+	sc.hc.fill(argb, w, h, quality, lowEffort, 0)
 	refsCap := initRefsCap(argb, w, h)
 	r0 := backwardRefsLz77(n, argb, &sc.hc, sc.refsBuf(0, refsCap))
 	sc.refs[0] = r0
 	r1 := backwardRefsRle(w, n, argb, sc.refsBuf(1, refsCap))
 	sc.refs[1] = r1
 	best := r0
-	bestCost := histoCost(r0, w, 0, sc)
-	if c := histoCost(r1, w, 0, sc); c < bestCost {
+	trace := quality >= 25
+	bestCost := histoCost(r0, w, 0, trace, sc)
+	if c := histoCost(r1, w, 0, trace, sc); c < bestCost {
 		best, bestCost = r1, c
-	} else if quality >= 25 {
-		r2 := traceBackwards(w, n, argb, 0, &sc.hc, r0, sc.refsBuf(2, 0), quality, sc)
+	} else if trace {
+		r2 := traceBackwards(w, n, argb, 0, &sc.hc, r0, sc.refsBuf(2, 0), sc)
 		sc.refs[2] = r2
-		if c := histoCost(r2, w, 0, sc); c < bestCost {
+		if c := histoCost(r2, w, 0, true, sc); c < bestCost {
 			best = r2
 		}
 	}
@@ -765,23 +848,40 @@ func buildCodes(s *histoSet, sc *scratch) []huffCode {
 
 // encodeImageInternal encodes the main (transformed) image with color cache
 // and meta Huffman codes, choosing the smallest of the candidate parses.
+// Like libwebp, images with at most 16 colors also try the "box" LZ77
+// parse.
 func encodeImageInternal(bw *bitWriter, argb []uint32, w, h int, p *params, cacheBitsMax int, sc *scratch) {
+	sc.hc.fill(argb, w, h, p.quality, p.lowEffort, p.windowCap)
 	var candBuf [2]refsCandidate
-	cands := getBackwardRefs(argb, w, h, p.quality, p.lowEffort, cacheBitsMax, p.tryNoCache, p.windowCap, sc, candBuf[:0])
-	if len(cands) == 1 {
+	cands := getBackwardRefs(argb, w, h, p.quality, p.lowEffort, false, cacheBitsMax, p.tryNoCache, sc, candBuf[:0])
+	if len(cands) == 1 && !p.tryBox {
 		writeMainImage(bw, w, h, p, cands[0], sc)
 		return
 	}
-	var bestW *bitWriter
-	for i := range cands {
+	// Write each candidate into the spare writer, keeping the smallest.
+	bestIdx := -1
+	try := func(c refsCandidate) {
+		i := 0
+		if bestIdx == 0 {
+			i = 1
+		}
 		t := &sc.bwTmp[i]
 		t.reset()
-		writeMainImage(t, w, h, p, cands[i], sc)
-		if bestW == nil || t.numBits() < bestW.numBits() {
-			bestW = t
+		writeMainImage(t, w, h, p, c, sc)
+		if bestIdx < 0 || t.numBits() < sc.bwTmp[bestIdx].numBits() {
+			bestIdx = i
 		}
 	}
-	bw.appendWriter(bestW)
+	for _, c := range cands {
+		try(c)
+	}
+	if p.tryBox {
+		cands = getBackwardRefs(argb, w, h, p.quality, p.lowEffort, true, cacheBitsMax, p.tryNoCache, sc, candBuf[:0])
+		for _, c := range cands {
+			try(c)
+		}
+	}
+	bw.appendWriter(&sc.bwTmp[bestIdx])
 }
 
 func writeMainImage(bw *bitWriter, w, h int, p *params, c refsCandidate, sc *scratch) {
@@ -795,14 +895,18 @@ func writeMainImage(bw *bitWriter, w, h int, p *params, c refsCandidate, sc *scr
 	ng := sc.clus.buildHistoImage(w, h, c.refs, p.quality, p.lowEffort, hb, c.cacheBits, &sc.out)
 	var symbols []uint16
 	if ng > 1 {
+		// Reduce the sampling of the entropy image if it is made of uniform
+		// squares (libwebp 1.6 VP8LOptimizeSampling).
+		syms := sc.clus.symbols
+		hb = optimizeSampling(syms, w, h, hb, maxHuffmanBits)
+		syms = syms[:subSampleSize(w, hb)*subSampleSize(h, hb)]
 		bw.putBits(1, 1)
 		bw.putBits(uint32(hb-2), 3)
-		syms := sc.clus.symbols
 		img := make([]uint32, len(syms))
 		for i, s := range syms {
 			img[i] = uint32(s) << 8
 		}
-		encodeImageNoHuffman(bw, img, subSampleSize(w, hb), subSampleSize(h, hb), p.quality, sc.child())
+		encodeImageNoHuffman(bw, img, subSampleSize(w, hb), subSampleSize(h, hb), p.quality, p.lowEffort, sc.child())
 		symbols = syms
 	} else {
 		bw.putBits(0, 1)

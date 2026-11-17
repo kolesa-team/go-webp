@@ -178,7 +178,10 @@ func transformColor(m multipliers, p uint32) uint32 {
 }
 
 // colorSpaceTransform selects per-tile multipliers and applies them to argb.
-func colorSpaceTransform(width, height, bits, quality int, argb []uint32, image []uint32, sc *scratch) {
+// image receives the multipliers; like libwebp 1.6, its sampling is then
+// reduced when it is made of uniform squares, and the resulting bits are
+// returned.
+func colorSpaceTransform(width, height, bits, quality int, argb []uint32, image []uint32, sc *scratch) int {
 	tile := 1 << uint(bits)
 	tilesX := subSampleSize(width, bits)
 	tilesY := subSampleSize(height, bits)
@@ -222,4 +225,5 @@ func colorSpaceTransform(width, height, bits, quality int, argb []uint32, image 
 			}
 		}
 	}
+	return optimizeSampling(image, width, height, bits, maxTransformBits)
 }

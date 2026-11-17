@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"image"
+	"strconv"
 	"sync"
 
 	"github.com/kolesa-team/go-webp/v2/internal/resample"
@@ -9,10 +10,16 @@ import (
 	"github.com/kolesa-team/go-webp/v2/utils"
 )
 
-// maxOutputBytes bounds the output image allocation (libwebp refuses
-// allocations above WEBP_MAX_ALLOCABLE_MEMORY, 1<<34 on 64-bit targets with
-// the default build).
-const maxOutputBytes = uint64(1) << 34
+// maxAllocableMemory is libwebp's WEBP_MAX_ALLOCABLE_MEMORY (default
+// build): 1<<34 bytes where size_t is 64-bit, (1<<31) - (1<<16) on 32-bit
+// targets (below INT_MAX). On 32-bit Go targets this also keeps the output
+// image below math.MaxInt bytes, which image.NewNRGBA would panic on.
+const maxAllocableMemory = uint64(1<<34)*(strconv.IntSize/64) + uint64(1<<31-1<<16)*(1-strconv.IntSize/64)
+
+// maxOutputBytes bounds the output image allocation: libwebp's
+// WebPAllocateDecBuffer reports VP8_STATUS_OUT_OF_MEMORY above
+// WEBP_MAX_ALLOCABLE_MEMORY. It is a variable so that tests can lower it.
+var maxOutputBytes = maxAllocableMemory
 
 // Params describes the transformations applied to a decoded frame, in
 // libwebp's order: crop, then scale, then vertical flip.
@@ -93,6 +100,9 @@ func NewSink(p Params) (Sink, func() *image.NRGBA, error) {
 		if err := checkImageSize(w, h); err != nil {
 			return nil, nil, err
 		}
+		if err := checkRescalerSize(w); err != nil {
+			return nil, nil, err
+		}
 		s := &scaleSink{
 			base:    newBase(p.SrcW, crop, w, h),
 			flip:    p.Flip,
@@ -124,6 +134,18 @@ func NewSink(p Params) (Sink, func() *image.NRGBA, error) {
 func checkImageSize(w, h int) error {
 	if uint64(w)*uint64(h)*4 > maxOutputBytes {
 		return status.New(utils.Vp8StatusOutOfMemory, "output image too large")
+	}
+	return nil
+}
+
+// checkRescalerSize reports an OutOfMemory error when the rescaler state
+// for an output w pixels wide exceeds maxOutputBytes: libwebp allocates it
+// with WebPSafeMalloc (2 * 4 channels * w uint32 work cells, plus a row of
+// w RGBA pixels), which fails above WEBP_MAX_ALLOCABLE_MEMORY. Both the RGBA
+// and the Y'CbCr(A) rescalers below need that much.
+func checkRescalerSize(w int) error {
+	if uint64(w)*(4*uint64(resample.WorkSize(1, 4))+4) > maxOutputBytes {
+		return status.New(utils.Vp8StatusOutOfMemory, "rescaler too large")
 	}
 	return nil
 }

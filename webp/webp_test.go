@@ -23,12 +23,14 @@ package webp
 
 import (
 	"bytes"
+	"encoding/binary"
 	"image"
 	"image/color"
 	"image/jpeg"
 	"io"
 	"os"
 	"testing"
+	"testing/iotest"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -336,6 +338,71 @@ func TestDecodeConfigMatchesNewDecoder(t *testing.T) {
 			}
 			f := d.GetFeatures()
 			assert.Equal(t, [2]int{f.Width, f.Height}, [2]int{cfg.Width, cfg.Height}, "%s mutant %d", name, i)
+		}
+	}
+}
+
+// rawPayload returns the payload of the first chunk with the given tag.
+func rawPayload(t *testing.T, data []byte, tag string) []byte {
+	t.Helper()
+	i := bytes.Index(data, []byte(tag))
+	require.GreaterOrEqual(t, i, 0, "no %q chunk", tag)
+	n := int(binary.LittleEndian.Uint32(data[i+4:]))
+	return data[i+8 : i+8+n]
+}
+
+// TestDecodeConfigRawBitstream checks raw VP8 / VP8L bitstreams (no RIFF
+// header), which libwebp, v1 and decoder.NewDecoder accept: DecodeConfig
+// and GetFeatures must too, although the first partition of a raw VP8
+// stream (its size check needs the whole input) extends far past the first
+// bytes read. image.DecodeConfig does not recognize them (the registered
+// magic starts with "RIFF"), exactly as with v1.
+func TestDecodeConfigRawBitstream(t *testing.T) {
+	tests := []struct {
+		file, tag string
+		want      utils.BitstreamFeatures
+	}{
+		{"m4_q75.webp", "VP8 ", utils.BitstreamFeatures{Width: 675, Height: 900, Format: utils.FormatLossy}},
+		{"100x150_lossy.webp", "VP8 ", utils.BitstreamFeatures{Width: 100, Height: 150, Format: utils.FormatLossy}},
+		{"webp-logo-lossless.webp", "VP8L", utils.BitstreamFeatures{Width: 3000, Height: 2000, HasAlpha: true, Format: utils.FormatLossless}},
+		{"100x150_lossless.webp", "VP8L", utils.BitstreamFeatures{Width: 100, Height: 150, HasAlpha: true, Format: utils.FormatLossless}},
+	}
+	for _, tt := range tests {
+		data, err := os.ReadFile("../test_data/images/" + tt.file)
+		require.NoError(t, err)
+		raw := rawPayload(t, data, tt.tag)
+
+		d, err := decoder.NewDecoder(bytes.NewReader(raw), nil)
+		require.NoError(t, err, tt.file)
+		require.Equal(t, tt.want.Width, d.GetFeatures().Width, tt.file)
+		require.Equal(t, tt.want.Format, d.GetFeatures().Format, tt.file)
+
+		for _, r := range []io.Reader{bytes.NewReader(raw), iotest.OneByteReader(bytes.NewReader(raw))} {
+			cfg, err := DecodeConfig(r, nil)
+			require.NoError(t, err, tt.file)
+			assert.Equal(t, image.Config{ColorModel: color.RGBAModel, Width: tt.want.Width, Height: tt.want.Height}, cfg, tt.file)
+		}
+		f, err := GetFeatures(bytes.NewReader(raw))
+		require.NoError(t, err, tt.file)
+		assert.Equal(t, d.GetFeatures(), f, tt.file)
+		assert.Equal(t, tt.want.HasAlpha, f.HasAlpha, tt.file)
+
+		_, _, err = image.DecodeConfig(bytes.NewReader(raw))
+		assert.ErrorIs(t, err, image.ErrFormat, tt.file)
+
+		// Truncations (shorter than the first partition for VP8) are
+		// reported like NewDecoder does.
+		for _, n := range []int{10, 11, 64, 100, len(raw) / 2, len(raw) - 1} {
+			if n <= 0 || n > len(raw) {
+				continue
+			}
+			_, cerr := DecodeConfig(bytes.NewReader(raw[:n]), nil)
+			_, derr := decoder.NewDecoder(bytes.NewReader(raw[:n]), nil)
+			if derr == nil {
+				assert.NoError(t, cerr, "%s[:%d]", tt.file, n)
+			} else {
+				assert.EqualError(t, cerr, derr.Error(), "%s[:%d]", tt.file, n)
+			}
 		}
 	}
 }

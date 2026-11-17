@@ -153,7 +153,10 @@ func (it *iterator) mbAnalyzeBestIntra16Mode() int {
 }
 
 func (it *iterator) fastMBAnalyze() int {
-	q := int(it.enc.cfg.Quality)
+	q := 0 // a NaN quality converts to 0, as libwebp's (int) cast on arm64
+	if qf := it.enc.cfg.Quality; qf == qf {
+		q = int(qf)
+	}
 	threshold := uint32(8 + (17-8)*q/100)
 	var m, m2 uint32
 	for k := 0; k < 16; k += 4 {

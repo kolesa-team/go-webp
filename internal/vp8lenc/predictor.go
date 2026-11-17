@@ -3,6 +3,8 @@ package vp8lenc
 // Spatial prediction transform.
 // Algorithm adapted from libwebp (BSD-3-Clause).
 
+import "math"
+
 const (
 	numPredModes         = 14
 	spatialPredictorBias = 15.0
@@ -264,16 +266,20 @@ func predictionCostSpatialHistogram(acc, tile *histo4, ae *[4]accEntropy) float6
 	return r
 }
 
-// predictorImage selects the best mode for every tile and replaces argb by
-// the prediction residuals. modes receives tile modes as ARGB pixels.
-// maxQuant > 1 enables near-lossless quantization of the residuals.
+// predictorImage selects the predictor modes and replaces argb by the
+// prediction residuals. Like libwebp 1.6 (VP8LResidualImage), the modes are
+// searched for tiles of every size from 1<<minBits to 1<<maxBits pixels and
+// the sampling with the lowest estimated cost is kept, then reduced further
+// when the chosen mode image is made of uniform squares
+// (VP8LOptimizeSampling). It returns the transform bits; modes (which must
+// hold one entry per tile of 1<<minBits pixels) receives the mode image as
+// ARGB pixels. maxQuant > 1 enables near-lossless quantization of the
+// residuals.
 //
 // clean enables libwebp's exact=0 handling of fully transparent pixels
 // (ignored with lowEffort, as in libwebp).
-func predictorImage(width, height, bits int, lowEffort bool, maxQuant int, usedSubGreen, clean bool,
-	argb []uint32, modes []uint32, sc *scratch) {
-	tilesX := subSampleSize(width, bits)
-	tilesY := subSampleSize(height, bits)
+func predictorImage(width, height, minBits, maxBits int, lowEffort bool, maxQuant int, usedSubGreen, clean bool,
+	argb []uint32, modes []uint32, sc *scratch) int {
 	n := width * height
 	var md []uint8
 	nl := maxQuant > 1 && !lowEffort && height >= 3 && width >= 3
@@ -283,88 +289,24 @@ func predictorImage(width, height, bits int, lowEffort bool, maxQuant int, usedS
 	clean = clean && !lowEffort
 	// slow selects the per-pixel GetResidual path working on row copies.
 	slow := nl || clean
-	var nlCur, nlUp []uint32
 	if nl {
 		md = sc.maxDiffs(n)
 		computeMaxDiffs(width, height, argb, usedSubGreen, md)
 	}
-	if slow {
-		nlCur = sc.rowA(width + 1)
-		nlUp = sc.rowB(width + 1)
-	}
+	var bits int
 	if lowEffort {
-		for i := range modes[:tilesX*tilesY] {
+		bits = maxBits
+		for i := range modes[:subSampleSize(width, bits)*subSampleSize(height, bits)] {
 			modes[i] = argbBlack | predLowEffort<<8
 		}
 	} else {
-		var acc histo4
-		var ae [4]accEntropy
-		h1 := &sc.h4a
-		h2 := &sc.h4b
-		resid := sc.residBuf(1 << uint(bits))
-		tile := 1 << uint(bits)
-		for ty := 0; ty < tilesY; ty++ {
-			for tx := 0; tx < tilesX; tx++ {
-				sx := tx << uint(bits)
-				sy := ty << uint(bits)
-				maxX := min(tile, width-sx)
-				maxY := min(tile, height-sy)
-				leftMode, aboveMode := -1, -1
-				if tx > 0 {
-					leftMode = int(modes[ty*tilesX+tx-1]>>8) & 0xff
-				}
-				if ty > 0 {
-					aboveMode = int(modes[(ty-1)*tilesX+tx]>>8) & 0xff
-				}
-				bestDiff := 1e30
-				bestMode := 0
-				cur, best := h1, h2
-				for i := range ae {
-					ae[i].init(&acc[i])
-				}
-				for mode := 0; mode < numPredModes; mode++ {
-					*cur = histo4{}
-					if slow {
-						nlTileResiduals(mode, argb, width, height, sx, sy, maxX, maxY, md, maxQuant, usedSubGreen, clean, nlCur, nlUp, resid, cur)
-					} else {
-						for ry := 0; ry < maxY; ry++ {
-							y := sy + ry
-							row := argb[y*width : (y+1)*width]
-							var up []uint32
-							if y > 0 {
-								up = argb[(y-1)*width : y*width+1]
-							}
-							r := resid[:maxX]
-							residualRow(mode, row, up, y, sx, sx+maxX, r)
-							for _, p := range r {
-								cur.add(p)
-							}
-						}
-					}
-					d := predictionCostSpatialHistogram(&acc, cur, &ae)
-					if mode == leftMode {
-						d -= spatialPredictorBias
-					}
-					if mode == aboveMode {
-						d -= spatialPredictorBias
-					}
-					if d < bestDiff {
-						bestDiff = d
-						bestMode = mode
-						cur, best = best, cur
-					}
-				}
-				for i := 0; i < 4; i++ {
-					for j := 0; j < 256; j++ {
-						acc[i][j] += best[i][j]
-					}
-				}
-				modes[ty*tilesX+tx] = argbBlack | uint32(bestMode)<<8
-			}
-		}
+		ps := predSearch{width: width, height: height, minBits: minBits, maxBits: maxBits,
+			maxQuant: maxQuant, md: md, usedSubGreen: usedSubGreen, clean: clean, slow: slow, argb: argb, sc: sc}
+		bits = ps.run(modes)
 	}
 	// Replace the image by residuals, row by row, keeping the original (or,
 	// with near-lossless, reconstructed) previous row.
+	tilesX := subSampleSize(width, bits)
 	prev := sc.rowA(width + 1)
 	curCopy := sc.rowB(width + 1)
 	out := sc.residBuf(width)
@@ -392,18 +334,248 @@ func predictorImage(width, height, bits int, lowEffort bool, maxQuant int, usedS
 		copy(row, out[:width])
 		prev, curCopy = curCopy, prev
 	}
+	return bits
 }
 
-// nlTileResiduals accumulates into h the near-lossless residuals of one tile
-// for mode, using row copies so that predictions use reconstructed pixels.
-func nlTileResiduals(mode int, argb []uint32, width, height, sx, sy, maxX, maxY int, md []uint8,
-	maxQuant int, usedSubGreen, clean bool, cur, up []uint32, resid []uint32, h *histo4) {
+// predSearch is libwebp's GetBestPredictorsAndSubSampling: the best mode of
+// every tile is searched at every sampling from minBits to maxBits at once.
+//
+// Tiles of 1<<minBits pixels are visited in Z order within each max-tile
+// (of 1<<maxBits pixels) so that super-tiles are completed as soon as
+// possible:
+//
+//	1  2|  5  6
+//	3  4|  7  8
+//	-----------
+//	9 10| 13 14
+//	11 12| 15 16
+//
+// The residual histograms of a tile (for each mode) are added to those of
+// its enclosing super-tiles; when a super-tile is complete its best mode is
+// chosen like for a tile, with its own accumulated histogram.
+type predSearch struct {
+	width, height    int
+	minBits, maxBits int
+	maxQuant         int
+	md               []uint8
+	usedSubGreen     bool
+	clean, slow      bool
+	argb             []uint32
+	sc               *scratch
+
+	hist      []histo4 // [level][mode] residual histograms of the current (super-)tiles
+	acc       []histo4 // [level] accumulated histograms of the chosen modes
+	levelMode [][]uint32
+	predHisto [(maxTransformBits - minTransformBits + 1) * numPredModes]int32
+}
+
+func (ps *predSearch) run(modes []uint32) int {
+	width, height := ps.width, ps.height
+	minBits := ps.minBits
+	sc := ps.sc
+	tilesPerRow := subSampleSize(width, minBits)
+	tilesPerCol := subSampleSize(height, minBits)
+	maxSub := ps.maxBits - minBits
+	// Residuals are added directly to the histograms of the super-tiles up
+	// to updateUpTo (cheaper for small tiles); larger super-tiles add the
+	// histograms of the finished smaller ones.
+	updateUpTo := max(min(4, ps.maxBits), minBits) - minBits
+	levels := maxSub + 1
+
+	total := 0
+	for l := 0; l < levels; l++ {
+		total += subSampleSize(width, minBits+l) * subSampleSize(height, minBits+l)
+	}
+	all := sc.predModeBuf(total)
+	if cap(ps.levelMode) < levels {
+		ps.levelMode = make([][]uint32, levels)
+	}
+	ps.levelMode = ps.levelMode[:levels]
+	off := 0
+	for l := 0; l < levels; l++ {
+		sz := subSampleSize(width, minBits+l) * subSampleSize(height, minBits+l)
+		ps.levelMode[l] = all[off : off+sz]
+		off += sz
+	}
+	ps.hist = sc.predHistos(levels * numPredModes)
+	ps.acc = sc.predAcc(levels)
+
+	tile := 1 << uint(minBits)
+	resid := sc.residBuf(tile * tile)
+	maxTileSize := 1 << uint(maxSub) // in tiles
+	var localX, localY, maxTileX, maxTileY, tileX, tileY int
+	for tileY < tilesPerCol {
+		// Residuals of the tile for every mode.
+		sx, sy := tileX<<uint(minBits), tileY<<uint(minBits)
+		maxX := min(tile, width-sx)
+		maxY := min(tile, height-sy)
+		for mode := 0; mode < numPredModes; mode++ {
+			r := resid[:maxX*maxY]
+			ps.tileResiduals(mode, sx, sy, maxX, maxY, r)
+			for l := 0; l <= updateUpTo; l++ {
+				h := &ps.hist[l*numPredModes+mode]
+				for _, p := range r {
+					h.add(p)
+				}
+			}
+		}
+		// Update all the super-tiles that are complete.
+		sub := 0
+		for {
+			ps.bestForTile(sub, tileX>>uint(sub), tileY>>uint(sub), subSampleSize(width, minBits+sub))
+			if sub == maxSub {
+				break
+			}
+			sub++
+			if sub > updateUpTo {
+				dst := ps.hist[sub*numPredModes : (sub+1)*numPredModes]
+				src := ps.hist[(sub-1)*numPredModes : sub*numPredModes]
+				for m := range dst {
+					addHisto4(&dst[m], &src[m])
+				}
+			}
+			if !((tileX == tilesPerRow-1 || (localX+1)%(1<<uint(sub)) == 0) &&
+				(tileY == tilesPerCol-1 || (localY+1)%(1<<uint(sub)) == 0)) {
+				sub-- // index of the last finished super-tile
+				break
+			}
+		}
+		// Reset the histograms of the finished (super-)tiles.
+		clear(ps.hist[:(sub+1)*numPredModes])
+		if sub == maxSub {
+			// Start a new max-tile.
+			if tileX == tilesPerRow-1 {
+				maxTileX = 0
+				maxTileY++
+			} else {
+				maxTileX++
+			}
+			localX, localY = 0, 0
+		} else {
+			// Proceed with the Z traversal.
+			cx := localX >> uint(sub)
+			cy := localY >> uint(sub)
+			switch {
+			case tileX == tilesPerRow-1 && cx%2 == 0:
+				cy++
+			case cx%2 == 0:
+				cx++
+			default:
+				cy++
+				cx--
+			}
+			localX = cx << uint(sub)
+			localY = cy << uint(sub)
+		}
+		tileX = maxTileX*maxTileSize + localX
+		tileY = maxTileY*maxTileSize + localY
+	}
+
+	// Pick the sampling with the lowest cost: entropy of the mode image
+	// plus entropy of the residuals.
+	bestCost := math.Inf(1)
+	best := 0
+	for l := 0; l < levels; l++ {
+		cost := shannonEntropy(ps.predHisto[l*numPredModes : (l+1)*numPredModes])
+		for c := 0; c < 4; c++ {
+			cost += shannonEntropy(ps.acc[l][c][:])
+		}
+		if cost < bestCost {
+			bestCost = cost
+			best = l
+		}
+	}
+	bits := minBits + best
+	copy(modes, ps.levelMode[best])
+	return optimizeSampling(modes, width, height, bits, maxTransformBits)
+}
+
+// bestForTile chooses the mode of the (super-)tile (tx, ty) at level sub
+// (libwebp GetBestPredictorForTile).
+func (ps *predSearch) bestForTile(sub, tx, ty, perRow int) {
+	modes := ps.levelMode[sub]
+	acc := &ps.acc[sub]
+	leftMode, aboveMode := -1, -1
+	if tx > 0 {
+		leftMode = int(modes[ty*perRow+tx-1]>>8) & 0xff
+	}
+	if ty > 0 {
+		aboveMode = int(modes[(ty-1)*perRow+tx]>>8) & 0xff
+	}
+	var ae [4]accEntropy
+	for i := range ae {
+		ae[i].init(&acc[i])
+	}
+	hs := ps.hist[sub*numPredModes : (sub+1)*numPredModes]
+	bestDiff := math.Inf(1)
+	bestMode := 0
+	for mode := range hs {
+		d := predictionCostSpatialHistogram(acc, &hs[mode], &ae)
+		if mode == leftMode {
+			d -= spatialPredictorBias
+		}
+		if mode == aboveMode {
+			d -= spatialPredictorBias
+		}
+		if d < bestDiff {
+			bestDiff = d
+			bestMode = mode
+		}
+	}
+	addHisto4(acc, &hs[bestMode])
+	modes[ty*perRow+tx] = argbBlack | uint32(bestMode)<<8
+	ps.predHisto[sub*numPredModes+bestMode]++
+}
+
+func addHisto4(dst, src *histo4) {
+	for i := range dst {
+		d, s := &dst[i], &src[i]
+		for j := range d {
+			d[j] += s[j]
+		}
+	}
+}
+
+// shannonEntropy returns sum(X)*log2(sum(X)) - sum(x*log2(x)) (libwebp
+// VP8LShannonEntropy).
+func shannonEntropy(x []int32) float64 {
+	var r float64
+	var sum uint32
+	for _, v := range x {
+		if v != 0 {
+			sum += uint32(v)
+			r -= slog2(uint32(v))
+		}
+	}
+	return r + slog2(sum)
+}
+
+// tileResiduals computes into out the residuals of one tile for mode.
+func (ps *predSearch) tileResiduals(mode, sx, sy, maxX, maxY int, out []uint32) {
+	width := ps.width
+	argb := ps.argb
+	if !ps.slow {
+		for ry := 0; ry < maxY; ry++ {
+			y := sy + ry
+			row := argb[y*width : (y+1)*width]
+			var up []uint32
+			if y > 0 {
+				up = argb[(y-1)*width : y*width+1]
+			}
+			residualRow(mode, row, up, y, sx, sx+maxX, out[ry*maxX:(ry+1)*maxX])
+		}
+		return
+	}
+	// Row copies, so that predictions use the reconstructed (near-lossless)
+	// or cleaned (transparent) pixels.
+	cur := ps.sc.rowA(width + 1)
+	up := ps.sc.rowB(width + 1)
 	lo := sx
 	if lo > 0 {
 		lo--
 	}
 	hi := sx + maxX + 1 // one pixel past the tile (top-right context)
-	n := width * height
+	n := width * ps.height
 	for ry := 0; ry < maxY; ry++ {
 		y := sy + ry
 		if ry == 0 {
@@ -416,14 +588,87 @@ func nlTileResiduals(mode int, argb []uint32, width, height, sx, sy, maxX, maxY 
 		}
 		e := min(y*width+hi, n)
 		copy(cur[lo:], argb[y*width+lo:e])
-		r := resid[:maxX]
 		var mdRow []uint8
-		if md != nil {
-			mdRow = md[y*width : (y+1)*width]
+		if ps.md != nil {
+			mdRow = ps.md[y*width : (y+1)*width]
 		}
-		residualRowNL(mode, cur, up, y, width, height, sx, sx+maxX, mdRow, maxQuant, usedSubGreen, clean, r)
-		for _, p := range r {
-			h.add(p)
+		residualRowNL(mode, cur, up, y, width, ps.height, sx, sx+maxX, mdRow, ps.maxQuant, ps.usedSubGreen, ps.clean,
+			out[ry*maxX:(ry+1)*maxX])
+	}
+}
+
+// optimizeSampling checks whether image (a sub-image of a fullWidth x
+// fullHeight image sampled with bits) is made of uniform squares of a larger
+// power of 2 and, if so, subsamples it in place. It returns the new bits
+// (at most maxBits). Port of libwebp's VP8LOptimizeSampling.
+func optimizeSampling[T uint16 | uint32](image []T, fullWidth, fullHeight, bits, maxBits int) int {
+	width := subSampleSize(fullWidth, bits)
+	height := subSampleSize(fullHeight, bits)
+	bestBits := bits
+	// Check rows first.
+	for bestBits < maxBits {
+		newSquare := 1 << uint(bestBits+1-bits)
+		square := 1 << uint(bestBits-bits)
+		good := true
+		for y := 0; y+square < height; y += newSquare {
+			a := image[y*width : (y+1)*width]
+			b := image[(y+square)*width : (y+square+1)*width]
+			if !equalSlice(a, b) {
+				good = false
+				break
+			}
+		}
+		if !good {
+			break
+		}
+		bestBits++
+	}
+	if bestBits == bits {
+		return bits
+	}
+	// Check columns.
+	for bestBits > bits {
+		square := 1 << uint(bestBits-bits)
+		good := true
+	rows:
+		for y := 0; y < height; y++ {
+			row := image[y*width : (y+1)*width]
+			for x := 0; x < width; x += square {
+				for i := x + 1; i < min(x+square, width); i++ {
+					if row[i] != row[x] {
+						good = false
+						break rows
+					}
+				}
+			}
+		}
+		if good {
+			break
+		}
+		bestBits--
+	}
+	if bestBits == bits {
+		return bits
+	}
+	// Subsample the image.
+	oldWidth := width
+	square := 1 << uint(bestBits-bits)
+	width = subSampleSize(fullWidth, bestBits)
+	height = subSampleSize(fullHeight, bestBits)
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			image[y*width+x] = image[square*(y*oldWidth+x)]
 		}
 	}
+	return bestBits
+}
+
+func equalSlice[T uint16 | uint32](a, b []T) bool {
+	b = b[:len(a)]
+	for i, v := range a {
+		if v != b[i] {
+			return false
+		}
+	}
+	return true
 }

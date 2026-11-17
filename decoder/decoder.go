@@ -268,6 +268,12 @@ func (d *Decoder) decodeLossy(parsed *container.Image) (*image.NRGBA, error) {
 	var la *lazyAlpha
 	if parsed.ALPH != nil {
 		la = &lazyAlpha{alph: parsed.ALPH, w: w, h: h, crop: crop, dithering: c.AlphaDitheringStrength}
+		// With UseThreads the plane is first needed on the worker
+		// goroutine, while release runs on this one: a sync.Pool Get on
+		// another P misses the plane put back by the previous decode. Take
+		// a pooled plane here (without allocating one: the allocation stays
+		// lazy, see grow).
+		la.prefetch()
 		defer la.release()
 		opts.Alpha = la.get
 	}
@@ -308,6 +314,7 @@ type lazyAlpha struct {
 	data    []byte             // payload after the header byte
 	dec     *vp8l.AlphaDecoder // nil for uncompressed alpha
 	pp      *[]byte            // pooled plane, if any
+	spare   *[]byte            // pooled plane taken by prefetch, not yet used
 	plane   []byte             // rows [0, rows) are final
 	rows    int
 	err     error
@@ -411,7 +418,12 @@ func (a *lazyAlpha) grow(rowEnd int) {
 		return
 	}
 	if w*h <= maxPooledPlane {
-		a.pp = getPlane(w * h)
+		if a.spare != nil {
+			a.pp, a.spare = a.spare, nil
+			*a.pp = (*a.pp)[:w*h]
+		} else {
+			a.pp = getPlane(w * h)
+		}
 		a.plane = *a.pp
 		return
 	}
@@ -424,7 +436,28 @@ func (a *lazyAlpha) grow(rowEnd int) {
 	a.plane = np
 }
 
+// prefetch takes a plane big enough for the whole alpha plane from
+// planePool, if the plane is poolable and the pool has one; it allocates
+// nothing.
+func (a *lazyAlpha) prefetch() {
+	n := a.w * a.h
+	if n > maxPooledPlane {
+		return
+	}
+	if p, ok := planePool.Get().(*[]byte); ok {
+		if cap(*p) >= n {
+			a.spare = p
+		} else {
+			planePool.Put(p)
+		}
+	}
+}
+
 func (a *lazyAlpha) release() {
+	if a.spare != nil {
+		planePool.Put(a.spare)
+		a.spare = nil
+	}
 	if a.dec != nil {
 		a.dec.Close()
 		a.dec = nil

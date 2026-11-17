@@ -5,20 +5,17 @@ import (
 	"image/color"
 )
 
-// toNRGBA returns src as an *image.NRGBA. An *image.NRGBA is returned as is,
-// and so is (sharing its pixels) a fully opaque *image.RGBA, whose bytes are
-// the same premultiplied or not (png.Decode returns those for RGB files);
-// the common standard library image types are converted with dedicated
-// loops (the results equal draw.Draw(dst, r, src, r.Min, draw.Src), i.e.
-// color.NRGBAModel conversion, but without its per-pixel interface calls).
+// toNRGBA returns src as an *image.NRGBA. An *image.NRGBA is returned as is
+// (shared, as in v1); every other image is copied, so that the result is a
+// snapshot of src. The common standard library image types are converted
+// with dedicated loops (the results equal draw.Draw(dst, r, src, r.Min,
+// draw.Src), i.e. color.NRGBAModel conversion, but without its per-pixel
+// interface calls); an opaque *image.RGBA, whose bytes are the same
+// premultiplied or not (png.Decode returns those for RGB files), is copied
+// row by row.
 func toNRGBA(src image.Image) *image.NRGBA {
-	switch v := src.(type) {
-	case *image.NRGBA:
+	if v, ok := src.(*image.NRGBA); ok {
 		return v
-	case *image.RGBA:
-		if v.Opaque() {
-			return &image.NRGBA{Pix: v.Pix, Stride: v.Stride, Rect: v.Rect}
-		}
 	}
 	b := src.Bounds()
 	w, h := b.Dx(), b.Dy()
@@ -26,10 +23,15 @@ func toNRGBA(src image.Image) *image.NRGBA {
 
 	switch v := src.(type) {
 	case *image.RGBA:
+		opaque := v.Opaque()
 		for y := 0; y < h; y++ {
 			s := v.Pix[v.PixOffset(b.Min.X, b.Min.Y+y):][:4*w]
 			d := dst.Pix[y*dst.Stride:][:4*w]
-			unpremultiplyRow(d, s)
+			if opaque {
+				copy(d, s)
+			} else {
+				unpremultiplyRow(d, s)
+			}
 		}
 	case *image.Gray:
 		for y := 0; y < h; y++ {

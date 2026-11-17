@@ -30,14 +30,6 @@ func slog2(v uint32) float64 {
 	return slog2Slow(v)
 }
 
-// flog2 returns log2(v) (0 for v == 0).
-func flog2(v uint32) float64 {
-	if v < logTabSize {
-		return log2Tab[v]
-	}
-	return log2Slow(v)
-}
-
 // log2Slow approximates log2(v) for v >= logTabSize from the table using the
 // 12 most significant bits plus a linear correction of the remainder.
 func log2Slow(v uint32) float64 {
@@ -210,15 +202,6 @@ func extraCost(pop []uint32) float64 {
 	var cost uint64
 	for i := 4; i < len(pop); i++ {
 		cost += uint64((i-2)>>1) * uint64(pop[i])
-	}
-	return float64(cost)
-}
-
-func extraCostCombined(a, b []uint32) float64 {
-	var cost uint64
-	b = b[:len(a)]
-	for i := 4; i < len(a); i++ {
-		cost += uint64((i-2)>>1) * uint64(a[i]+b[i])
 	}
 	return float64(cost)
 }

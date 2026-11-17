@@ -149,9 +149,8 @@ func TestAllConfigsNoPanic(t *testing.T) {
 }
 
 func TestEncodeAlphaMatchesGreenImage(t *testing.T) {
-	// The alpha stream must equal the image stream of an opaque image whose
-	// green channel holds the alpha values (header stripped), for the same
-	// effort and no color cache.
+	// The alpha stream is the image stream (header stripped) of an image
+	// whose green channel holds the alpha values; it must be deterministic.
 	w, h := 37, 21
 	plane := make([]byte, w*h)
 	for i := range plane {
