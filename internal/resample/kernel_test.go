@@ -32,14 +32,20 @@ func importRow(rs *Rescaler, src []byte, acc []uint32, ref bool) {
 // work as the work buffer.
 func checkImport(t testing.TB, rnd *rand.Rand, sw, dw, ch int, src []byte, work []uint32) {
 	t.Helper()
-	var rs Rescaler
-	if err := rs.Init(sw, 2, dw, 1, ch, work); err != nil {
-		t.Fatal(err)
-	}
 	if src == nil {
 		src = make([]byte, sw*ch)
 	}
 	copy(src, randomPixels(rnd, sw*ch))
+	compareImport(t, rnd, sw, dw, ch, src, work)
+}
+
+// compareImport is checkImport on the given source row (sw*ch bytes).
+func compareImport(t testing.TB, rnd *rand.Rand, sw, dw, ch int, src []byte, work []uint32) {
+	t.Helper()
+	var rs Rescaler
+	if err := rs.Init(sw, 2, dw, 1, ch, work); err != nil {
+		t.Fatal(err)
+	}
 	n := dw * ch
 	acc0 := make([]uint32, n)
 	for i := range acc0 {
