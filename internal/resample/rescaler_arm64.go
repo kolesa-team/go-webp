@@ -66,6 +66,7 @@ const (
 	kindShrink1T16
 	kindShrink1T32
 	kindShrink1T64
+	kindExpand4
 )
 
 // archState records which assembly kernel a rescaler uses and how far:
@@ -89,11 +90,19 @@ func archTableSize(dstWidth, numChannels int) int {
 // initArch picks the kernel for r's geometry; tab holds archTableSize
 // cells.
 func (r *Rescaler) initArch(tab []uint32) {
-	if r.xExpand || (r.numChannels != 1 && r.numChannels != 4) {
-		return
-	}
 	a := &r.arch
 	cols := r.cols
+	if r.xExpand {
+		// The left pixels never decrease; the kernel loads each one with
+		// its right neighbour.
+		if r.numChannels == 4 && int(cols[2*r.dstWidth-2])+2 <= r.srcWidth {
+			a.kind, a.asmOuts, a.asmSrc = kindExpand4, r.dstWidth, r.srcWidth
+		}
+		return
+	}
+	if r.numChannels != 1 && r.numChannels != 4 {
+		return
+	}
 	nmax := 0
 	for x := 0; x < r.dstWidth; x++ {
 		nmax = max(nmax, int(cols[2*x]))
@@ -279,19 +288,80 @@ func (r *Rescaler) shrinkRow1(src []byte, acc []uint32) {
 	shrinkRow1Go(frow[n:], acc, src[s:], cols[2*n:], xSub, fx, carry)
 }
 
-func (r *Rescaler) expandRow(src []byte, acc []uint32) { r.expandRowRef(src, acc) }
+// expandRow4NEON imports a 4-channel horizontal expansion of n
+// destination pixels: frow[0:4n] (and acc[0:4n] when acc is not nil). It
+// reads cols[0:2n] and the 8 bytes (left and right pixel) at each left
+// source pixel, which must be at most the last but one of src.
+//
+//go:noescape
+func expandRow4NEON(frow, acc *uint32, src *byte, cols *uint32, n int, xAdd uint32)
 
-func exportExpand(dst []byte, frow []uint32, fy uint32) { exportExpandGo(dst, frow, fy) }
+func (r *Rescaler) expandRow(src []byte, acc []uint32) {
+	if r.arch.kind != kindExpand4 {
+		r.expandRowRef(src, acc)
+		return
+	}
+	// initArch checked that the left pixels end before the last one, so
+	// every 8-byte load is inside src.
+	src, frow, acc, ap := r.asmRows(src, acc)
+	cols := r.cols[:2*r.dstWidth]
+	expandRow4NEON(&frow[0], ap, &src[0], &cols[0], r.dstWidth, uint32(r.xAdd))
+}
+
+// The export kernels process n values, n > 0 and a multiple of 8; the
+// wrappers below run the Go kernels on the rest of the row.
+
+//go:noescape
+func exportShrinkNEON(dst *byte, irow, frow *uint32, n int, yscale, fxy uint32)
+
+//go:noescape
+func exportShrinkZeroNEON(dst *byte, irow *uint32, n int, fxy uint32)
+
+//go:noescape
+func exportExpandNEON(dst *byte, frow *uint32, n int, fy uint32)
+
+//go:noescape
+func exportExpandMixNEON(dst *byte, frow, irow *uint32, n int, a, b, fy uint32)
+
+func exportExpand(dst []byte, frow []uint32, fy uint32) {
+	n := len(dst)
+	frow = frow[:n]
+	if m := n &^ 7; m > 0 {
+		exportExpandNEON(&dst[0], &frow[0], m, fy)
+		dst, frow = dst[m:], frow[m:]
+	}
+	exportExpandGo(dst, frow, fy)
+}
 
 func exportExpandMix(dst []byte, frow, irow []uint32, a, b, fy uint32) {
+	n := len(dst)
+	frow, irow = frow[:n], irow[:n]
+	if m := n &^ 7; m > 0 {
+		exportExpandMixNEON(&dst[0], &frow[0], &irow[0], m, a, b, fy)
+		dst, frow, irow = dst[m:], frow[m:], irow[m:]
+	}
 	exportExpandMixGo(dst, frow, irow, a, b, fy)
 }
 
 func exportShrink(dst []byte, irow, frow []uint32, yscale, fxy uint32) {
+	n := len(dst)
+	irow, frow = irow[:n], frow[:n]
+	if m := n &^ 7; m > 0 {
+		exportShrinkNEON(&dst[0], &irow[0], &frow[0], m, yscale, fxy)
+		dst, irow, frow = dst[m:], irow[m:], frow[m:]
+	}
 	exportShrinkGo(dst, irow, frow, yscale, fxy)
 }
 
-func exportShrinkZero(dst []byte, irow []uint32, fxy uint32) { exportShrinkZeroGo(dst, irow, fxy) }
+func exportShrinkZero(dst []byte, irow []uint32, fxy uint32) {
+	n := len(dst)
+	irow = irow[:n]
+	if m := n &^ 7; m > 0 {
+		exportShrinkZeroNEON(&dst[0], &irow[0], m, fxy)
+		dst, irow = dst[m:], irow[m:]
+	}
+	exportShrinkZeroGo(dst, irow, fxy)
+}
 
 func premultiplyRow(row []byte) { multRGBA(row, &premulScale) }
 

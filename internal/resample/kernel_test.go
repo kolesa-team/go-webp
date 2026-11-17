@@ -2,6 +2,7 @@ package resample
 
 import (
 	"bytes"
+	"fmt"
 	"math/rand"
 	"slices"
 	"testing"
@@ -234,5 +235,119 @@ func FuzzExportKernels(f *testing.F) {
 	f.Fuzz(func(t *testing.T, sw, sh, dw, dh uint16, ch uint8, seed int64) {
 		w, h, ow, oh := int(sw%400)+1, int(sh%400)+1, int(dw%400)+1, int(dh%400)+1
 		checkRescale(t, rand.New(rand.NewSource(seed)), w, h, ow, oh, int(ch%4)+1, nil)
+	})
+}
+
+// BenchmarkKernels compares the selected kernels ("sel": assembly where
+// available) with the Go ones on single rows.
+func BenchmarkKernels(b *testing.B) {
+	rnd := rand.New(rand.NewSource(15))
+	for _, c := range []struct{ sw, dw, ch int }{
+		{1024, 300, 4}, {3000, 320, 4}, {300, 1024, 4},
+		{512, 320, 1}, {1024, 320, 1}, {1500, 320, 1}, {3000, 320, 1}, {3000, 100, 1},
+	} {
+		rs, err := New(c.sw, 2, c.dw, 1, c.ch)
+		if err != nil {
+			b.Fatal(err)
+		}
+		src := randomPixels(rnd, c.sw*c.ch)
+		for _, ref := range []bool{false, true} {
+			name := map[bool]string{false: "sel", true: "go"}[ref]
+			b.Run(fmt.Sprintf("import/%dto%dx%d/%s", c.sw, c.dw, c.ch, name), func(b *testing.B) {
+				b.SetBytes(int64(len(src)))
+				for i := 0; i < b.N; i++ {
+					importRow(rs, src, rs.irow, ref)
+				}
+			})
+		}
+	}
+	const n = 4096
+	irow, frow, dst := randomWords(rnd, n), randomWords(rnd, n), make([]byte, n)
+	for _, k := range []struct {
+		name     string
+		sel, ref func()
+	}{
+		{"exportShrink",
+			func() { exportShrink(dst, irow, frow, 0x12345678, 0x9abc) },
+			func() { exportShrinkGo(dst, irow, frow, 0x12345678, 0x9abc) }},
+		{"exportExpandMix",
+			func() { exportExpandMix(dst, frow, irow, 0x40000000, 0xc0000000, 0x9abc) },
+			func() { exportExpandMixGo(dst, frow, irow, 0x40000000, 0xc0000000, 0x9abc) }},
+	} {
+		for _, ref := range []bool{false, true} {
+			f := map[bool]func(){false: k.sel, true: k.ref}[ref]
+			b.Run(k.name+"/"+map[bool]string{false: "sel", true: "go"}[ref], func(b *testing.B) {
+				b.SetBytes(n)
+				for i := 0; i < b.N; i++ {
+					f()
+				}
+			})
+		}
+	}
+}
+
+// randomWords returns n random words, some of them extreme.
+func randomWords(rnd *rand.Rand, n int) []uint32 {
+	w := make([]uint32, n)
+	for i := range w {
+		switch rnd.Intn(8) {
+		case 0:
+			w[i] = 0xffffffff - uint32(rnd.Intn(4))
+		case 1:
+			w[i] = uint32(rnd.Intn(4))
+		case 2:
+			w[i] = uint32(rnd.Intn(1 << 20))
+		default:
+			w[i] = rnd.Uint32()
+		}
+	}
+	return w
+}
+
+// checkExportRow runs the selected and the Go export kernels on the same
+// arbitrary rows (any 32-bit values, not only those a rescale produces).
+func checkExportRow(t testing.TB, rnd *rand.Rand, n int) {
+	t.Helper()
+	irow, frow := randomWords(rnd, n), randomWords(rnd, n)
+	k := randomWords(rnd, 3)
+	b := max(1, k[1])
+	a := uint32(one - uint64(b))
+	got, want := make([]byte, n), make([]byte, n)
+	gi, wi := slices.Clone(irow), slices.Clone(irow)
+	check := func(name string) {
+		t.Helper()
+		if !bytes.Equal(got, want) || !slices.Equal(gi, wi) {
+			t.Fatalf("%s, %d values, scales %#x: differs from the Go kernel", name, n, k)
+		}
+	}
+	exportShrink(got, gi, frow, k[0], k[1])
+	exportShrinkGo(want, wi, frow, k[0], k[1])
+	check("exportShrink")
+	exportShrinkZero(got, gi, k[2])
+	exportShrinkZeroGo(want, wi, k[2])
+	check("exportShrinkZero")
+	exportExpand(got, frow, k[0])
+	exportExpandGo(want, frow, k[0])
+	check("exportExpand")
+	exportExpandMix(got, frow, irow, a, b, k[2])
+	exportExpandMixGo(want, frow, irow, a, b, k[2])
+	check("exportExpandMix")
+}
+
+func TestExportRowKernels(t *testing.T) {
+	rnd := rand.New(rand.NewSource(14))
+	n := 200000
+	if testing.Short() {
+		n = 20000
+	}
+	for i := 0; i < n; i++ {
+		checkExportRow(t, rnd, rnd.Intn(80))
+	}
+}
+
+func FuzzExportRowKernels(f *testing.F) {
+	f.Add(uint16(37), int64(1))
+	f.Fuzz(func(t *testing.T, n uint16, seed int64) {
+		checkExportRow(t, rand.New(rand.NewSource(seed)), int(n%4096))
 	})
 }

@@ -378,3 +378,205 @@ t64loop:
 
 t64done:
 	RET
+
+// Export kernels: 8 values per iteration, n > 0 and a multiple of 8.
+// MULT_FIX(v, scale) = (v*scale + 2^31) >> 32 is UMULL/UMULL2 then ADDHN
+// with 2^31; clip8 of the unsigned result is two saturating narrows
+// (UQXTN to 16 then 8 bits). V18 holds 2^31 in both 64-bit lanes.
+
+// EXP_SETUP2(r) loads 2^31 into V18 using scratch register r.
+#define EXP_SETUP2(r) \
+	MOVD $0x80000000, r \
+	VDUP r, V18.D2
+
+// EXP_MULTFIX(vs, vk, vlo, vhi, t, lo, hi) sets register t (4S) to
+// MULT_FIX(vs, vk) per lane, with vlo/vhi (numbered lo/hi) as 2D scratch.
+#define EXP_MULTFIX(vs, vk, vlo, vhi, t, lo, hi) \
+	VUMULL  vk.S2, vs.S2, vlo.D2 \
+	VUMULL2 vk.S4, vs.S4, vhi.D2 \
+	ADDHN_2S(t, lo, 18) \
+	ADDHN2_4S(t, hi, 18)
+
+// EXP_CLIP_STORE stores clip8 of V12 and V13 (8 words) at R0.
+#define EXP_CLIP_STORE \
+	VUQXTN  V12.S4, V14.H4 \
+	VUQXTN2 V13.S4, V14.H8 \
+	VUQXTN  V14.H8, V15.B8 \
+	VST1.P  [V15.B8], 8(R0)
+
+// func exportShrinkNEON(dst *byte, irow, frow *uint32, n int, yscale, fxy uint32)
+//
+// WebPRescalerExportRowShrink_C with yscale != 0:
+//
+//	fr = (frow*yscale) >> 32; dst = clip8(MULT_FIX(irow - fr, fxy)); irow = fr
+//
+// R0 dst, R1 irow, R2 frow, R3 values left. V0/V1 frow, V2/V3 irow,
+// V4-V7 products, V4/V5 fr, V8-V11 products, V12/V13 results, V16
+// yscale, V17 fxy.
+TEXT ·exportShrinkNEON(SB), NOSPLIT, $0-40
+	MOVD  dst+0(FP), R0
+	MOVD  irow+8(FP), R1
+	MOVD  frow+16(FP), R2
+	MOVD  n+24(FP), R3
+	MOVWU yscale+32(FP), R4
+	MOVWU fxy+36(FP), R5
+	VDUP  R4, V16.S4
+	VDUP  R5, V17.S4
+	EXP_SETUP2(R6)
+
+exs:
+	VLD1.P  32(R2), [V0.S4, V1.S4]
+	VLD1    (R1), [V2.S4, V3.S4]
+	VUMULL  V16.S2, V0.S2, V4.D2
+	VUMULL2 V16.S4, V0.S4, V5.D2
+	VUMULL  V16.S2, V1.S2, V6.D2
+	VUMULL2 V16.S4, V1.S4, V7.D2
+	VUZP2   V5.S4, V4.S4, V4.S4
+	VUZP2   V7.S4, V6.S4, V5.S4
+	VSUB    V4.S4, V2.S4, V2.S4
+	VSUB    V5.S4, V3.S4, V3.S4
+	VST1.P  [V4.S4, V5.S4], 32(R1)
+	EXP_MULTFIX(V2, V17, V8, V9, 12, 8, 9)
+	EXP_MULTFIX(V3, V17, V10, V11, 13, 10, 11)
+	EXP_CLIP_STORE
+	SUBS    $8, R3, R3
+	BNE     exs
+	RET
+
+// func exportShrinkZeroNEON(dst *byte, irow *uint32, n int, fxy uint32)
+//
+// WebPRescalerExportRowShrink_C with yscale == 0:
+// dst = clip8(MULT_FIX(irow, fxy)); irow = 0.
+TEXT ·exportShrinkZeroNEON(SB), NOSPLIT, $0-28
+	MOVD  dst+0(FP), R0
+	MOVD  irow+8(FP), R1
+	MOVD  n+16(FP), R3
+	MOVWU fxy+24(FP), R5
+	VDUP  R5, V17.S4
+	EXP_SETUP2(R6)
+	VEOR  V20.B16, V20.B16, V20.B16
+	VEOR  V21.B16, V21.B16, V21.B16
+
+exz:
+	VLD1   (R1), [V2.S4, V3.S4]
+	VST1.P [V20.S4, V21.S4], 32(R1)
+	EXP_MULTFIX(V2, V17, V8, V9, 12, 8, 9)
+	EXP_MULTFIX(V3, V17, V10, V11, 13, 10, 11)
+	EXP_CLIP_STORE
+	SUBS   $8, R3, R3
+	BNE    exz
+	RET
+
+// func exportExpandNEON(dst *byte, frow *uint32, n int, fy uint32)
+//
+// WebPRescalerExportRowExpand_C with y_accum == 0:
+// dst = clip8(MULT_FIX(frow, fy)).
+TEXT ·exportExpandNEON(SB), NOSPLIT, $0-28
+	MOVD  dst+0(FP), R0
+	MOVD  frow+8(FP), R2
+	MOVD  n+16(FP), R3
+	MOVWU fy+24(FP), R5
+	VDUP  R5, V17.S4
+	EXP_SETUP2(R6)
+
+exe:
+	VLD1.P 32(R2), [V2.S4, V3.S4]
+	EXP_MULTFIX(V2, V17, V8, V9, 12, 8, 9)
+	EXP_MULTFIX(V3, V17, V10, V11, 13, 10, 11)
+	EXP_CLIP_STORE
+	SUBS   $8, R3, R3
+	BNE    exe
+	RET
+
+// func exportExpandMixNEON(dst *byte, frow, irow *uint32, n int, a, b, fy uint32)
+//
+// WebPRescalerExportRowExpand_C with y_accum != 0:
+//
+//	j = (a*frow + b*irow + 2^31) >> 32; dst = clip8(MULT_FIX(j, fy))
+//
+// a + b == 2^32, so the 64-bit sum (UMULL then UMLAL) cannot overflow.
+// R0 dst, R1 irow, R2 frow, R3 values left. V0/V1 frow, V2/V3 irow,
+// V4-V7 sums, V8-V11 products, V12/V13 results, V16 a, V17 fy, V19 b.
+TEXT ·exportExpandMixNEON(SB), NOSPLIT, $0-44
+	MOVD  dst+0(FP), R0
+	MOVD  frow+8(FP), R2
+	MOVD  irow+16(FP), R1
+	MOVD  n+24(FP), R3
+	MOVWU a+32(FP), R4
+	MOVWU b+36(FP), R5
+	MOVWU fy+40(FP), R6
+	VDUP  R4, V16.S4
+	VDUP  R5, V19.S4
+	VDUP  R6, V17.S4
+	EXP_SETUP2(R7)
+
+exm:
+	VLD1.P  32(R2), [V0.S4, V1.S4]
+	VLD1.P  32(R1), [V2.S4, V3.S4]
+	VUMULL  V16.S2, V0.S2, V4.D2
+	VUMLAL  V19.S2, V2.S2, V4.D2
+	VUMULL2 V16.S4, V0.S4, V5.D2
+	VUMLAL2 V19.S4, V2.S4, V5.D2
+	VUMULL  V16.S2, V1.S2, V6.D2
+	VUMLAL  V19.S2, V3.S2, V6.D2
+	VUMULL2 V16.S4, V1.S4, V7.D2
+	VUMLAL2 V19.S4, V3.S4, V7.D2
+	ADDHN_2S(0, 4, 18)
+	ADDHN2_4S(0, 5, 18)
+	ADDHN_2S(1, 6, 18)
+	ADDHN2_4S(1, 7, 18)
+	EXP_MULTFIX(V0, V17, V8, V9, 12, 8, 9)
+	EXP_MULTFIX(V1, V17, V10, V11, 13, 10, 11)
+	EXP_CLIP_STORE
+	SUBS    $8, R3, R3
+	BNE     exm
+	RET
+
+// func expandRow4NEON(frow, acc *uint32, src *byte, cols *uint32, n int, xAdd uint32)
+//
+// WebPRescalerImportRowExpand_C for 4 channels and a source at least two
+// pixels wide, one destination pixel per iteration:
+//
+//	frow = right*xAdd + (left - right)*w; acc += frow   (32-bit, wrapping)
+//
+// where left/right are the 8 bytes at source pixel cols[2x] and w is
+// cols[2x+1].
+//
+// R0 frow, R1 acc (nil: no accumulation), R2 src, R3 cols, R4 pixels left,
+// R8 left pixel, R9 w, R10 its address. V0 the two pixels, V1 left then
+// the result, V2 right, V3 w, V4 acc, V16 xAdd.
+TEXT ·expandRow4NEON(SB), NOSPLIT, $0-44
+	MOVD  frow+0(FP), R0
+	MOVD  acc+8(FP), R1
+	MOVD  src+16(FP), R2
+	MOVD  cols+24(FP), R3
+	MOVD  n+32(FP), R4
+	MOVWU xAdd+40(FP), R5
+	CBZ   R4, edone
+	VDUP  R5, V16.S4
+
+eloop:
+	MOVWU  (R3), R8
+	MOVWU  4(R3), R9
+	ADD    $8, R3, R3
+	ADD    R8<<2, R2, R10
+	VLD1   (R10), V0.D[0]
+	VUXTL  V0.B8, V0.H8
+	VUXTL  V0.H4, V1.S4
+	VUXTL2 V0.H8, V2.S4
+	VSUB   V2.S4, V1.S4, V1.S4
+	VDUP   R9, V3.S4
+	VMUL   V3.S4, V1.S4, V1.S4
+	VMLA   V16.S4, V2.S4, V1.S4
+	VST1.P [V1.S4], 16(R0)
+	CBZ    R1, enext
+	VLD1   (R1), [V4.S4]
+	VADD   V1.S4, V4.S4, V4.S4
+	VST1.P [V4.S4], 16(R1)
+
+enext:
+	SUBS $1, R4, R4
+	BNE  eloop
+
+edone:
+	RET
