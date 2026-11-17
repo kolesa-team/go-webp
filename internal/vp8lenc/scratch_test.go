@@ -250,7 +250,7 @@ func TestRefsSizing(t *testing.T) {
 		seed = seed*1664525 + 1013904223
 		noise[i] = seed
 	}
-	sc := new(scratch)
+	var sc *scratch
 	// The parse buffers in use (the slots holding a parse) must be sized
 	// to the parse.
 	check := func(name string, noise bool) {
@@ -270,14 +270,17 @@ func TestRefsSizing(t *testing.T) {
 				t.Errorf("%s refs[%d]: len %d cap %d, n %d", name, i, len(sc.refs[i]), cap(sc.refs[i]), n)
 			}
 		}
-		// Without tryNoCache, a single parse is kept (bestRefs).
-		if used != 1 {
-			t.Errorf("%s: %d parse buffers in use, want 1", name, used)
+		// Without tryNoCache, a single dense parse is kept, two sparse
+		// ones (bestRefs).
+		if used != 1 && (noise || used != 2) {
+			t.Errorf("%s: %d parse buffers in use", name, used)
 		}
 	}
+	sc = new(scratch)
 	sc.hc.fill(flat, w, h, 75, false, 0)
 	getBackwardRefs(flat, w, h, 75, false, false, 0, false, -1, sc, nil)
 	check("flat", false)
+	sc = new(scratch)
 	sc.hc.fill(noise, w, h, 75, false, 0)
 	getBackwardRefs(noise, w, h, 75, false, false, 0, false, -1, sc, nil)
 	check("noise", true)
@@ -364,8 +367,9 @@ func refBestRefs(argb []uint32, w, n, quality int, types []int, trace bool, cach
 	return refsCandidate{bufs[best], bestCB, bestCost}, kind
 }
 
-// TestBestRefsSingleBuffer checks the single-buffer parse selection against
-// the two-buffer one, on images where each parse type (and the cost-based
+// TestBestRefsSingleBuffer checks the parse selection of bestRefs (with a
+// single buffer for dense parses, two for sparse ones) against the
+// two-buffer one, on images where each parse type (and the cost-based
 // parse, or not) wins.
 func TestBestRefsSingleBuffer(t *testing.T) {
 	rng := rand.New(rand.NewSource(5))
@@ -382,6 +386,15 @@ func TestBestRefsSingleBuffer(t *testing.T) {
 		{"few", 90, 70, func(x, y int) uint32 {
 			return []uint32{0xff000000, 0xffff0000, 0xff00ff00, 0xff0000ff}[(x/3+y/2+rng.Intn(2))%4]
 		}},
+		// Sparse parses (a second buffer).
+		{"blocks", 1024, 256, func(x, y int) uint32 { return uint32(x/32*7+y/16*13) * 0x10101 }},
+		{"tiles", 800, 200, func(x, y int) uint32 { return uint32((x%97)/25+(y%41)/9) * 0x30507 }},
+		{"sparse-noise", 640, 256, func(x, y int) uint32 {
+			if rng.Intn(300) == 0 {
+				return rng.Uint32()
+			}
+			return uint32(x/24+y/10) * 0x20406
+		}},
 	}
 	won := map[string]bool{}
 	for _, im := range imgs {
@@ -390,9 +403,13 @@ func TestBestRefsSingleBuffer(t *testing.T) {
 		for i := range argb {
 			argb[i] = im.f(i%im.w, i/im.w)
 		}
-		for _, q := range []int{0, 20, 25, 50, 75, 100} {
+		qs, cbs := []int{0, 20, 25, 50, 75, 100}, []int{0, 4, maxColorCacheBits}
+		if n > 1<<16 {
+			qs, cbs = []int{20, 50, 100}, []int{0, maxColorCacheBits}
+		}
+		for _, q := range qs {
 			for _, box := range []bool{false, true} {
-				for _, cbMax := range []int{0, 4, maxColorCacheBits} {
+				for _, cbMax := range cbs {
 					sc := new(scratch)
 					sc.hc.fill(argb, im.w, im.h, q, q == 0, 0)
 					types := []int{lz77Standard, lz77RLE}
@@ -403,22 +420,36 @@ func TestBestRefsSingleBuffer(t *testing.T) {
 					trace := q >= 25
 					ref := new(scratch)
 					ref.hc, ref.hcBox = sc.hc, sc.hcBox // (read only)
-					want, kind := refBestRefs(argb, im.w, n, q, types, trace, cbMax, 16, ref)
+					refsCap := initRefsCap(argb, im.w, im.h)
+					want, kind := refBestRefs(argb, im.w, n, q, types, trace, cbMax, refsCap, ref)
 					cacheBuf := sc.cacheBuf(1 << maxColorCacheBits)
-					got := bestRefs(argb, im.w, n, q, types, trace, cbMax, 16, cacheBuf, sc)
+					got := bestRefs(argb, im.w, n, q, types, trace, cbMax, refsCap, cacheBuf, sc)
+					c := refsCap
+					if c < n && !box {
+						e := rleRefsEstimate(argb, im.w, im.h)
+						c = max(c, min(n, e+e/8+4096))
+					}
+					if c <= n/sparseRefs {
+						kind += "-sparse"
+					}
+
 					name := fmt.Sprintf("%s q%d box=%v cb%d (%s)", im.name, q, box, cbMax, kind)
 					if got.cacheBits != want.cacheBits || got.bits != want.bits || !slices.Equal(got.refs, want.refs) {
 						t.Fatalf("%s: single-buffer parse differs (cache bits %d/%d, %d/%d refs)", name, got.cacheBits, want.cacheBits, len(got.refs), len(want.refs))
 					}
-					if &sc.refs[0][:1][0] != &got.refs[:1][0] {
-						t.Fatalf("%s: parse not kept in refs[0]", name)
+					if p := &got.refs[:1][0]; p != &sc.refs[0][:1][0] && (cap(sc.refs[1]) == 0 || p != &sc.refs[1][:1][0]) {
+						t.Fatalf("%s: parse not kept in the parse buffers", name)
+					}
+					if refsCap == n && cap(sc.refs[1]) != 0 {
+						t.Fatalf("%s: a second buffer for a dense parse", name)
 					}
 					won[kind] = true
 				}
 			}
 		}
 	}
-	for _, k := range []string{"type1", "type2", "type1-trace-wins", "type1-trace-loses", "type4-trace-wins"} {
+	for _, k := range []string{"type1", "type2", "type1-trace-wins", "type1-trace-loses", "type4-trace-wins",
+		"type1-sparse", "type2-sparse", "type1-trace-wins-sparse", "type1-trace-loses-sparse", "type4-trace-wins-sparse"} {
 		if !won[k] {
 			t.Errorf("no case where %s (cases: %v)", k, won)
 		}
