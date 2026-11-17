@@ -28,13 +28,20 @@ type scratch struct {
 	rowa     []uint32
 	rowb     []uint32
 	idxRow   []uint8
-	md       []uint8
+	md       []uint8  // near-lossless max diffs, or cleanMask
 	predMode []uint32 // mode images of all the samplings (predSearch)
 	predHist []histo4 // per sampling and mode residual histograms
 	predAccH []histo4 // per sampling accumulated histograms
 	tile     tilePixels
 
 	bwTmp [2]bitWriter
+
+	// ThreadLevel only.
+	predBatch []histo4     // per tile and mode histograms (predSearch.runPar)
+	predWork  []predWorker // per goroutine buffers (predSearch.runPar)
+	hcChain   []uint32     // hash chain kept apart from the results (fillStripes)
+	hcMarks   []uint64     // positions searched by the stripes
+	hcExits   []int        // last position searched by each stripe
 
 	sub *scratch // for sub-images encoded while the main buffers are in use
 
@@ -43,19 +50,27 @@ type scratch struct {
 	pixels int
 }
 
-// maxPooledPixels bounds the image size whose scratch buffers are kept in
-// the pool: the buffers of a large encode (hundreds of MB for 12 MP) are
-// left to the garbage collector instead of being retained.
+// maxPooledPixels bounds the image size whose buffers are kept in the
+// sync.Pools (the free lists, see freelist.go, have their own budget): the
+// buffers of a large encode (hundreds of MB for 12 MP) are left to the
+// garbage collector instead of being retained until the next collections.
 const maxPooledPixels = 2 << 20
 
 var scratchPool = sync.Pool{New: func() any { return new(scratch) }}
 
-func getScratch() *scratch { return scratchPool.Get().(*scratch) }
+// getScratch returns a scratch from the free list, or from the pool.
+func getScratch() *scratch {
+	if s, ok := scratchFree.get(nil); ok {
+		return s
+	}
+	return scratchPool.Get().(*scratch)
+}
 
-// putScratch returns s to the pool, unless it served an image larger than
-// maxPooledPixels: dropping it bounds the memory retained by the pool.
+// putScratch returns s to the free list if the budget allows, else to the
+// pool unless it served an image larger than maxPooledPixels (dropping it
+// bounds the memory retained by the pool).
 func putScratch(s *scratch) {
-	if s.pixels > maxPooledPixels {
+	if scratchFree.put(s, s.bytes()) || s.pixels > maxPooledPixels {
 		return
 	}
 	scratchPool.Put(s)
@@ -182,6 +197,58 @@ func (s *scratch) predAcc(n int) []histo4 {
 	h := s.predAccH[:n]
 	clear(h)
 	return h
+}
+
+// predBatchBufs returns n histograms (contents unspecified).
+func (s *scratch) predBatchBufs(n int) []histo4 {
+	if cap(s.predBatch) < n {
+		s.predBatch = make([]histo4, n)
+	}
+	return s.predBatch[:n]
+}
+
+// predWorkers returns the buffers of n goroutines of predSearch.runPar.
+func (s *scratch) predWorkers(n, resid, row int) []predWorker {
+	if len(s.predWork) < n {
+		s.predWork = append(s.predWork, make([]predWorker, n-len(s.predWork))...)
+	}
+	w := s.predWork[:n]
+	for i := range w {
+		if cap(w[i].resid) < resid {
+			w[i].resid = make([]uint32, resid)
+		}
+		if cap(w[i].rowCur) < row {
+			w[i].rowCur = make([]uint32, row)
+			w[i].rowUp = make([]uint32, row)
+		}
+		w[i].resid, w[i].rowCur, w[i].rowUp = w[i].resid[:resid], w[i].rowCur[:row], w[i].rowUp[:row]
+	}
+	return w
+}
+
+// hcChainBuf returns a buffer of n entries (contents unspecified).
+func (s *scratch) hcChainBuf(n int) []uint32 {
+	if cap(s.hcChain) < n {
+		s.hcChain = make([]uint32, n)
+	}
+	return s.hcChain[:n]
+}
+
+// hcMarkBuf returns n cleared words.
+func (s *scratch) hcMarkBuf(n int) []uint64 {
+	if cap(s.hcMarks) < n {
+		s.hcMarks = make([]uint64, n)
+	}
+	m := s.hcMarks[:n]
+	clear(m)
+	return m
+}
+
+func (s *scratch) hcExitBuf(n int) []int {
+	if cap(s.hcExits) < n {
+		s.hcExits = make([]int, n)
+	}
+	return s.hcExits[:n]
 }
 
 func (s *scratch) cacheCosts(n int) []int64 {

@@ -19,27 +19,134 @@ func colorTransformDelta(pred, color int8) int32 {
 	return (int32(pred) * int32(color)) >> 5
 }
 
-// tilePixels holds the channels of one tile as signed bytes.
-type tilePixels struct {
-	r, g, b []int8
+// The cost of a multiplier candidate only depends on the histogram of the
+// transformed red (or blue) channel of the tile, which only depends on the
+// distinct (green, red) pairs (or (green, red, blue) triples) of the tile and
+// their counts. Tiles of photos have 25-40% distinct triples and graphics far
+// fewer, so the candidates are evaluated on the distinct values, weighted by
+// their counts (exact: the histograms are integer counts).
+const (
+	ccTabBits = 13
+	ccTabSize = 1 << ccTabBits
+	// ccMaxTilePixels bounds the tiles that are deduplicated (keeping the
+	// tables at most half full); larger tiles (not produced by the encoder:
+	// its transform bits are at most 6) list every pixel.
+	ccMaxTilePixels = ccTabSize / 2
+)
+
+// ccTable is an open-addressing set of keys (at most 24 bits) mapping to the
+// index of their entry. A slot is in use for the current generation gen
+// when slot&0xff == gen, so that the table is cleared only every 255 tiles.
+type ccTable struct {
+	slot [ccTabSize]uint32 // key<<8 | generation
+	idx  [ccTabSize]uint16
 }
 
+// ccTables are the deduplication tables of a tilePixels (allocated on first
+// use: about 96 KB).
+type ccTables struct {
+	pairs, triples ccTable
+	gen            uint32 // 1..255
+}
+
+// tilePixels holds the distinct (green, red) pairs and (green, red, blue)
+// triples of one tile, as signed bytes, with their pixel counts.
+type tilePixels struct {
+	pg, pr     []int8 // distinct (green, red) pairs
+	pc         []int32
+	tg, tr, tb []int8 // distinct (green, red, blue) triples
+	tc         []int32
+	tabs       *ccTables
+}
+
+func (t *tilePixels) reset(n int) {
+	if cap(t.pg) < n {
+		t.pg, t.pr, t.pc = make([]int8, 0, n), make([]int8, 0, n), make([]int32, 0, n)
+		t.tg, t.tr, t.tb, t.tc = make([]int8, 0, n), make([]int8, 0, n), make([]int8, 0, n), make([]int32, 0, n)
+	}
+	t.pg, t.pr, t.pc = t.pg[:0], t.pr[:0], t.pc[:0]
+	t.tg, t.tr, t.tb, t.tc = t.tg[:0], t.tr[:0], t.tb[:0], t.tc[:0]
+}
+
+// load collects the distinct pairs and triples of the w x h tile at (x0, y0)
+// of argb (whose rows are stride pixels apart).
 func (t *tilePixels) load(argb []uint32, stride, x0, y0, w, h int) {
 	n := w * h
-	if cap(t.r) < n {
-		t.r = make([]int8, n)
-		t.g = make([]int8, n)
-		t.b = make([]int8, n)
+	t.reset(min(n, ccMaxTilePixels))
+	if n > ccMaxTilePixels {
+		// Not deduplicated: one entry per pixel.
+		for y := 0; y < h; y++ {
+			for _, p := range argb[(y0+y)*stride+x0 : (y0+y)*stride+x0+w] {
+				g, r := int8(p>>8), int8(p>>16)
+				t.pg, t.pr, t.pc = append(t.pg, g), append(t.pr, r), append(t.pc, 1)
+				t.tg, t.tr, t.tb, t.tc = append(t.tg, g), append(t.tr, r), append(t.tb, int8(p)), append(t.tc, 1)
+			}
+		}
+		return
 	}
-	t.r, t.g, t.b = t.r[:n], t.g[:n], t.b[:n]
-	k := 0
+	if t.tabs == nil {
+		t.tabs = new(ccTables)
+	}
+	tabs := t.tabs
+	tabs.gen++
+	if tabs.gen > 0xff {
+		clear(tabs.pairs.slot[:])
+		clear(tabs.triples.slot[:])
+		tabs.gen = 1
+	}
+	gen := tabs.gen
+	pairs, triples := &tabs.pairs, &tabs.triples
+	// The entries of the previous pixel (neighbors are often equal).
+	last := ^uint32(0)
+	lastPair, lastTriple := 0, 0
 	for y := 0; y < h; y++ {
-		row := argb[(y0+y)*stride+x0 : (y0+y)*stride+x0+w]
-		for _, p := range row {
-			t.r[k] = int8(p >> 16)
-			t.g[k] = int8(p >> 8)
-			t.b[k] = int8(p)
-			k++
+		for _, p := range argb[(y0+y)*stride+x0 : (y0+y)*stride+x0+w] {
+			p &= 0xffffff // r<<16 | g<<8 | b
+			if p == last {
+				t.pc[lastPair]++
+				t.tc[lastTriple]++
+				continue
+			}
+			if p>>8 != last>>8 {
+				key := p >> 8 // r<<8 | g
+				h := (key * 0x9e3779b1) >> (32 - ccTabBits)
+				for {
+					s := pairs.slot[h]
+					if s&0xff != gen {
+						pairs.slot[h] = key<<8 | gen
+						lastPair = len(t.pc)
+						pairs.idx[h] = uint16(lastPair)
+						t.pg, t.pr, t.pc = append(t.pg, int8(p>>8)), append(t.pr, int8(p>>16)), append(t.pc, 1)
+						break
+					}
+					if s>>8 == key {
+						lastPair = int(pairs.idx[h])
+						t.pc[lastPair]++
+						break
+					}
+					h = (h + 1) & (ccTabSize - 1)
+				}
+			} else {
+				t.pc[lastPair]++
+			}
+			h := (p * 0x9e3779b1) >> (32 - ccTabBits)
+			for {
+				s := triples.slot[h]
+				if s&0xff != gen {
+					triples.slot[h] = p<<8 | gen
+					lastTriple = len(t.tc)
+					triples.idx[h] = uint16(lastTriple)
+					t.tg, t.tr, t.tb, t.tc = append(t.tg, int8(p>>8)), append(t.tr, int8(p>>16)), append(t.tb, int8(p)), append(t.tc, 1)
+					break
+				}
+				if s>>8 == p {
+					lastTriple = int(triples.idx[h])
+					t.tc[lastTriple]++
+					break
+				}
+				h = (h + 1) & (ccTabSize - 1)
+			}
+			last = p
 		}
 	}
 }
@@ -51,11 +158,12 @@ func predictionCostCrossColor(acc, counts *[256]int32, ae *accEntropy) float64 {
 func (t *tilePixels) costRed(g2r int, prevX, prevY multipliers, acc *[256]int32, ae *accEntropy, histo *[256]int32) float64 {
 	*histo = [256]int32{}
 	m := int8(g2r)
-	r := t.r
-	g := t.g[:len(r)]
+	r := t.pr
+	g := t.pg[:len(r)]
+	c := t.pc[:len(r)]
 	for i, rv := range r {
 		nr := int32(rv) - colorTransformDelta(m, g[i])
-		histo[uint8(nr)]++
+		histo[uint8(nr)] += c[i]
 	}
 	d := predictionCostCrossColor(acc, histo, ae)
 	if uint8(g2r) == prevX.greenToRed {
@@ -74,12 +182,13 @@ func (t *tilePixels) costBlue(g2b, r2b int, prevX, prevY multipliers, acc *[256]
 	*histo = [256]int32{}
 	mg := int8(g2b)
 	mr := int8(r2b)
-	b := t.b
-	g := t.g[:len(b)]
-	r := t.r[:len(b)]
+	b := t.tb
+	g := t.tg[:len(b)]
+	r := t.tr[:len(b)]
+	c := t.tc[:len(b)]
 	for i, bv := range b {
 		nb := int32(bv) - colorTransformDelta(mg, g[i]) - colorTransformDelta(mr, r[i])
-		histo[uint8(nb)]++
+		histo[uint8(nb)] += c[i]
 	}
 	d := predictionCostCrossColor(acc, histo, ae)
 	if uint8(g2b) == prevX.greenToBlue {
@@ -103,6 +212,31 @@ func (t *tilePixels) costBlue(g2b, r2b int, prevX, prevY multipliers, acc *[256]
 	return d
 }
 
+// visitedSet records the candidates already evaluated by a search. The cost
+// of a candidate is a pure function of it, and a candidate replaces the best
+// one only if its cost is strictly lower, so a candidate seen before can never
+// win again and is skipped. The candidates stay within [-63, 63] (sums of the
+// search steps), so their byte keys do not alias.
+type visitedSet struct {
+	n    int
+	keys [64]uint16
+}
+
+// seen reports whether k was added before, and adds it otherwise (when the
+// set is full, k is not added: it would only be evaluated again).
+func (v *visitedSet) seen(k uint16) bool {
+	for _, x := range v.keys[:v.n] {
+		if x == k {
+			return true
+		}
+	}
+	if v.n < len(v.keys) {
+		v.keys[v.n] = k
+		v.n++
+	}
+	return false
+}
+
 func (t *tilePixels) bestTransform(prevX, prevY multipliers, quality int, accRed, accBlue *[256]int32) multipliers {
 	var histo [256]int32
 	var best multipliers
@@ -111,13 +245,18 @@ func (t *tilePixels) bestTransform(prevX, prevY multipliers, quality int, accRed
 	aeB.init(accBlue)
 	// Green to red.
 	{
+		var vis visitedSet
 		maxIters := 4 + (7*quality)>>8
 		g2rBest := 0
 		bestDiff := t.costRed(0, prevX, prevY, accRed, &aeR, &histo)
+		vis.seen(0)
 		for iter := 0; iter < maxIters; iter++ {
 			delta := 32 >> uint(iter)
 			for off := -delta; off <= delta; off += 2 * delta {
 				cur := off + g2rBest
+				if vis.seen(uint16(uint8(cur))) {
+					continue
+				}
 				d := t.costRed(cur, prevX, prevY, accRed, &aeR, &histo)
 				if d < bestDiff {
 					bestDiff = d
@@ -137,17 +276,21 @@ func (t *tilePixels) bestTransform(prevX, prevY multipliers, quality int, accRed
 		} else if quality > 50 {
 			iters = 7
 		}
+		var vis visitedSet
 		g2b, r2b := 0, 0
 		bestDiff := t.costBlue(0, 0, prevX, prevY, accBlue, &aeB, &histo)
+		vis.seen(0)
 		for iter := 0; iter < iters; iter++ {
 			delta := deltaLut[iter]
 			for axis := 0; axis < 8; axis++ {
 				cg := offsets[axis][0]*delta + g2b
 				cr := offsets[axis][1]*delta + r2b
-				d := t.costBlue(cg, cr, prevX, prevY, accBlue, &aeB, &histo)
-				if d < bestDiff {
-					bestDiff = d
-					g2b, r2b = cg, cr
+				if !vis.seen(uint16(uint8(cg)) | uint16(uint8(cr))<<8) {
+					d := t.costBlue(cg, cr, prevX, prevY, accBlue, &aeB, &histo)
+					if d < bestDiff {
+						bestDiff = d
+						g2b, r2b = cg, cr
+					}
 				}
 				if quality < 25 && iter == 4 {
 					break

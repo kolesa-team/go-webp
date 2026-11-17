@@ -10,37 +10,71 @@ const maxPaletteSize = 256
 // collectPalette returns the sorted unique colors of argb, or nil when there
 // are more than 256 of them.
 func collectPalette(argb []uint32, dst []uint32) []uint32 {
-	const tabBits = 11
-	const tabSize = 1 << tabBits
-	var table [tabSize]uint32
-	var inUse [tabSize]bool
-	n := 0
-	last := ^argb[0]
+	var s colorSet
+	s.add(argb)
+	return s.palette(dst)
+}
+
+const (
+	colorSetBits = 11
+	colorSetSize = 1 << colorSetBits
+)
+
+// colorSet collects the distinct colors of an image (in any number of
+// add calls) until there are more than maxPaletteSize of them. The zero
+// value is an empty set.
+type colorSet struct {
+	table   [colorSetSize]uint32
+	inUse   [colorSetSize]bool
+	n       int
+	last    uint32 // the last color added (valid when n > 0)
+	tooMany bool
+}
+
+// add adds the colors of argb.
+func (s *colorSet) add(argb []uint32) {
+	if s.tooMany || len(argb) == 0 {
+		return
+	}
+	last := s.last
+	if s.n == 0 {
+		last = ^argb[0]
+	}
 	for _, p := range argb {
 		if p == last {
 			continue
 		}
 		last = p
-		key := (p * 0x1e35a7bd) >> (32 - tabBits)
+		key := (p * 0x1e35a7bd) >> (32 - colorSetBits)
 		for {
-			if !inUse[key] {
-				inUse[key] = true
-				table[key] = p
-				n++
-				if n > maxPaletteSize {
-					return nil
+			if !s.inUse[key] {
+				s.inUse[key] = true
+				s.table[key] = p
+				s.n++
+				if s.n > maxPaletteSize {
+					s.tooMany = true
+					return
 				}
 				break
-			} else if table[key] == p {
+			} else if s.table[key] == p {
 				break
 			}
-			key = (key + 1) & (tabSize - 1)
+			key = (key + 1) & (colorSetSize - 1)
 		}
 	}
+	s.last = last
+}
+
+// palette returns the sorted colors of the set in dst, or nil when there
+// are more than maxPaletteSize of them.
+func (s *colorSet) palette(dst []uint32) []uint32 {
+	if s.tooMany {
+		return nil
+	}
 	dst = dst[:0]
-	for i := range table {
-		if inUse[i] {
-			dst = append(dst, table[i])
+	for i := range s.table {
+		if s.inUse[i] {
+			dst = append(dst, s.table[i])
 		}
 	}
 	slices.Sort(dst)
@@ -142,8 +176,10 @@ func paletteXBits(n int) int {
 }
 
 // applyPalette maps argb (width x height) to bundled palette indices in dst
-// (packed width x height).
-func applyPalette(argb []uint32, width, height int, palette []uint32, dst []uint32, idxRow []uint8) {
+// (packed width x height). dst may be argb itself: each row is read entirely
+// (into idxRow) before its bundled row, which starts no later, is written.
+// It returns initRefsCap of the bundled image (computed on the way).
+func applyPalette(argb []uint32, width, height int, palette []uint32, dst []uint32, idxRow []uint8) (refsCap int) {
 	xbits := paletteXBits(len(palette))
 	pw := subSampleSize(width, xbits)
 	// Small open-addressing lookup table color -> index.
@@ -169,6 +205,7 @@ func applyPalette(argb []uint32, width, height int, palette []uint32, dst []uint
 		return uint8(vals[k])
 	}
 	idxRow = idxRow[:width]
+	est := 1
 	for y := 0; y < height; y++ {
 		row := argb[y*width : (y+1)*width]
 		prevC := ^row[0]
@@ -180,8 +217,15 @@ func applyPalette(argb []uint32, width, height int, palette []uint32, dst []uint
 			}
 			idxRow[x] = prevI
 		}
-		bundleColorMap(idxRow, xbits, dst[y*pw:(y+1)*pw])
+		out := dst[y*pw : (y+1)*pw]
+		bundleColorMap(idxRow, xbits, out)
+		if y == 0 {
+			est += newPixels(out[1:], nil, out[0])
+		} else {
+			est += newPixels(out, dst[(y-1)*pw:y*pw], dst[y*pw-1])
+		}
 	}
+	return refsCapFromEstimate(pw*height, est)
 }
 
 // bundleColorMap packs 1<<xbits palette indices per output pixel (green).

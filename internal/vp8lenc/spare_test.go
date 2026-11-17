@@ -66,7 +66,7 @@ func TestEncodeARGBSpare(t *testing.T) {
 	cfg := &Config{Quality: 100, Method: 6}
 	enc := func(spare []byte) ([]byte, []byte) {
 		src := append([]uint32(nil), argb...)
-		return encodeARGB(src, w, h, cfg, true, 0, nil, spare)
+		return encodeARGB(src, w, h, cfg, true, 0, nil, spare, nil)
 	}
 	best, spare := enc(nil)
 	if spare != nil && &best[:cap(best)][0] == &spare[:cap(spare)][0] {
