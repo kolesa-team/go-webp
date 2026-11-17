@@ -52,10 +52,13 @@ import (
 // Every wait blocks on a sync.Cond (one per worker) and is woken only when
 // its condition holds: a row's progress is published with an atomic store,
 // and the worker of the row below, if it sleeps, is signalled only once the
-// row is a full gap (see minWavefrontGap) ahead. Hand-offs are expensive
-// (on Linux a woken goroutine may wait tens of microseconds, or until the
-// waker blocks, before another thread picks it up), so the rows are kept
-// far enough apart that workers rarely have to sleep.
+// row is a full gap (see minWavefrontGap) ahead. Hand-offs are expensive:
+// the Go scheduler leaves a goroutine woken by a running one on the
+// waker's processor, and another thread steals it only after sleeping
+// 3 us, which takes about 50 us on Linux (timer slack) and about 1 ms in
+// some virtual machines. So the rows are kept far enough apart that
+// workers rarely have to sleep, and only pictures with enough work per
+// row and per worker are coded as a wavefront.
 
 const (
 	// maxWavefrontWorkers bounds the number of rows coded at once (the
@@ -72,10 +75,9 @@ const (
 
 	// The wavefront is used only when the pass is long enough to pay for
 	// its hand-offs (each worker sleeps and is woken a few times per
-	// refresh point, which costs from tens of microseconds to about half a
-	// millisecond in virtual machines): at least minWavefrontWork of
-	// estimated work in all, minWavefrontRowWork per row and
-	// wavefrontWorkPerWorker per worker (nanoseconds).
+	// refresh point): at least minWavefrontWork of estimated work in all,
+	// minWavefrontRowWork per row and wavefrontWorkPerWorker per worker
+	// (nanoseconds).
 	minWavefrontWork       = 8_000_000
 	minWavefrontRowWork    = 250_000
 	wavefrontWorkPerWorker = 4_000_000
@@ -84,11 +86,11 @@ const (
 // wavefrontMBCost estimates the coding pass time per macroblock (ns) of
 // each method, measured on a photo (Apple M5) with the vector kernels and
 // with the Go reference ones.
-var wavefrontMBCost = func() [7]int {
+var wavefrontMBCost = func() [7]int64 {
 	if vecKernels {
-		return [7]int{1500, 1500, 2400, 7400, 7800, 9400, 24000}
+		return [7]int64{1500, 1500, 2400, 7400, 7800, 9400, 24000}
 	}
-	return [7]int{3200, 3500, 4800, 24600, 23600, 24800, 35200}
+	return [7]int64{3200, 3500, 4800, 24600, 23600, 24800, 35200}
 }()
 
 var (
@@ -113,12 +115,13 @@ func (e *encoder) wavefrontWorkers() int {
 	if forceWavefront {
 		return max(1, min(maxWavefrontWorkers, e.mbH, e.mbW/2))
 	}
+	// int64: the estimate of a 16383x16383 picture overflows 32 bits.
 	cost := wavefrontMBCost[e.method]
-	work := e.mbW * e.mbH * cost
-	if work < minWavefrontWork || e.mbW*cost < minWavefrontRowWork {
+	work := int64(e.mbW) * int64(e.mbH) * cost
+	if work < minWavefrontWork || int64(e.mbW)*cost < minWavefrontRowWork {
 		return 1
 	}
-	return max(1, min(maxWavefrontWorkers, e.mbH, e.mbW/minWavefrontGap, work/wavefrontWorkPerWorker))
+	return max(1, min(maxWavefrontWorkers, e.mbH, e.mbW/minWavefrontGap, int(min(work/wavefrontWorkPerWorker, maxWavefrontWorkers))))
 }
 
 // wfWorker is one goroutine of a wavefront pass.
