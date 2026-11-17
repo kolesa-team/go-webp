@@ -70,7 +70,7 @@ type decoder struct {
 	arena       []uint32 // sub-images (transform data, entropy image)
 	argb        []uint32 // level-0 decoded pixels (whole image or sliding window)
 	rows        []uint32 // inverse transform output: 1 top row + numCacheRows rows
-	colorCache  []uint32
+	colorCache  *[1 << maxCacheBits]uint32
 	pal         [256]uint32 // RGBA palette for fused color-index output
 	palReady    bool
 	bundle      []byte // RGBA bytes of the pixels of each bundled index byte
