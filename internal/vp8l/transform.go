@@ -36,6 +36,33 @@ func average2(a, b uint32) uint32 {
 	return ((a^b)&0xfefefefe)>>1 + a&b
 }
 
+// Two pixels per 64-bit word (SWAR): the predictors that do not depend on
+// the left pixel process the row two pixels at a time.
+
+// load2 returns the pixels s[x] and s[x+1] as one word.
+func load2(s []uint32, x int) uint64 {
+	p := s[x : x+2 : x+2]
+	return uint64(p[0]) | uint64(p[1])<<32
+}
+
+// store2 stores the two pixels of v at s[x] and s[x+1].
+func store2(s []uint32, x int, v uint64) {
+	p := s[x : x+2 : x+2]
+	p[0], p[1] = uint32(v), uint32(v>>32)
+}
+
+// addPixels2 is addPixels for two pixels per word.
+func addPixels2(a, b uint64) uint64 {
+	ag := (a & 0xff00ff00ff00ff00) + (b & 0xff00ff00ff00ff00)
+	rb := (a & 0x00ff00ff00ff00ff) + (b & 0x00ff00ff00ff00ff)
+	return ag&0xff00ff00ff00ff00 | rb&0x00ff00ff00ff00ff
+}
+
+// average2x2 is average2 for two pixels per word.
+func average2x2(a, b uint64) uint64 {
+	return ((a^b)&0xfefefefefefefefe)>>1 + a&b
+}
+
 // absDiff returns |a-b| for channel values a, b.
 func absDiff(a, b uint32) int32 {
 	d := int32(a) - int32(b)
@@ -118,15 +145,27 @@ func predictRun(mode uint32, in, out, up []uint32, x0, x1 int) {
 	case 1: // L
 		predictLeft(in, out, x0, x1)
 	case 2: // T
-		for x := x0; x < x1; x++ {
+		x := x0
+		for ; x+2 <= x1; x += 2 {
+			store2(out, x, addPixels2(load2(in, x), load2(up, x)))
+		}
+		if x < x1 {
 			out[x] = addPixels(in[x], up[x])
 		}
 	case 3: // TR
-		for x := x0; x < x1; x++ {
+		x := x0
+		for ; x+2 <= x1; x += 2 {
+			store2(out, x, addPixels2(load2(in, x), load2(up, x+1)))
+		}
+		if x < x1 {
 			out[x] = addPixels(in[x], up[x+1])
 		}
 	case 4: // TL
-		for x := x0; x < x1; x++ {
+		x := x0
+		for ; x+2 <= x1; x += 2 {
+			store2(out, x, addPixels2(load2(in, x), load2(up, x-1)))
+		}
+		if x < x1 {
 			out[x] = addPixels(in[x], up[x-1])
 		}
 	case 5:
@@ -148,11 +187,19 @@ func predictRun(mode uint32, in, out, up []uint32, x0, x1 int) {
 			out[x] = l
 		}
 	case 8:
-		for x := x0; x < x1; x++ {
+		x := x0
+		for ; x+2 <= x1; x += 2 {
+			store2(out, x, addPixels2(load2(in, x), average2x2(load2(up, x-1), load2(up, x))))
+		}
+		if x < x1 {
 			out[x] = addPixels(in[x], average2(up[x-1], up[x]))
 		}
 	case 9:
-		for x := x0; x < x1; x++ {
+		x := x0
+		for ; x+2 <= x1; x += 2 {
+			store2(out, x, addPixels2(load2(in, x), average2x2(load2(up, x), load2(up, x+1))))
+		}
+		if x < x1 {
 			out[x] = addPixels(in[x], average2(up[x], up[x+1]))
 		}
 	case 10:
@@ -162,19 +209,22 @@ func predictRun(mode uint32, in, out, up []uint32, x0, x1 int) {
 			out[x] = l
 		}
 	case 11:
+		// libwebp Select: T if the sum over the channels of |l-tl| is at
+		// most that of |t-tl|, else L. Both sums are added to the residual
+		// before the choice, which shortens the dependency on l.
 		l := out[x0-1]
 		for x := x0; x < x1; x++ {
 			t, tl := up[x], up[x-1]
-			// Sum over channels of |l-tl| - |t-tl| (libwebp Select).
-			s := absDiff(l>>24, tl>>24) - absDiff(t>>24, tl>>24) +
-				absDiff(l>>16&0xff, tl>>16&0xff) - absDiff(t>>16&0xff, tl>>16&0xff) +
-				absDiff(l>>8&0xff, tl>>8&0xff) - absDiff(t>>8&0xff, tl>>8&0xff) +
-				absDiff(l&0xff, tl&0xff) - absDiff(t&0xff, tl&0xff)
-			pred := l
-			if s <= 0 {
-				pred = t
+			pt := absDiff(t>>24, tl>>24) + absDiff(t>>16&0xff, tl>>16&0xff) +
+				absDiff(t>>8&0xff, tl>>8&0xff) + absDiff(t&0xff, tl&0xff)
+			pl := absDiff(l>>24, tl>>24) + absDiff(l>>16&0xff, tl>>16&0xff) +
+				absDiff(l>>8&0xff, tl>>8&0xff) + absDiff(l&0xff, tl&0xff)
+			c := in[x]
+			withT, withL := addPixels(c, t), addPixels(c, l)
+			l = withL
+			if pl <= pt {
+				l = withT
 			}
-			l = addPixels(in[x], pred)
 			out[x] = l
 		}
 	case 12:
@@ -190,7 +240,11 @@ func predictRun(mode uint32, in, out, up []uint32, x0, x1 int) {
 			out[x] = l
 		}
 	default: // 0, and 14/15 which libwebp treats as black too
-		for x := x0; x < x1; x++ {
+		x := x0
+		for ; x+2 <= x1; x += 2 {
+			store2(out, x, addPixels2(load2(in, x), 0xff000000ff000000))
+		}
+		if x < x1 {
 			out[x] = addPixels(in[x], 0xff000000)
 		}
 	}
