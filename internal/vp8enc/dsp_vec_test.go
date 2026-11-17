@@ -40,7 +40,7 @@ func fillPixels(rng *rand.Rand, b []byte) {
 // fillCoeffs fills c with coefficients of a random magnitude class,
 // including the int16 extremes and DC-only blocks.
 func fillCoeffs(rng *rand.Rand, c []int16) {
-	scale := []int{2, 16, 300, 2400, 16384, 32768}[rng.Intn(6)]
+	scale := []int{2, 16, 300, 2048, 2400, 16384, 32768}[rng.Intn(7)]
 	dcOnly := rng.Intn(5) == 0
 	for i := range c {
 		switch {
@@ -51,8 +51,48 @@ func fillCoeffs(rng *rand.Rand, c []int16) {
 		default:
 			c[i] = int16(rng.Intn(2*scale) - scale)
 		}
-		if rng.Intn(200) == 0 {
+		switch rng.Intn(200) {
+		case 0:
 			c[i] = [3]int16{-32768, 32767, -32767}[rng.Intn(3)]
+		case 1:
+			// the bound of the 16-bit path of iTransformPairsNEON
+			c[i] = [4]int16{-2048, -2047, 2047, 2048}[rng.Intn(4)]
+		}
+	}
+}
+
+// TestITransformBoundary runs every sign pattern of coefficients of
+// magnitude 2047 (the largest the 16-bit path of the NEON inverse DCT
+// accepts, where its intermediate values are largest) and 2048 (the
+// smallest it rejects), for both blocks of a pair.
+func TestITransformBoundary(t *testing.T) {
+	rng := rand.New(rand.NewSource(10))
+	ref := make([]byte, 4*bps)
+	got := make([]byte, 4*bps)
+	want := make([]byte, 4*bps)
+	tab := newPairTable([2]uint16{0, 0})
+	var in [2][16]int16
+	step := 1
+	if testing.Short() {
+		step = 13
+	}
+	for p := 0; p < 1<<16; p += step {
+		for i := 0; i < 16; i++ {
+			v := int16(2047)
+			if p>>i&1 != 0 {
+				v = -2047
+			}
+			in[0][i] = v
+			in[1][i] = -v
+		}
+		if p&1 != 0 {
+			in[1][p>>1&15] = [2]int16{2048, -2048}[p>>5&1]
+		}
+		fillPixels(rng, ref)
+		iTransformPairs(ref, in[:], got, &tab)
+		iTransformPairsRef(ref, in[:], want, &tab)
+		if string(got) != string(want) {
+			t.Fatalf("pattern %#x: in %v\ngot  %v\nwant %v", p, in, got, want)
 		}
 	}
 }
@@ -499,8 +539,11 @@ func BenchmarkVecKernels(b *testing.B) {
 	src := make([]byte, 16*bps)
 	ref := make([]byte, 16*bps)
 	dst := make([]byte, 16*bps)
-	fillPixels(rng, src)
-	fillPixels(rng, ref)
+	// a textured source and a close prediction, as in the mode search
+	for i := range src {
+		src[i] = byte(60 + i%bps*4 + i/bps*2 + rng.Intn(24))
+		ref[i] = byte(int(src[i]) + rng.Intn(25) - 12)
+	}
 	var coeffs, levels [16][16]int16
 	var info [16]uint16
 	var res [16]int32
@@ -531,6 +574,11 @@ func BenchmarkVecKernels(b *testing.B) {
 	quantizeBlocksRef(c[:], levels[:], &m, info[:])
 	run("ITransformY16/vec", func() { iTransformPairs(ref, c[:], dst, &tabY16) })
 	run("ITransformY16/go", func() { iTransformPairsRef(ref, c[:], dst, &tabY16) })
+	big := c
+	for b := range big {
+		big[b][5] = 4000 // takes the int32 path
+	}
+	run("ITransformY16Large/vec", func() { iTransformPairs(ref, big[:], dst, &tabY16) })
 	run("TTransformY16/vec", func() { tTransformPairs(src, &tabY16, res[:]) })
 	run("TTransformY16/go", func() { tTransformPairsRef(src, &tabY16, res[:]) })
 	run("SSE4x4I4/vec", func() { sse4x4Pairs(src, ref, &tabI4Src, res[:]) })
@@ -592,5 +640,112 @@ func BenchmarkHistogram(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			histogramStatsRef(coeffs[:])
 		}
+	})
+}
+
+// residualCostRef is the branchy formulation of residualCost (libwebp's
+// GetResidualCost_C).
+func (p *encProba) residualCostRef(ctx0 int, res *residual) int {
+	n := res.first
+	prob := &p.coeffs[res.ctype]
+	costs := &p.levelCost[res.ctype]
+	p0 := prob[n][ctx0][0]
+	if res.last < 0 {
+		return bitCost(0, p0)
+	}
+	cost := 0
+	if ctx0 == 0 {
+		cost = bitCost(1, p0)
+	}
+	t := &costs[n][ctx0]
+	coeffs := res.coeffs
+	for ; n < res.last; n++ {
+		v := abs16(coeffs[n&15])
+		cost += levelCost(t, v)
+		ctx := v
+		if ctx > 2 {
+			ctx = 2
+		}
+		t = &costs[encBands[n+1]][ctx]
+	}
+	v := abs16(coeffs[n&15])
+	cost += levelCost(t, v)
+	if n < 15 {
+		b := encBands[n+1]
+		ctx := 2
+		if v == 1 {
+			ctx = 1
+		}
+		cost += bitCost(0, prob[b][ctx][0])
+	}
+	return cost
+}
+
+// randomResiduals returns blocks of levels of every shape (including the
+// largest levels and residuals that start after their last level) with a
+// set of probabilities.
+func randomResiduals(rng *rand.Rand, n int, mags []int) ([]residual, *encProba) {
+	p := new(encProba)
+	p.reset()
+	for ty := range p.coeffs {
+		for b := range p.coeffs[ty] {
+			for c := range p.coeffs[ty][b] {
+				for i := range p.coeffs[ty][b][c] {
+					p.coeffs[ty][b][c][i] = uint8(rng.Intn(256))
+				}
+			}
+		}
+	}
+	p.calculateLevelCosts()
+	blocks := make([][16]int16, n)
+	res := make([]residual, n)
+	for i := range blocks {
+		k := rng.Intn(17)
+		for j := 0; j < k; j++ {
+			if rng.Intn(3) > 0 {
+				v := int16(1 + rng.Intn(mags[rng.Intn(len(mags))]))
+				if rng.Intn(2) == 0 {
+					v = -v
+				}
+				blocks[i][j] = v
+			}
+		}
+		res[i].first = i & 1
+		res[i].ctype = rng.Intn(numTypes)
+		res[i].setCoeffs(&blocks[i])
+	}
+	return res, p
+}
+
+func TestResidualCostExact(t *testing.T) {
+	rng := rand.New(rand.NewSource(11))
+	for round := 0; round < 20; round++ {
+		res, p := randomResiduals(rng, 2000, []int{1, 2, 4, 66, 70, 2047})
+		for i := range res {
+			for ctx := 0; ctx < numCtx; ctx++ {
+				if got, want := p.residualCost(ctx, &res[i]), p.residualCostRef(ctx, &res[i]); got != want {
+					t.Fatalf("%+v ctx %d: cost %d, want %d", res[i], ctx, got, want)
+				}
+			}
+		}
+	}
+}
+
+func BenchmarkResidualCost(b *testing.B) {
+	// mostly small levels, as in the mode search
+	res, p := randomResiduals(rand.New(rand.NewSource(12)), 1024, []int{1, 1, 2, 3, 8, 100})
+	b.Run("new", func(b *testing.B) {
+		s := 0
+		for i := 0; i < b.N; i++ {
+			s += p.residualCost(i%numCtx, &res[i&1023])
+		}
+		_ = s
+	})
+	b.Run("ref", func(b *testing.B) {
+		s := 0
+		for i := 0; i < b.N; i++ {
+			s += p.residualCostRef(i%numCtx, &res[i&1023])
+		}
+		_ = s
 	})
 }
