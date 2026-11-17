@@ -62,8 +62,16 @@ DATA ·zigzagTBL+16(SB)/8, $0x15141b1a19181312
 DATA ·zigzagTBL+24(SB)/8, $0x1f1e1d1c17160f0e
 GLOBL ·zigzagTBL(SB), RODATA|NOPTR, $32
 
+// Bytes 1..16 (index of a zigzag position plus one) and the mask of the
+// AC positions 1..15, for the level summaries of quantizeBlocksNEON.
+DATA ·levelIdx+0(SB)/8, $0x0807060504030201
+DATA ·levelIdx+8(SB)/8, $0x100f0e0d0c0b0a09
+DATA ·levelIdx+16(SB)/8, $0x0101010101010100
+DATA ·levelIdx+24(SB)/8, $0x0101010101010101
+GLOBL ·levelIdx(SB), RODATA|NOPTR, $32
+
 // ---------------------------------------------------------------------------
-// func quantizeBlocksNEON(in, out *[16]int16, n int, m *matrix) uint32
+// func quantizeBlocksNEON(in, out *[16]int16, n int, m *matrix, info *uint16) uint32
 //
 // quantizeBlock (dsp.go) on n consecutive blocks; mirrors libwebp's
 // QuantizeBlock_NEON. Per block, two vectors of 8 coefficients:
@@ -75,16 +83,23 @@ GLOBL ·zigzagTBL(SB), RODATA|NOPTR, $32
 //   level = (level ^ sign) - sign
 //   in    = level * q                     (MUL, low 16 bits as in Go)
 //   out   = zigzag(level)                 (TBL)
-// Bit b of the result is set if block b has a non-zero level.
+// then the summary levelInfoOf(out) (dsp_batch.go): CMTST gives the
+// non-zero lanes, UZP1 narrows them to bytes, UMAXV of (mask & 1..16) is
+// the last index plus one, ADDV of (mask & AC positions) the AC count.
+// It is stored to info[b] unless info is nil. Bit b of the result is set
+// if block b has a non-zero level.
 //
 // Registers: R0 in, R1 out, R2 blocks left, R3 matrix, R6 nz mask, R7
-// current bit. V16-V17 iq, V18-V19 sharpen, V20-V21 q, V22-V25 bias,
-// V26-V27 zigzag index, V28 2047.
-TEXT ·quantizeBlocksNEON(SB), NOSPLIT, $0-36
+// current bit, R10 info. V16-V17 iq, V18-V19 sharpen, V20-V21 q, V22-V25
+// bias, V26-V27 zigzag index, V28 2047, V29 1..16, V30 AC mask.
+TEXT ·quantizeBlocksNEON(SB), NOSPLIT, $0-44
 	MOVD	in+0(FP), R0
 	MOVD	out+8(FP), R1
 	MOVD	n+16(FP), R2
 	MOVD	m+24(FP), R3
+	MOVD	info+32(FP), R10
+	MOVD	$·levelIdx(SB), R4
+	VLD1	(R4), [V29.B16, V30.B16]
 	ADD	$matrix_iq16, R3, R4
 	VLD1	(R4), [V16.H8, V17.H8]
 	ADD	$matrix_sharpen16, R3, R4
@@ -133,18 +148,30 @@ qloop:
 	VTBL	V26.B16, [V8.B16, V9.B16], V12.B16
 	VTBL	V27.B16, [V8.B16, V9.B16], V13.B16
 	VST1.P	[V12.H8, V13.H8], 32(R1)
-	VORR	V8.B16, V9.B16, V14.B16
-	VUMAXV	V14.H8, V14
-	VMOV	V14.H[0], R8
+	VCMTST	V12.H8, V12.H8, V14.H8
+	VCMTST	V13.H8, V13.H8, V15.H8
+	VUZP1	V15.B16, V14.B16, V14.B16 // 0xff where the level is non-zero
+	VAND	V29.B16, V14.B16, V15.B16
+	VUMAXV	V15.B16, V15
+	VMOV	V15.B[0], R8             // last + 1
 	CMP	$0, R8
 	CSEL	NE, R7, ZR, R9
 	ORR	R9, R6, R6
+	CBZ	R10, qnext
+	VAND	V30.B16, V14.B16, V15.B16
+	VADDV	V15.B16, V15
+	VMOV	V15.B[0], R9             // non-zero AC levels
+	ORR	R9<<8, R8, R8
+	MOVH	R8, (R10)
+	ADD	$2, R10
+
+qnext:
 	LSL	$1, R7, R7
 	SUBS	$1, R2, R2
 	BNE	qloop
 
 qdone:
-	MOVW	R6, ret+32(FP)
+	MOVW	R6, ret+40(FP)
 	RET
 
 // ---------------------------------------------------------------------------

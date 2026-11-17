@@ -365,6 +365,22 @@ type modeScore struct {
 	yDCLevels          [16]int16
 	yACLevels          [16][16]int16
 	uvLevels           [8][16]int16
+	// levelInfoOf summaries of the levels, for the rate and flatness
+	// estimates of the mode search (filled by reconstructIntra16 and
+	// reconstructUV when asked to).
+	yDCInfo [1]uint16
+	yACInfo [16]uint16
+	uvInfo  [8]uint16
+}
+
+// flatInfo reports whether the blocks summarized by info have at most
+// thresh non-zero AC levels in total (libwebp's IsFlat).
+func flatInfo(info []uint16, thresh int) bool {
+	n := 0
+	for _, v := range info {
+		n += infoNzAC(v)
+	}
+	return n <= thresh
 }
 
 func (rd *modeScore) init() {
@@ -570,19 +586,27 @@ func (it *iterator) trellisQuantizeBlock(in *[16]int16, out *[16]int16, ctx0 int
 //------------------------------------------------------------------------------
 // Reconstruction
 
-func (it *iterator) reconstructIntra16(dcLevels *[16]int16, acLevels *[16][16]int16, yuvOut []byte, mode int) uint32 {
+// reconstructIntra16 reconstructs the luma of the macroblock with the
+// intra16 prediction mode into yuvOut, setting rd's luma levels (and their
+// summaries if withInfo is set). Returns the non-zero bits.
+func (it *iterator) reconstructIntra16(rd *modeScore, yuvOut []byte, mode int, withInfo bool) uint32 {
 	e := it.enc
 	ref := it.yuvP[vp8I16ModeOffsets[mode&3]:]
 	src := it.yuvIn[yOff:]
 	dqm := &e.dqm[it.mb().segment&3]
 	nz := uint32(0)
 	tmp := &it.tmp16
+	acLevels := &rd.yACLevels
 	var dcTmp, dcLev [1][16]int16
+	var dcInfo, acInfo []uint16
+	if withInfo {
+		dcInfo, acInfo = rd.yDCInfo[:], rd.yACInfo[:]
+	}
 
 	fTransformPairs(src, ref, &tabY16, tmp[:])
 	fTransformWHT(tmp, &dcTmp[0])
-	nz |= quantizeBlocks(dcTmp[:], dcLev[:], &dqm.y2) << 24
-	*dcLevels = dcLev[0]
+	nz |= quantizeBlocks(dcTmp[:], dcLev[:], &dqm.y2, dcInfo) << 24
+	rd.yDCLevels = dcLev[0]
 
 	if it.doTrellis {
 		it.nzToBytes()
@@ -595,13 +619,16 @@ func (it *iterator) reconstructIntra16(dcLevels *[16]int16, acLevels *[16][16]in
 				it.leftNz[y] = v
 				acLevels[n][0] = 0
 				nz |= uint32(v) << uint(n)
+				if withInfo {
+					acInfo[n] = levelInfoOf(&acLevels[n])
+				}
 			}
 		}
 	} else {
 		for n := 0; n < 16; n++ {
 			tmp[n][0] = 0
 		}
-		nz |= quantizeBlocks(tmp[:], acLevels[:], &dqm.y1)
+		nz |= quantizeBlocks(tmp[:], acLevels[:], &dqm.y1, acInfo)
 	}
 
 	iTransformWHT(&dcTmp[0], tmp)
@@ -616,6 +643,7 @@ type i4Modes struct {
 	rec    [8 * bps]byte   // reconstructions, laid out as the predictions (tabI4Rec)
 	coeffs [numBModes][16]int16
 	levels [numBModes][16]int16 // quantized levels, zigzag order
+	info   [numBModes]uint16    // levelInfoOf(levels)
 	d      [numBModes]int32     // sse4x4(source, reconstruction)
 	tt     [numBModes]int32     // tTransform(reconstruction), if requested
 	srcTT  [2]int32             // tTransform(source), if requested
@@ -637,9 +665,9 @@ func (it *iterator) setI4Source(src []byte) {
 
 // reconstructI4Modes does what reconstructIntra4 does for one mode for all
 // 10 intra4 predictions (makeIntra4Preds) of the current sub-block src,
-// then measures each reconstruction against the source (and the texture
-// transforms when withTT is set) into it.i4m. Bit m of the result is set
-// if mode m has a non-zero level.
+// then summarizes the levels and measures each reconstruction against the
+// source (and the texture transforms when withTT is set) into it.i4m. Bit
+// m of the result is set if mode m has a non-zero level.
 //
 // With vector kernels each step runs on the 10 modes in one call; the
 // portable build keeps the mode-by-mode loop, which is faster in plain Go
@@ -666,6 +694,7 @@ func (it *iterator) reconstructI4Modes(src []byte, withTT bool) uint32 {
 			if nzm {
 				nz |= 1 << uint(m)
 			}
+			s.info[m] = levelInfoOf(&s.levels[m])
 			iTransform(ref, c, rec)
 			s.d[m] = int32(sse4x4(src, rec))
 			if withTT {
@@ -684,9 +713,10 @@ func (it *iterator) reconstructI4Modes(src []byte, withTT bool) uint32 {
 			if it.trellisQuantizeBlock(&s.coeffs[m], &s.levels[m], ctx, typeI4AC, &dqm.y1, dqm.lambdaTrellisI4) {
 				nz |= 1 << uint(m)
 			}
+			s.info[m] = levelInfoOf(&s.levels[m])
 		}
 	} else {
-		nz = quantizeBlocks(s.coeffs[:], s.levels[:], &dqm.y1)
+		nz = quantizeBlocks(s.coeffs[:], s.levels[:], &dqm.y1, s.info[:])
 	}
 	iTransformPairs(preds, s.coeffs[:], s.rec[:], &tabI4Rec)
 	sse4x4Pairs(s.src[:], s.rec[:], &tabI4Src, s.d[:])
@@ -790,7 +820,11 @@ func (it *iterator) storeDiffusionErrors(derr *[2][3]int8) {
 	}
 }
 
-func (it *iterator) reconstructUV(levels *[8][16]int16, derr *[2][3]int8, yuvOut []byte, mode int) uint32 {
+// reconstructUV reconstructs the chroma of the macroblock with the
+// prediction mode into yuvOut, setting rd's chroma levels and diffusion
+// errors (and the level summaries if withInfo is set). Returns the
+// non-zero bits.
+func (it *iterator) reconstructUV(rd *modeScore, yuvOut []byte, mode int, withInfo bool) uint32 {
 	e := it.enc
 	ref := it.yuvP[vp8UVModeOffsets[mode&3]:]
 	src := it.yuvIn[uOff:]
@@ -798,9 +832,13 @@ func (it *iterator) reconstructUV(levels *[8][16]int16, derr *[2][3]int8, yuvOut
 	tmp := &it.tmpUV
 	fTransformPairs(src, ref, &tabUV, tmp[:])
 	if e.topDerr != nil {
-		it.correctDCValues(&dqm.uv, tmp, derr)
+		it.correctDCValues(&dqm.uv, tmp, &rd.derr)
 	}
-	nz := quantizeBlocks(tmp[:], levels[:], &dqm.uv)
+	var info []uint16
+	if withInfo {
+		info = rd.uvInfo[:]
+	}
+	nz := quantizeBlocks(tmp[:], rd.uvLevels[:], &dqm.uv, info)
 	iTransformPairs(ref, tmp[:], yuvOut, &tabUV)
 	return nz << 16
 }
@@ -845,7 +883,7 @@ func (it *iterator) pickBestIntra16(rd *modeScore) {
 	for mode := 0; mode < numPredModes; mode++ {
 		tmpDst := it.yuvOut2[yOff:]
 		rdCur.modeI16 = mode
-		rdCur.nz = it.reconstructIntra16(&rdCur.yDCLevels, &rdCur.yACLevels, tmpDst, mode)
+		rdCur.nz = it.reconstructIntra16(rdCur, tmpDst, mode, true)
 
 		rdCur.D = int64(sse16x16(src, tmpDst))
 		if tlambda != 0 {
@@ -861,7 +899,7 @@ func (it *iterator) pickBestIntra16(rd *modeScore) {
 		rdCur.H = int64(fixedCostsI16[mode])
 		rdCur.R = int64(it.getCostLuma16(rdCur))
 		if isFlatSrc {
-			isFlatSrc = isFlat(rdCur.yACLevels[:], flatnessLimitI16)
+			isFlatSrc = flatInfo(rdCur.yACInfo[:], flatnessLimitI16)
 			if isFlatSrc {
 				rdCur.D *= 2
 				rdCur.SD *= 2
@@ -933,7 +971,6 @@ func (it *iterator) pickBestIntra4(rd *modeScore) bool {
 		nzModes := it.reconstructI4Modes(src0[vp8Scan[it.i4]:], tlambda != 0)
 		for mode := 0; mode < numBModes; mode++ {
 			var rdTmp scoreT
-			levels := cand.levels[mode : mode+1 : mode+1]
 			nz := nzModes>>uint(mode)&1 != 0
 			if nz {
 				rdTmp.nz = 1 << uint(it.i4)
@@ -943,7 +980,7 @@ func (it *iterator) pickBestIntra4(rd *modeScore) bool {
 				rdTmp.SD = mult8b(tlambda, int(iabs(cand.tt[mode]-cand.srcTT[0])>>5))
 			}
 			rdTmp.H = int64(modeCosts[mode])
-			if mode > 0 && (!nz || isFlat(levels, flatnessLimitI4)) {
+			if mode > 0 && (!nz || infoNzAC(cand.info[mode]) <= flatnessLimitI4) {
 				rdTmp.R = flatnessPenalty
 			} else {
 				rdTmp.R = 0
@@ -953,7 +990,7 @@ func (it *iterator) pickBestIntra4(rd *modeScore) bool {
 			if bestMode >= 0 && rdTmp.score >= rdI4.score {
 				continue
 			}
-			rdTmp.R += int64(it.getCostLuma4(&levels[0], nz))
+			rdTmp.R += int64(it.getCostLuma4(&cand.levels[mode], cand.info[mode]))
 			rdTmp.setRDScore(lambda)
 			if bestMode < 0 || rdTmp.score < rdI4.score {
 				rdI4 = rdTmp
@@ -1012,12 +1049,12 @@ func (it *iterator) pickBestUV(rd *modeScore) {
 	rdBest.score = maxCost
 	for mode := 0; mode < numPredModes; mode++ {
 		var s scoreT
-		s.nz = it.reconstructUV(&rdUV.uvLevels, &rdUV.derr, tmpDst, mode)
+		s.nz = it.reconstructUV(rdUV, tmpDst, mode, true)
 		s.D = int64(sse16x8(src, tmpDst))
 		s.SD = 0
 		s.H = int64(fixedCostsUV[mode])
-		s.R = int64(it.getCostUV(&rdUV.uvLevels))
-		if mode > 0 && isFlat(rdUV.uvLevels[:], flatnessLimitUV) {
+		s.R = int64(it.getCostUV(rdUV))
+		if mode > 0 && flatInfo(rdUV.uvInfo[:], flatnessLimitUV) {
 			s.R += flatnessPenalty * kNumBlocks
 		}
 		s.setRDScore(lambda)
@@ -1058,7 +1095,7 @@ func (it *iterator) simpleQuantize(rd *modeScore, uvDone bool) {
 	mb := it.mb()
 	nz := uint32(0)
 	if mb.typ == 1 {
-		nz = it.reconstructIntra16(&rd.yDCLevels, &rd.yACLevels, it.yuvOut[yOff:], int(e.preds[it.predsIdx]))
+		nz = it.reconstructIntra16(rd, it.yuvOut[yOff:], int(e.preds[it.predsIdx]), false)
 	} else {
 		it.startI4()
 		for {
@@ -1077,7 +1114,7 @@ func (it *iterator) simpleQuantize(rd *modeScore, uvDone bool) {
 	if uvDone {
 		nz |= rd.nz & 0xff0000
 	} else {
-		nz |= it.reconstructUV(&rd.uvLevels, &rd.derr, it.yuvOut[uOff:], int(mb.uvMode))
+		nz |= it.reconstructUV(rd, it.yuvOut[uOff:], int(mb.uvMode), false)
 	}
 	rd.nz = nz
 }
@@ -1196,7 +1233,7 @@ func (it *iterator) refineUsingDistortion(tryBothModes, refineUVMode bool, rd *m
 		rd.H = 211 + i4BitSum // 211 is VP8BitCost(0, 145)
 	} else {
 		mode := int(e.preds[it.predsIdx])
-		nz = it.reconstructIntra16(&rd.yDCLevels, &rd.yACLevels, it.yuvOut[yOff:], mode)
+		nz = it.reconstructIntra16(rd, it.yuvOut[yOff:], mode, false)
 		rd.H = int64(fixedCostsI16[mode&3])
 	}
 
@@ -1215,7 +1252,7 @@ func (it *iterator) refineUsingDistortion(tryBothModes, refineUVMode bool, rd *m
 		it.mb().uvMode = uint8(bestMode)
 	}
 	uvMode := int(it.mb().uvMode)
-	nz |= it.reconstructUV(&rd.uvLevels, &rd.derr, it.yuvOut[uOff:], uvMode)
+	nz |= it.reconstructUV(rd, it.yuvOut[uOff:], uvMode, false)
 	if e.topDerr != nil {
 		it.storeDiffusionErrors(&rd.derr)
 	}
@@ -1254,6 +1291,8 @@ func (it *iterator) decimate(rd *modeScore, rdOpt int) bool {
 //------------------------------------------------------------------------------
 // Rate calculation
 
+// getCostLuma16 returns the rate of rd's intra16 levels (rd.yDCInfo and
+// rd.yACInfo must be set).
 func (it *iterator) getCostLuma16(rd *modeScore) int {
 	p := &it.enc.proba
 	var res residual
@@ -1261,14 +1300,14 @@ func (it *iterator) getCostLuma16(rd *modeScore) int {
 	it.nzToBytes()
 	// DC
 	res.first, res.ctype = 0, typeI16DC
-	res.setCoeffs(&rd.yDCLevels)
+	res.setCoeffsInfo(&rd.yDCLevels, rd.yDCInfo[0])
 	r += p.residualCost(it.topNz[8]+it.leftNz[8], &res)
 	// AC
 	res.first, res.ctype = 1, typeI16AC
 	for y := 0; y < 4; y++ {
 		for x := 0; x < 4; x++ {
 			ctx := it.topNz[x] + it.leftNz[y]
-			res.setCoeffs(&rd.yACLevels[x+y*4])
+			res.setCoeffsInfo(&rd.yACLevels[x+y*4], rd.yACInfo[x+y*4])
 			r += p.residualCost(ctx, &res)
 			v := b2i(res.last >= 0)
 			it.topNz[x] = v
@@ -1278,19 +1317,23 @@ func (it *iterator) getCostLuma16(rd *modeScore) int {
 	return r
 }
 
-func (it *iterator) getCostLuma4(levels *[16]int16, nz bool) int {
+// getCostLuma4 returns the rate of the levels of the current intra4
+// sub-block; info is their levelInfoOf summary.
+func (it *iterator) getCostLuma4(levels *[16]int16, info uint16) int {
 	x, y := it.i4&3, it.i4>>2
 	ctx := it.topNz[x] + it.leftNz[y]
-	if !nz { // empty block: only the EOB is coded
+	if infoLast(info) < 0 { // empty block: only the EOB is coded
 		return bitCost(0, it.enc.proba.coeffs[typeI4AC][0][ctx%numCtx][0])
 	}
 	var res residual
 	res.first, res.ctype = 0, typeI4AC
-	res.setCoeffs(levels)
+	res.setCoeffsInfo(levels, info)
 	return it.enc.proba.residualCost(it.topNz[x]+it.leftNz[y], &res)
 }
 
-func (it *iterator) getCostUV(levels *[8][16]int16) int {
+// getCostUV returns the rate of rd's chroma levels (rd.uvInfo must be
+// set).
+func (it *iterator) getCostUV(rd *modeScore) int {
 	p := &it.enc.proba
 	var res residual
 	r := 0
@@ -1300,7 +1343,7 @@ func (it *iterator) getCostUV(levels *[8][16]int16) int {
 		for y := 0; y < 2; y++ {
 			for x := 0; x < 2; x++ {
 				ctx := it.topNz[4+ch+x] + it.leftNz[4+ch+y]
-				res.setCoeffs(&levels[ch*2+x+y*2])
+				res.setCoeffsInfo(&rd.uvLevels[ch*2+x+y*2], rd.uvInfo[ch*2+x+y*2])
 				r += p.residualCost(ctx, &res)
 				v := b2i(res.last >= 0)
 				it.topNz[4+ch+x] = v

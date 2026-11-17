@@ -24,7 +24,7 @@ func fTransformPairsNEON(src, ref *byte, off *[8][2]uint16, n int, out *[16]int1
 func iTransformPairsNEON(ref *byte, in *[16]int16, dst *byte, off *[8][2]uint16, n int)
 
 //go:noescape
-func quantizeBlocksNEON(in, out *[16]int16, n int, m *matrix) uint32
+func quantizeBlocksNEON(in, out *[16]int16, n int, m *matrix, info *uint16) uint32
 
 //go:noescape
 func tTransformPairsNEON(a *byte, off *[8][2]uint16, n int, out *int32)
@@ -57,15 +57,19 @@ func iTransformPairs(ref []byte, in [][16]int16, dst []byte, t *pairTable) {
 	iTransformPairsNEON(&ref[0], &in[0], &dst[0], &t.off, t.n)
 }
 
-func quantizeBlocks(in, out [][16]int16, m *matrix) uint32 {
+func quantizeBlocks(in, out [][16]int16, m *matrix, info []uint16) uint32 {
 	n := len(in)
-	if len(out) < n || n > 32 {
+	if len(out) < n || n > 32 || (info != nil && len(info) < n) {
 		panic("vp8enc: quantizeBlocks: bad block count")
 	}
 	if !neonEnabled || n == 0 || !m.vecOK {
-		return quantizeBlocksRef(in, out, m)
+		return quantizeBlocksRef(in, out, m, info)
 	}
-	return quantizeBlocksNEON(&in[0], &out[0], n, m)
+	var pinfo *uint16
+	if info != nil {
+		pinfo = &info[0]
+	}
+	return quantizeBlocksNEON(&in[0], &out[0], n, m, pinfo)
 }
 
 func tTransformPairs(a []byte, t *pairTable, out []int32) {

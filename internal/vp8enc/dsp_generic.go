@@ -18,8 +18,8 @@ func iTransformPairs(ref []byte, in [][16]int16, dst []byte, t *pairTable) {
 	iTransformPairsRef(ref, in, dst, t)
 }
 
-func quantizeBlocks(in, out [][16]int16, m *matrix) uint32 {
-	return quantizeBlocksRef(in, out, m)
+func quantizeBlocks(in, out [][16]int16, m *matrix, info []uint16) uint32 {
+	return quantizeBlocksRef(in, out, m, info)
 }
 
 func tTransformPairs(a []byte, t *pairTable, out []int32) { tTransformPairsRef(a, t, out) }

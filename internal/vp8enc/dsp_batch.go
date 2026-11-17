@@ -1,5 +1,7 @@
 package vp8enc
 
+import "math/bits"
+
 // Batched DSP entry points. The mode search works on whole macroblocks
 // (16 luma or 8 chroma 4x4 blocks per prediction mode) and on all 10
 // intra4 modes of one sub-block at a time, so the kernels below take a
@@ -87,17 +89,40 @@ func iTransformPairsRef(ref []byte, in [][16]int16, dst []byte, t *pairTable) {
 	}
 }
 
+// levelInfoOf summarizes a block of quantized levels (zigzag order) for the
+// rate and flatness estimates: bits 0-7 hold the index of the last
+// non-zero level plus one (0 for an empty block), bits 8-15 the number of
+// non-zero levels after the first (the AC levels).
+func levelInfoOf(c *[16]int16) uint16 {
+	m := uint32(0)
+	for i := 15; i >= 0; i-- {
+		v := uint32(uint16(c[i]))
+		m = m<<1 | (v|-v)>>31
+	}
+	return uint16(bits.Len32(m)) | uint16(bits.OnesCount32(m>>1))<<8
+}
+
+// infoLast returns the index of the last non-zero level, or -1.
+func infoLast(info uint16) int { return int(info&0xff) - 1 }
+
+// infoNzAC returns the number of non-zero AC levels.
+func infoNzAC(info uint16) int { return int(info >> 8) }
+
 // quantizeBlocksRef quantizes each block of in into the matching block of
-// out with quantizeBlock. Bit n of the result is set if block n has a
-// non-zero level.
-func quantizeBlocksRef(in, out [][16]int16, m *matrix) uint32 {
-	if len(out) < len(in) || len(in) > 32 {
+// out with quantizeBlock, and stores levelInfoOf of each block into info
+// unless info is nil. Bit n of the result is set if block n has a non-zero
+// level.
+func quantizeBlocksRef(in, out [][16]int16, m *matrix, info []uint16) uint32 {
+	if len(out) < len(in) || len(in) > 32 || (info != nil && len(info) < len(in)) {
 		panic("vp8enc: quantizeBlocks: bad block count")
 	}
 	nz := uint32(0)
 	for n := range in {
 		if quantizeBlock(&in[n], &out[n], m) {
 			nz |= 1 << uint(n)
+		}
+		if info != nil {
+			info[n] = levelInfoOf(&out[n])
 		}
 	}
 	return nz

@@ -126,6 +126,12 @@ func (r *residual) setCoeffs(c *[16]int16) {
 	r.last = lastNonZero(c)
 }
 
+// setCoeffsInfo is setCoeffs with the levelInfoOf summary of c known.
+func (r *residual) setCoeffsInfo(c *[16]int16, info uint16) {
+	r.coeffs = c
+	r.last = infoLast(info)
+}
+
 // lastNonZero returns the index of the last non-zero coefficient, or -1.
 func lastNonZero(c *[16]int16) int {
 	n := 15
