@@ -104,7 +104,7 @@ func benchRescale(b *testing.B, sw, sh, dw, dh int) {
 	src := benchImage(sw, sh)
 	out := make([]byte, dw*4)
 	var rs Rescaler
-	work := make([]uint32, WorkSize(dw, 4))
+	work := make([]uint32, BufferSize(dw, 4))
 	b.SetBytes(int64(sw * sh * 4))
 	b.ReportAllocs()
 	b.ResetTimer()

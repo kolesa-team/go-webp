@@ -26,11 +26,11 @@ func mult(x byte, scale uint32) byte { return byte((uint32(x)*scale + half) >> m
 // PremultiplyRGBA multiplies the R, G and B samples of an RGBA row by alpha,
 // exactly like libwebp's WebPMultARGBRow(..., inverse=0); fully transparent
 // pixels become 0,0,0,0.
-func PremultiplyRGBA(row []byte) { multRGBA(row, &premulScale) }
+func PremultiplyRGBA(row []byte) { premultiplyRow(row) }
 
 // UnpremultiplyRGBA reverses PremultiplyRGBA, exactly like libwebp's
 // WebPMultARGBRow(..., inverse=1).
-func UnpremultiplyRGBA(row []byte) { multRGBA(row, &unpremulScale) }
+func UnpremultiplyRGBA(row []byte) { unpremultiplyRow(row) }
 
 func multRGBA(row []byte, table *[256]uint32) {
 	for i := 0; i+4 <= len(row); i += 4 {
