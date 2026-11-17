@@ -637,3 +637,99 @@ func FuzzReconGlue(f *testing.F) {
 		}
 	})
 }
+
+// checkWHT compares transformWHT with transformWHTRef, including the
+// coefficients it must leave alone.
+func checkWHT(t *testing.T, in *[16]int16, out *[384]int16) bool {
+	t.Helper()
+	got, want := *out, *out
+	in0 := *in
+	transformWHT(in, &got)
+	transformWHTRef(in, &want)
+	if *in != in0 {
+		t.Errorf("transformWHT modified its input")
+		return false
+	}
+	if got != want {
+		for i := range got {
+			if got[i] != want[i] {
+				t.Errorf("transformWHT(%v): out[%d] = %d, want %d", *in, i, got[i], want[i])
+				break
+			}
+		}
+		return false
+	}
+	return true
+}
+
+func TestTransformWHT(t *testing.T) {
+	r := rand.New(rand.NewPCG(13, 14))
+	var in [16]int16
+	var out [384]int16
+	for i := range out {
+		out[i] = int16(r.Uint32())
+	}
+	step := 1
+	if testing.Short() {
+		step = 7
+	}
+	// Every value at every position (the others zero or extreme).
+	for pos := 0; pos < 16; pos++ {
+		for v := -32768; v < 32768; v += step {
+			in = [16]int16{}
+			if v&1 != 0 {
+				for k := range in {
+					in[k] = randCoeff(r, 3)
+				}
+			}
+			in[pos] = int16(v)
+			if !checkWHT(t, &in, &out) {
+				t.FailNow()
+			}
+		}
+	}
+	for i := 0; i < reconIters(t); i++ {
+		kind := r.IntN(5)
+		for k := range in {
+			in[k] = randCoeff(r, kind)
+		}
+		if !checkWHT(t, &in, &out) {
+			t.FailNow()
+		}
+	}
+}
+
+func FuzzTransformWHT(f *testing.F) {
+	f.Add([]byte{0x00, 0x80, 0xff, 0x7f})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) == 0 {
+			return
+		}
+		var in [16]int16
+		var out [384]int16
+		for i := range in {
+			in[i] = int16(uint16(data[(2*i)%len(data)]) | uint16(data[(2*i+1)%len(data)])<<8)
+		}
+		for i := range out {
+			out[i] = int16(i * 37)
+		}
+		if !checkWHT(t, &in, &out) {
+			t.FailNow()
+		}
+	})
+}
+
+func BenchmarkTransformWHT(b *testing.B) {
+	in := [16]int16{100, -20, 3, 0, 7, 1, -1, 0, 0, 0, 2, 0, -5, 0, 0, 1}
+	var out [384]int16
+	b.Run("kernel", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			transformWHT(&in, &out)
+		}
+	})
+	b.Run("ref", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			transformWHTRef(&in, &out)
+		}
+	})
+}

@@ -22,6 +22,9 @@ func reconI16NEON(b *[yuvSize]byte, coeffs *[384]int16, bits uint32, mode int)
 func reconUVNEON(b *[yuvSize]byte, coeffs *[384]int16, codes uint32, mode int)
 
 //go:noescape
+func transformWHTNEON(in *[16]int16, out *[384]int16)
+
+//go:noescape
 func loadEdgesNEON(b *[yuvSize]byte, top *topSamples, tr, flags uint32)
 
 //go:noescape
@@ -37,6 +40,10 @@ func reconI16(b *[yuvSize]byte, coeffs *[384]int16, bits uint32, mode int) {
 
 func reconUV(b *[yuvSize]byte, coeffs *[384]int16, bits uint32, mode int) {
 	reconUVNEON(b, coeffs, uvCodes(bits&0xff, coeffs[16*16:])|uvCodes(bits>>8&0xff, coeffs[20*16:])<<8, mode)
+}
+
+func transformWHT(in *[16]int16, out *[384]int16) {
+	transformWHTNEON(in, out)
 }
 
 func loadEdges(b *[yuvSize]byte, top *topSamples, tr, flags uint32) {

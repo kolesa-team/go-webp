@@ -24,3 +24,7 @@ func loadEdges(b *[yuvSize]byte, top *topSamples, tr, flags uint32) {
 func storeMBRows(b *[yuvSize]byte, top *topSamples, cy, cu, cv []byte, ys, uvs int) {
 	storeMBRowsRef(b, top, cy, cu, cv, ys, uvs)
 }
+
+func transformWHT(in *[16]int16, out *[384]int16) {
+	transformWHTRef(in, out)
+}

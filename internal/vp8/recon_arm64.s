@@ -937,3 +937,73 @@ noStash:
 	VST1.P	[V21.B8], (R4)(R6)
 	VST1	[V23.B8], (R4)
 	RET
+
+// --- inverse Walsh-Hadamard transform -------------------------------------------
+
+// func transformWHTNEON(in *[16]int16, out *[384]int16)
+//
+// Mirrors transformWHTRef (libwebp's TransformWHT): a vertical pass on the
+// four input rows (lane = column), a 4x4 transpose, a horizontal pass with
+// the +3 rounder, then >> 3 truncated to int16 (SHRN keeps bits 3-18, the
+// same as int16(x >> 3) for any sign). All in 32-bit lanes, so any int16
+// input gives the reference's result. Output (row i, column k) goes to the
+// DC of block 4*i + k, out[(4*i+k)*16].
+// Registers: R0 in, R1 out, R2 = 32 (block stride in bytes), R3 = 3,
+// V0-V11.
+TEXT ·transformWHTNEON(SB), NOSPLIT, $0-16
+	MOVD	in+0(FP), R0
+	MOVD	out+8(FP), R1
+	MOVD	$32, R2
+	VLD1	(R0), [V0.H8, V1.H8]
+	VSXTL	V0.H4, V2.S4  // in[0..3]
+	VSXTL2	V0.H8, V3.S4  // in[4..7]
+	VSXTL	V1.H4, V4.S4  // in[8..11]
+	VSXTL2	V1.H8, V5.S4  // in[12..15]
+	VADD	V5.S4, V2.S4, V6.S4 // a0 = in0 + in12
+	VADD	V4.S4, V3.S4, V7.S4 // a1 = in4 + in8
+	VSUB	V4.S4, V3.S4, V8.S4 // a2 = in4 - in8
+	VSUB	V5.S4, V2.S4, V9.S4 // a3 = in0 - in12
+	VADD	V7.S4, V6.S4, V2.S4 // tmp[0..3]   = a0 + a1
+	VADD	V8.S4, V9.S4, V3.S4 // tmp[4..7]   = a3 + a2
+	VSUB	V7.S4, V6.S4, V4.S4 // tmp[8..11]  = a0 - a1
+	VSUB	V8.S4, V9.S4, V5.S4 // tmp[12..15] = a3 - a2
+	VTRN1	V3.S4, V2.S4, V6.S4
+	VTRN2	V3.S4, V2.S4, V7.S4
+	VTRN1	V5.S4, V4.S4, V8.S4
+	VTRN2	V5.S4, V4.S4, V9.S4
+	VTRN1	V8.D2, V6.D2, V2.D2 // tmp[4i+0]
+	VTRN1	V9.D2, V7.D2, V3.D2 // tmp[4i+1]
+	VTRN2	V8.D2, V6.D2, V4.D2 // tmp[4i+2]
+	VTRN2	V9.D2, V7.D2, V5.D2 // tmp[4i+3]
+	MOVD	$3, R3
+	VDUP	R3, V10.S4
+	VADD	V10.S4, V2.S4, V2.S4 // dc = tmp[4i] + 3
+	VADD	V5.S4, V2.S4, V6.S4  // a0 = dc + tmp[4i+3]
+	VADD	V4.S4, V3.S4, V7.S4  // a1 = tmp[4i+1] + tmp[4i+2]
+	VSUB	V4.S4, V3.S4, V8.S4  // a2 = tmp[4i+1] - tmp[4i+2]
+	VSUB	V5.S4, V2.S4, V9.S4  // a3 = dc - tmp[4i+3]
+	VADD	V7.S4, V6.S4, V2.S4  // column 0: a0 + a1
+	VADD	V8.S4, V9.S4, V3.S4  // column 1: a3 + a2
+	VSUB	V7.S4, V6.S4, V4.S4  // column 2: a0 - a1
+	VSUB	V8.S4, V9.S4, V5.S4  // column 3: a3 - a2
+	VSHRN	$3, V2.S4, V10.H4
+	VSHRN2	$3, V3.S4, V10.H8    // V10 = columns 0, 1 (lane = row)
+	VSHRN	$3, V4.S4, V11.H4
+	VSHRN2	$3, V5.S4, V11.H8    // V11 = columns 2, 3
+	VST1.P	V10.H[0], (R1)(R2)
+	VST1.P	V10.H[4], (R1)(R2)
+	VST1.P	V11.H[0], (R1)(R2)
+	VST1.P	V11.H[4], (R1)(R2)
+	VST1.P	V10.H[1], (R1)(R2)
+	VST1.P	V10.H[5], (R1)(R2)
+	VST1.P	V11.H[1], (R1)(R2)
+	VST1.P	V11.H[5], (R1)(R2)
+	VST1.P	V10.H[2], (R1)(R2)
+	VST1.P	V10.H[6], (R1)(R2)
+	VST1.P	V11.H[2], (R1)(R2)
+	VST1.P	V11.H[6], (R1)(R2)
+	VST1.P	V10.H[3], (R1)(R2)
+	VST1.P	V10.H[7], (R1)(R2)
+	VST1.P	V11.H[3], (R1)(R2)
+	VST1	V11.H[7], (R1)
+	RET
