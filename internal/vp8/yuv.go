@@ -56,12 +56,15 @@ func yuvPix(t *yuvTables, y, u, v uint8) uint32 {
 // into byte stores.
 var opaque2 uint64 = 0xff000000ff000000
 
-// upsamplePair converts a pair of luma rows sharing the chroma rows topU/V
-// (above) and curU/V (below) with libwebp's fancy upsampler
+// upsamplePairGo converts a pair of luma rows sharing the chroma rows
+// topU/V (above) and curU/V (below) with libwebp's fancy upsampler
 // (UpsampleRgbaLinePair). botY may be nil when only the top row is needed.
 // uvT and uvB are scratch rows of at least w entries. topA and botA are the
 // alpha rows of the two output rows, or nil for opaque output.
-func upsamplePair(topY, botY, topU, topV, curU, curV, topDst, botDst, topA, botA []byte, uvT, uvB []uint32, w int) {
+//
+// This is the portable reference; upsamplePair (yuv_arm64.go,
+// yuv_generic.go) is the entry point used by the decoder.
+func upsamplePairGo(topY, botY, topU, topV, curU, curV, topDst, botDst, topA, botA []byte, uvT, uvB []uint32, w int) {
 	if botY == nil {
 		upsampleUV(topU, topV, curU, curV, uvT, nil, w)
 		convertRow(topY, uvT, topA, topDst, w)
@@ -157,9 +160,10 @@ func convertRow(ys []byte, uv []uint32, as, dst []byte, w int) {
 	}
 }
 
-// sampleRow converts one luma row using nearest (point-sampled) chroma. as
-// is the alpha row, or nil for opaque output.
-func sampleRow(ys, us, vs, as, dst []byte, w int) {
+// sampleRowGo converts one luma row using nearest (point-sampled) chroma.
+// as is the alpha row, or nil for opaque output. This is the portable
+// reference; sampleRow is the entry point used by the decoder.
+func sampleRowGo(ys, us, vs, as, dst []byte, w int) {
 	ys = ys[:w]
 	dst = dst[:4*w]
 	uvW := (w + 1) >> 1
