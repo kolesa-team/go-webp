@@ -70,11 +70,13 @@ type decoder struct {
 	arena       []uint32 // sub-images (transform data, entropy image)
 	argb        []uint32 // level-0 decoded pixels (whole image or sliding window)
 	rows        []uint32 // inverse transform output: 1 top row + numCacheRows rows
-	colorCache  []uint32
+	colorCache  *[1 << maxCacheBits]uint32
 	pal         [256]uint32 // RGBA palette for fused color-index output
 	palReady    bool
-	bundle      []byte // RGBA bytes of the pixels of each bundled index byte
+	premulPal   bool     // pal is alpha-premultiplied (pipeline.PremultipliedSink)
+	bundle      []uint64 // RGBA pixels of each bundled index byte (bundleTable)
 	bundleReady bool
+	alphaTab    *alphaTables // 8-bit alpha path tables (built once per decode)
 
 	// Level-0 output state.
 	out      int
@@ -99,6 +101,15 @@ type decoder struct {
 	ib      []byte   // 8-bit index buffer (whole image or sliding window)
 	inTail  bool     // the 8-bit path switched to the tail bit reader
 	tr      tailReader
+
+	// Palette images decoded as bytes (idx8.go).
+	idx8   bool   // the level-0 pixels are the index bytes in d.ib
+	idxARB uint32 // alpha, red and blue of every level-0 pixel
+	cache8 *[1 << maxCacheBits]uint16
+	hash8  [256]uint16 // color cache slot of each index
+
+	useThreads bool       // Options.UseThreads
+	async      *asyncEmit // two-stage decode in progress (async.go)
 }
 
 // pixState is the position of a (resumable) pixel decoding loop. base is
@@ -124,9 +135,13 @@ func getDecoder() *decoder {
 	d.md0 = metadata{}
 	d.buf = nil
 	d.use8b = false
+	d.idx8 = false
 	d.inTail = false
 	d.palReady = false
+	d.premulPal = false
 	d.bundleReady = false
+	d.useThreads = false
+	d.async = nil
 	return d
 }
 
@@ -186,6 +201,17 @@ func DecodeHeader(data []byte) (width, height int, hasAlpha bool, err error) {
 	return width, height, hasAlpha, nil
 }
 
+// Options configures DecodeWithOptions.
+type Options struct {
+	// UseThreads decodes big images (at least 256K needed pixels) in two
+	// stages when the process-wide helper budget allows (see package
+	// internal/workers): the calling goroutine decodes the entropy-coded
+	// pixels while a helper goroutine applies the inverse transforms and
+	// writes the rows into the sink. The output is the same either way.
+	// libwebp ignores use_threads for lossless images.
+	UseThreads bool
+}
+
 // Decode decodes a VP8L chunk payload and writes non-premultiplied RGBA rows
 // into sink, top to bottom (respecting sink.NeedRows() to stop early).
 //
@@ -196,6 +222,13 @@ func DecodeHeader(data []byte) (width, height int, hasAlpha bool, err error) {
 // slice reproduces that behavior exactly. Bits beyond len(data) read as
 // zero.
 func Decode(data []byte, sink pipeline.Sink) error {
+	return DecodeWithOptions(data, sink, nil)
+}
+
+// DecodeWithOptions is Decode with options (nil for the defaults). With
+// UseThreads the sink may be called from a helper goroutine, never
+// concurrently and always before DecodeWithOptions returns.
+func DecodeWithOptions(data []byte, sink pipeline.Sink, opts *Options) error {
 	w, h, _, err := DecodeHeader(data)
 	if err != nil {
 		return err
@@ -214,6 +247,7 @@ func Decode(data []byte, sink pipeline.Sink) error {
 	d.out = outRGBA
 	d.sink = sink
 	d.needRows = max(need, 0)
+	d.useThreads = opts != nil && opts.UseThreads
 	err = d.decodeLevel0(w, h)
 	if status.CodeOf(err) == utils.Vp8StatusNotEnoughData {
 		// The whole file is available (no incremental decoding): like
@@ -294,6 +328,10 @@ func (a *AlphaDecoder) init(data []byte, width, height int) error {
 	d.use8b = d.nTransforms == 1 && d.transforms[0].kind == colorIndexingTransform && is8bOptimizable(&d.md0)
 	if d.use8b {
 		d.initBuffer8()
+		if d.alphaTab == nil {
+			d.alphaTab = new(alphaTables)
+		}
+		d.alphaTab.init(&d.transforms[0])
 	} else {
 		d.initBuffer32()
 	}
@@ -421,7 +459,42 @@ func (d *decoder) decodeLevel0(w, h int) error {
 		return nil
 	}
 	d.inPixels = true
-	d.initBuffer32()
+	// When the palette lookup is the last step, a sink that premultiplies
+	// its rows (scaling) can be fed premultiplied palette colors instead:
+	// premultiplying 256 palette entries once gives the same pixels as
+	// premultiplying every pixel.
+	if d.nTransforms > 0 && d.transforms[0].kind == colorIndexingTransform {
+		if ps, ok := d.sink.(pipeline.PremultipliedSink); ok && ps.AcceptPremultiplied() {
+			d.premulPal = true
+		}
+	}
+	if arb, ok := d.idx8ARB(); ok {
+		d.initIdx8(arb)
+	} else {
+		d.initBuffer32()
+	}
+	if d.startAsync() {
+		// Stop the helper on every path; after a normal return finishAsync
+		// already did, and this is a no-op.
+		defer d.abortAsync()
+		return d.finishAsync(d.decodeLevel0Pixels(h))
+	}
+	return d.decodeLevel0Pixels(h)
+}
+
+// decodeLevel0Pixels decodes the level-0 pixels of an image of height h,
+// as index bytes when d.idx8 is set (switching to 32 bits if the stream
+// requires it, see idx8.go).
+func (d *decoder) decodeLevel0Pixels(h int) error {
+	if d.idx8 {
+		err := d.decodeIdx8(&d.md0, d.ib, d.xsize, h, d.sliding, d.window, &d.px)
+		if err != errWiden {
+			return err
+		}
+		if err := d.widenIdx8(); err != nil {
+			return err
+		}
+	}
 	return d.decodePixels(&d.md0, d.buf, d.xsize, h, true, d.sliding, d.window, &d.px)
 }
 

@@ -6,6 +6,7 @@ package vp8l
 import (
 	"encoding/binary"
 
+	"github.com/kolesa-team/go-webp/v2/internal/resample"
 	"github.com/kolesa-team/go-webp/v2/internal/status"
 )
 
@@ -22,6 +23,60 @@ func prefixValue(sym int, val uint64) (int, uint) {
 
 func errTruncated() error { return status.NotEnoughData("vp8l: truncated pixel data") }
 
+// Color cache maintenance.
+//
+// libwebp inserts every decoded pixel into the color cache: at the end of
+// each row, after each backward reference and before each cache lookup.
+// Only lookups read the cache, so decodePixels defers the insertions: the
+// pixels buf[lastCached:p] are pending, and they are inserted in order (a
+// forward loop) before the next lookup, before the window slides (which
+// moves them) or, for caches of more than lazyCacheMaxBits bits, at the
+// same points as libwebp.
+//
+// Small caches (palette images use 2 to 4 bits) are settled backwards
+// instead when many pixels are pending: the last pending pixel hashing to a
+// slot is the value that slot ends up with, so the scan can stop as soon as
+// every slot has been seen, usually after a handful of pixels instead of
+// the whole range. Both orders leave the cache in the same state.
+var (
+	// lazyCacheMaxBits is the largest cache (in bits) maintained lazily; at
+	// most 6 (settleCache tracks the slots in a uint64). A variable so that
+	// tests can compare against eager maintenance (0).
+	lazyCacheMaxBits = 4
+	// lazyCacheMinRun is the smallest pending range settled backwards;
+	// shorter ranges are inserted forwards. A variable for tests.
+	lazyCacheMinRun = 256
+)
+
+// insertCache inserts px into the color cache in order. shift is
+// 32-cacheBits.
+func insertCache(cache *[1 << maxCacheBits]uint32, px []uint32, shift uint) {
+	for _, c := range px {
+		cache[(c*colorCacheMult)>>(shift&31)&(1<<maxCacheBits-1)] = c
+	}
+}
+
+// settleCache leaves a color cache of at most 64 slots (shift >= 26) in
+// the state inserting px in order would: scanning backwards, the first
+// pixel seen for a slot is its final value, and the scan stops once every
+// slot is settled.
+//
+// It is small enough to be inlined: a call on the cache lookup path of
+// decodePixels makes the register allocator spill around it even when the
+// branch is not taken, which costs more than 10% on photos.
+func settleCache(cache *[1 << maxCacheBits]uint32, px []uint32, shift uint) {
+	full := ^uint64(0) >> (64 - 1<<(32-shift&31)) // one bit per slot
+	var seen uint64
+	for i := len(px) - 1; i >= 0 && seen != full; i-- {
+		c := px[i]
+		h := (c * colorCacheMult) >> (shift & 31) & 63
+		if seen>>h&1 == 0 {
+			seen |= 1 << h
+			cache[h] = c
+		}
+	}
+}
+
 // decodePixels entropy-decodes a w*h image into buf.
 //
 // For level0, rows are passed through the inverse transforms to the output
@@ -37,21 +92,26 @@ func (d *decoder) decodePixels(md *metadata, buf []uint32, w, h int, level0, sli
 	if level0 {
 		lastPixel = w * d.needRows
 	}
-	var cache []uint32
+	var cache *[1 << maxCacheBits]uint32
 	var cacheShift uint
+	var cacheSize int
+	// eager: insert the pending pixels at the same points as libwebp,
+	// otherwise only before lookups and window slides (see above).
+	eager := false
 	if md.cacheBits > 0 {
-		n := 1 << md.cacheBits
-		if cap(d.colorCache) < n {
-			d.colorCache = make([]uint32, 1<<maxCacheBits)
+		if d.colorCache == nil {
+			d.colorCache = new([1 << maxCacheBits]uint32)
 		}
-		cache = d.colorCache[:n]
+		cache = d.colorCache
+		cacheSize = 1 << md.cacheBits
 		if !st.started {
-			clear(cache)
+			clear(cache[:cacheSize])
 		}
 		cacheShift = 32 - uint(md.cacheBits)
+		eager = md.cacheBits > min(lazyCacheMaxBits, 6)
 	}
 	const lenCodeLimit = numLiteralCodes + numLengthCodes
-	cacheLimit := lenCodeLimit + len(cache)
+	cacheLimit := lenCodeLimit + cacheSize
 	mask := md.huffMask
 
 	data := d.br.data
@@ -69,6 +129,11 @@ outer:
 		stop := lastPixel - base
 		if sliding {
 			stop = min(stop, len(buf)-maxCopyLength)
+		}
+		if a := d.async; a != nil && level0 && a.guard > 0 {
+			// Do not overwrite the rows the helper still reads (copies
+			// write up to maxCopyLength pixels past stop).
+			stop = min(stop, a.guard-maxCopyLength)
 		}
 		for p < stop {
 			if col&mask == 0 {
@@ -189,19 +254,19 @@ outer:
 					if col&mask != 0 {
 						g = md.group(groups, col, row)
 					}
-					if cache != nil {
-						for ; lastCached < p; lastCached++ {
-							c := buf[lastCached]
-							cache[(c*colorCacheMult)>>cacheShift] = c
-						}
+					if eager {
+						insertCache(cache, buf[lastCached:p], cacheShift)
+						lastCached = p
 					}
 					continue
 				case code < cacheLimit:
-					for ; lastCached < p; lastCached++ {
-						c := buf[lastCached]
-						cache[(c*colorCacheMult)>>cacheShift] = c
+					if !eager && p-lastCached >= lazyCacheMinRun {
+						settleCache(cache, buf[lastCached:p], cacheShift)
+					} else {
+						insertCache(cache, buf[lastCached:p], cacheShift)
 					}
-					buf[p] = cache[code-lenCodeLimit]
+					lastCached = p
+					buf[p] = cache[(code-lenCodeLimit)&(1<<maxCacheBits-1)]
 				default:
 					err = status.Bitstream("vp8l: invalid green symbol")
 					break outer
@@ -217,11 +282,9 @@ outer:
 						break outer
 					}
 				}
-				if cache != nil {
-					for ; lastCached < p; lastCached++ {
-						c := buf[lastCached]
-						cache[(c*colorCacheMult)>>cacheShift] = c
-					}
+				if eager {
+					insertCache(cache, buf[lastCached:p], cacheShift)
+					lastCached = p
 				}
 				if bpos > len(data) && isEOS(len(data), bpos, nbits) {
 					err = errTruncated()
@@ -232,15 +295,26 @@ outer:
 		if base+p >= lastPixel {
 			break
 		}
-		// Slide the window: keep the LZ77 window and the rows not yet
-		// emitted.
-		if cache != nil {
-			for ; lastCached < p; lastCached++ {
-				c := buf[lastCached]
-				cache[(c*colorCacheMult)>>cacheShift] = c
+		if a := d.async; a != nil && level0 && a.guard > 0 && p < len(buf)-maxCopyLength {
+			// Stopped at the guard: wait for the helper, then go on.
+			if err = a.waitGuard(); err != nil {
+				break
 			}
+			continue
+		}
+		// Slide the window: keep the LZ77 window and the rows not yet
+		// emitted. The pending cache pixels move, so settle them first.
+		if cache != nil && !eager && p-lastCached >= lazyCacheMinRun {
+			settleCache(cache, buf[lastCached:p], cacheShift)
+		} else if cache != nil {
+			insertCache(cache, buf[lastCached:p], cacheShift)
 		}
 		keep := min(base+p-window, d.lastRow*w)
+		if a := d.async; a != nil && level0 {
+			if err = a.beforeSlide(p - (keep - base)); err != nil {
+				break
+			}
+		}
 		n := copy(buf, buf[keep-base:p])
 		base = keep
 		p = n
@@ -265,6 +339,9 @@ outer:
 // the output conversion when it is subtract-green or color indexing.
 func (d *decoder) processRows(buf []uint32, base, row int) error {
 	row = min(row, d.needRows)
+	if d.async != nil {
+		return d.sendRows(base, row, false)
+	}
 	// A resumed decode (AlphaDecoder) may have more than numCacheRows
 	// decoded rows pending: emit them in batches that fit d.rows.
 	for row-d.lastRow > numCacheRows {
@@ -283,9 +360,19 @@ func (d *decoder) processBatch(buf []uint32, base, row int) error {
 		return nil
 	}
 	w := d.xsize
-	fw := d.width
 	argb := buf[y0*w-base : row*w-base]
 	d.lastRow = row
+	return d.emitRows(argb, y0, row)
+}
+
+// emitRows runs the inverse transforms over rows [y0, row) (at most
+// numCacheRows rows, the level-0 pixels argb) and emits them. Rows must
+// arrive in order. In a two-stage decode it runs on the helper goroutine,
+// so it must only use the decoder state reserved to it: d.rows, the fused
+// palette tables and the output.
+func (d *decoder) emitRows(argb []uint32, y0, row int) error {
+	n := row - y0
+	fw := d.width
 
 	// Pick the transform fused into the output step, if any.
 	var final *transform
@@ -376,26 +463,38 @@ func toRGBA(c uint32) uint32 {
 	return c&0xff00ff00 | c>>16&0xff | (c&0xff)<<16
 }
 
+// emitRGBA converts the ARGB pixels src to RGBA bytes in dst (as many
+// pixels as fit), two pixels per 64-bit word.
 func emitRGBA(src []uint32, dst []byte) {
-	for _, c := range src {
-		if len(dst) < 4 {
-			return
-		}
-		binary.LittleEndian.PutUint32(dst, toRGBA(c))
-		dst = dst[4:]
+	for len(src) >= 2 && len(dst) >= 8 {
+		c := uint64(src[0]) | uint64(src[1])<<32
+		binary.LittleEndian.PutUint64(dst, swapRB2(c))
+		src, dst = src[2:], dst[8:]
 	}
+	if len(src) > 0 && len(dst) >= 4 {
+		binary.LittleEndian.PutUint32(dst, toRGBA(src[0]))
+	}
+}
+
+// swapRB2 swaps the red and blue bytes of the two ARGB pixels in c.
+func swapRB2(c uint64) uint64 {
+	return c&0xff00ff00ff00ff00 | c>>16&0x000000ff000000ff | c&0x000000ff000000ff<<16
 }
 
 // emitAddGreen fuses the inverse subtract-green transform with emitRGBA.
 func emitAddGreen(src []uint32, dst []byte) {
-	for _, c := range src {
-		if len(dst) < 4 {
-			return
-		}
+	for len(src) >= 2 && len(dst) >= 8 {
+		c := uint64(src[0]) | uint64(src[1])<<32
+		g := c & 0x0000ff000000ff00
+		rb := (c&0x00ff00ff00ff00ff + (g>>8 | g<<8)) & 0x00ff00ff00ff00ff
+		binary.LittleEndian.PutUint64(dst, swapRB2(c&0xff00ff00ff00ff00|rb))
+		src, dst = src[2:], dst[8:]
+	}
+	if len(src) > 0 && len(dst) >= 4 {
+		c := src[0]
 		g := c >> 8 & 0xff
 		rb := (c&0x00ff00ff + (g<<16 | g)) & 0x00ff00ff
 		binary.LittleEndian.PutUint32(dst, toRGBA(c&0xff00ff00|rb))
-		dst = dst[4:]
 	}
 }
 
@@ -416,32 +515,49 @@ func (d *decoder) emitPalette(t *transform, src []uint32, dst []byte) {
 	// Bundled indices: expand a whole packed byte at once from a table of
 	// the 256 possible byte values.
 	tab := d.bundleTable(t)
-	n := 4 << t.bits // bytes per packed byte
+	wpb := 1 << t.bits >> 1 // words per packed byte
 	for _, c := range src {
-		e := tab[(c>>8&0xff)*uint32(n):]
-		if len(dst) < n {
-			copy(dst, e[:len(dst)])
-			return
+		k := int(c>>8&0xff) * wpb
+		for _, v := range tab[k : k+wpb] {
+			if len(dst) < 8 {
+				if len(dst) >= 4 {
+					binary.LittleEndian.PutUint32(dst, uint32(v))
+				}
+				return
+			}
+			binary.LittleEndian.PutUint64(dst, v)
+			dst = dst[8:]
 		}
-		copy(dst[:n], e[:n])
-		dst = dst[n:]
 	}
 }
 
-// paletteRGBA returns the palette of t converted to RGBA words.
+// paletteRGBA returns the palette of t converted to RGBA words,
+// alpha-premultiplied with d.premulPal.
 func (d *decoder) paletteRGBA(t *transform) *[256]uint32 {
 	if !d.palReady {
 		for i, c := range t.data {
 			d.pal[i] = toRGBA(c)
+		}
+		if d.premulPal {
+			var b [4 * 256]byte
+			n := len(t.data)
+			for i, c := range d.pal[:n] {
+				binary.LittleEndian.PutUint32(b[4*i:], c)
+			}
+			resample.PremultiplyRGBA(b[:4*n])
+			for i := range d.pal[:n] {
+				d.pal[i] = binary.LittleEndian.Uint32(b[4*i:])
+			}
 		}
 		d.palReady = true
 	}
 	return &d.pal
 }
 
-// bundleTable returns, for each packed index byte, the RGBA bytes of the
-// 1<<t.bits pixels it holds.
-func (d *decoder) bundleTable(t *transform) []byte {
+// bundleTable returns, for each packed index byte, the RGBA words of the
+// 1<<t.bits pixels it holds, two pixels per little-endian 64-bit word
+// (1<<t.bits/2 words per byte).
+func (d *decoder) bundleTable(t *transform) []uint64 {
 	if d.bundleReady {
 		return d.bundle
 	}
@@ -449,15 +565,18 @@ func (d *decoder) bundleTable(t *transform) []byte {
 	ppb := 1 << t.bits
 	bpp := uint(8 >> t.bits)
 	mask := 1<<bpp - 1
-	n := 256 * ppb * 4
+	wpb := ppb / 2
+	n := 256 * wpb
 	if cap(d.bundle) < n {
-		d.bundle = make([]byte, 256*8*4)
+		d.bundle = make([]uint64, 256*4)
 	}
 	tab := d.bundle[:n]
 	for v := 0; v < 256; v++ {
-		e := tab[v*ppb*4 : (v+1)*ppb*4]
-		for k := 0; k < ppb; k++ {
-			binary.LittleEndian.PutUint32(e[4*k:], pal[v>>(uint(k)*bpp)&mask])
+		e := tab[v*wpb : (v+1)*wpb]
+		for k := range e {
+			lo := pal[v>>(uint(2*k)*bpp)&mask]
+			hi := pal[v>>(uint(2*k+1)*bpp)&mask]
+			e[k] = uint64(lo) | uint64(hi)<<32
 		}
 	}
 	d.bundle = tab
@@ -519,7 +638,7 @@ func (d *decoder) extractAlpha8(row int) {
 		return
 	}
 	w, fw, base := d.xsize, d.width, d.px.base
-	inverseColorIndexAlpha(&d.transforms[0], row-y0, d.ib[y0*w-base:row*w-base], d.alpha[y0*fw:row*fw])
+	inverseColorIndexAlpha(&d.transforms[0], d.alphaTab, row-y0, d.ib[y0*w-base:row*w-base], d.alpha[y0*fw:row*fw])
 	d.lastRow = row
 }
 
