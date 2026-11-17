@@ -308,26 +308,42 @@ floop:
 fdone:
 	RET
 
+// SQDMULH Vd.8H, Vn.8H, Vm.8H (signed saturating doubling multiply high)
+#define SQDMULH8H(d, n, m) WORD $(0x4E60B400 | ((m)<<16) | ((n)<<5) | (d))
+// SSRA Vd.8H, Vn.8H, #1 (signed shift right by 1 and accumulate)
+#define SSRA8H1(d, n) WORD $(0x4F1F1400 | ((n)<<5) | (d))
+
 // ---------------------------------------------------------------------------
 // func iTransformPairsNEON(ref *byte, in *[16]int16, dst *byte, off *[8][2]uint16, n int)
 //
 // iTransform (dsp.go) of the 2n blocks of the n pairs of a pair table:
-// dst = clip8(ref + IDCT(in)). Unlike libwebp's ITransform_NEON (16-bit
-// lanes and SQDMULH), the transform runs on int32 lanes so that it
-// reproduces the Go code, including its int32 wrap-around, for any input:
+// dst = clip8(ref + IDCT(in)), with
 //   pass 1 (lanes = columns i): a = in[i]+in[8+i], b = in[i]-in[8+i],
 //           c = mul2(in[4+i]) - mul1(in[12+i]), d = mul1(in[4+i]) + mul2(in[12+i])
-//           with mul1(x) = ((x*20091)>>16)+x, mul2(x) = (x*35468)>>16
-//           (MUL, SSHR)
+//           with mul1(x) = ((x*20091)>>16)+x, mul2(x) = (x*35468)>>16,
+//           outputs a+d, b+c, b-c, a-d
 //   transpose -> lanes = rows
 //   pass 2: same butterfly with dc = c0+4, then >> 3
-//   clip8(ref + v): SQXTN to int16 (saturating), ZIP back to rows, SQADD
-//           with the widened reference, SQXTUN to bytes. Saturation at each
-//           step gives the same result as Go's clip8 of the int32 sum.
+//   clip8(ref + v)
+//
+// The Go code computes in int32. When every coefficient of the pair has
+// |in| <= 2047 (all the blocks the encoder produces in practice), no
+// intermediate value exceeds 14.8*2047+4 < 2^15, so 16-bit lanes give the
+// same results: the pair is transformed at once as in libwebp's
+// ITransform_NEON, with
+//   mul2(x) = (x*35468)>>16 = SQDMULH(x, 17734)
+//   mul1(x) = ((x*20091)>>16) + x = x + (SQDMULH(x, 20091) >> 1)  (SSRA)
+// (exact: floor(floor(2*x*20091/2^16)/2) = floor(x*20091/2^16)), and
+// SQADD/SQXTUN add the prediction and clip. Otherwise each block takes the int32 path, which
+// reproduces the Go arithmetic (including its int32 wrap-around) for any
+// input: MUL/SSHR for mul1/mul2, SQXTN to int16 (saturating), SQADD with
+// the widened reference, SQXTUN to bytes; saturating at each step gives the
+// same result as Go's clip8 of the int32 sum.
 //
 // Registers: R0 ref, R1 in, R2 dst, R3 table, R4 pairs left, R5/R6 pair
-// pointers, R8 blocks left in the pair, R10/R11 row pointers, R7 = bps.
-// V28 20091, V29 35468, V30 4.
+// pointers, R7 = bps, R8 blocks left in the pair (int32 path), R9 max |in|,
+// R10/R11 row pointers. 16-bit path: V25 20091, V26 17734, V27 4.
+// int32 path: V28 20091, V29 35468, V30 4.
 TEXT ·iTransformPairsNEON(SB), NOSPLIT, $0-40
 	MOVD	ref+0(FP), R0
 	MOVD	in+8(FP), R1
@@ -337,10 +353,14 @@ TEXT ·iTransformPairsNEON(SB), NOSPLIT, $0-40
 	MOVD	$32, R7
 	MOVD	$20091, R5
 	VDUP	R5, V28.S4
+	VDUP	R5, V25.H8
 	MOVD	$35468, R5
 	VDUP	R5, V29.S4
+	MOVD	$17734, R5
+	VDUP	R5, V26.H8
 	MOVD	$4, R5
 	VDUP	R5, V30.S4
+	VDUP	R5, V27.H8
 	CBZ	R4, idone
 
 iloop:
@@ -349,6 +369,90 @@ iloop:
 	ADD	$4, R3
 	ADD	R0, R5, R5
 	ADD	R2, R6, R6
+
+	// max |in| over the pair (ABS(-32768) reads as 32768 unsigned)
+	VLD1	(R1), [V0.H8, V1.H8, V2.H8, V3.H8]
+	VABS	V0.H8, V4.H8
+	VABS	V1.H8, V5.H8
+	VABS	V2.H8, V6.H8
+	VABS	V3.H8, V7.H8
+	VUMAX	V5.H8, V4.H8, V4.H8
+	VUMAX	V7.H8, V6.H8, V6.H8
+	VUMAX	V6.H8, V4.H8, V4.H8
+	VUMAXV	V4.H8, V4
+	VMOV	V4.H[0], R9
+	CMP	$2047, R9
+	BHI	islow
+
+	// 16-bit path: rows [A row k | B row k]
+	ADD	$64, R1
+	VZIP1	V2.D2, V0.D2, V4.D2
+	VZIP2	V2.D2, V0.D2, V5.D2
+	VZIP1	V3.D2, V1.D2, V6.D2
+	VZIP2	V3.D2, V1.D2, V7.D2
+	// pass 1: V4..V7 -> V0..V3 (V5, V7 clobbered)
+	VADD	V6.H8, V4.H8, V8.H8   // a = in0 + in8
+	VSUB	V6.H8, V4.H8, V9.H8   // b = in0 - in8
+	SQDMULH8H(10, 5, 26)        // mul2(in4)
+	SQDMULH8H(12, 5, 25)
+	SSRA8H1(5, 12)              // mul1(in4)
+	SQDMULH8H(11, 7, 26)        // mul2(in12)
+	SQDMULH8H(13, 7, 25)
+	SSRA8H1(7, 13)              // mul1(in12)
+	VSUB	V7.H8, V10.H8, V12.H8 // c = mul2(in4) - mul1(in12)
+	VADD	V11.H8, V5.H8, V13.H8 // d = mul1(in4) + mul2(in12)
+	VADD	V13.H8, V8.H8, V0.H8  // a + d
+	VADD	V12.H8, V9.H8, V1.H8  // b + c
+	VSUB	V12.H8, V9.H8, V2.H8  // b - c
+	VSUB	V13.H8, V8.H8, V3.H8  // a - d
+	TRANSPOSE4x4H(V0, V1, V2, V3, V4, V5, V6, V7)
+
+	// pass 2: V0..V3 -> V4..V7 (V1, V3 clobbered)
+	VADD	V27.H8, V0.H8, V0.H8  // dc = c0 + 4
+	VADD	V2.H8, V0.H8, V8.H8
+	VSUB	V2.H8, V0.H8, V9.H8
+	SQDMULH8H(10, 1, 26)
+	SQDMULH8H(12, 1, 25)
+	SSRA8H1(1, 12)
+	SQDMULH8H(11, 3, 26)
+	SQDMULH8H(13, 3, 25)
+	SSRA8H1(3, 13)
+	VSUB	V3.H8, V10.H8, V12.H8
+	VADD	V11.H8, V1.H8, V13.H8
+	VADD	V13.H8, V8.H8, V4.H8
+	VADD	V12.H8, V9.H8, V5.H8
+	VSUB	V12.H8, V9.H8, V6.H8
+	VSUB	V13.H8, V8.H8, V7.H8
+	VSSHR	$3, V4.H8, V4.H8
+	VSSHR	$3, V5.H8, V5.H8
+	VSSHR	$3, V6.H8, V6.H8
+	VSSHR	$3, V7.H8, V7.H8
+	TRANSPOSE4x4H(V4, V5, V6, V7, V0, V1, V2, V3)
+	VLD1.P	(R5)(R7), [V0.B8]
+	VLD1.P	(R5)(R7), [V1.B8]
+	VLD1.P	(R5)(R7), [V2.B8]
+	VLD1	(R5), [V3.B8]
+	VUXTL	V0.B8, V0.H8
+	VUXTL	V1.B8, V1.H8
+	VUXTL	V2.B8, V2.H8
+	VUXTL	V3.B8, V3.H8
+	VSQADD	V0.H8, V4.H8, V4.H8
+	VSQADD	V1.H8, V5.H8, V5.H8
+	VSQADD	V2.H8, V6.H8, V6.H8
+	VSQADD	V3.H8, V7.H8, V7.H8
+	VSQXTUN	V4.H8, V0.B8
+	VSQXTUN	V5.H8, V1.B8
+	VSQXTUN	V6.H8, V2.B8
+	VSQXTUN	V7.H8, V3.B8
+	VST1.P	[V0.B8], (R6)(R7)
+	VST1.P	[V1.B8], (R6)(R7)
+	VST1.P	[V2.B8], (R6)(R7)
+	VST1	[V3.B8], (R6)
+	SUBS	$1, R4, R4
+	BNE	iloop
+	RET
+
+islow:
 	MOVD	$2, R8
 
 iblock:
