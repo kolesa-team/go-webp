@@ -744,3 +744,173 @@ uvnextplane:
 	SUB	$1, R11, R11
 	CBNZ	R11, uvplane
 	RET
+
+// --- macroblock edges and row cache ---------------------------------------------
+
+// ROT4(row, base, from) copies the 4 bytes at columns from..from+3 of row
+// (relative to base) to columns -4..-1.
+#define ROT4(row, base, from) \
+	MOVWU	(base+(row)*const_bps+(from))(R0), R4 \
+	MOVW	R4, (base+(row)*const_bps-4)(R0)
+
+// func loadEdgesNEON(b *[yuvSize]byte, top *topSamples, tr, flags uint32)
+//
+// Mirrors loadEdgesRef (same flags) with straight-line loads and stores at
+// constant offsets. Registers: R0 b, R1 top, R2 tr, R3 flags, R4-R7 data.
+TEXT ·loadEdgesNEON(SB), NOSPLIT, $0-24
+	MOVD	b+0(FP), R0
+	MOVD	top+8(FP), R1
+	MOVWU	tr+16(FP), R2
+	MOVWU	flags+20(FP), R3
+	TBZ	$0, R3, noRotate // edgeRotate
+	ROT4(-1, const_yOff, 12)
+	ROT4(0, const_yOff, 12)
+	ROT4(1, const_yOff, 12)
+	ROT4(2, const_yOff, 12)
+	ROT4(3, const_yOff, 12)
+	ROT4(4, const_yOff, 12)
+	ROT4(5, const_yOff, 12)
+	ROT4(6, const_yOff, 12)
+	ROT4(7, const_yOff, 12)
+	ROT4(8, const_yOff, 12)
+	ROT4(9, const_yOff, 12)
+	ROT4(10, const_yOff, 12)
+	ROT4(11, const_yOff, 12)
+	ROT4(12, const_yOff, 12)
+	ROT4(13, const_yOff, 12)
+	ROT4(14, const_yOff, 12)
+	ROT4(15, const_yOff, 12)
+	ROT4(-1, const_uOff, 4)
+	ROT4(0, const_uOff, 4)
+	ROT4(1, const_uOff, 4)
+	ROT4(2, const_uOff, 4)
+	ROT4(3, const_uOff, 4)
+	ROT4(4, const_uOff, 4)
+	ROT4(5, const_uOff, 4)
+	ROT4(6, const_uOff, 4)
+	ROT4(7, const_uOff, 4)
+	ROT4(-1, const_vOff, 4)
+	ROT4(0, const_vOff, 4)
+	ROT4(1, const_vOff, 4)
+	ROT4(2, const_vOff, 4)
+	ROT4(3, const_vOff, 4)
+	ROT4(4, const_vOff, 4)
+	ROT4(5, const_vOff, 4)
+	ROT4(6, const_vOff, 4)
+	ROT4(7, const_vOff, 4)
+
+noRotate:
+	TBZ	$1, R3, noTop // edgeTop
+	MOVD	(topSamples_y)(R1), R4
+	MOVD	(topSamples_y+8)(R1), R5
+	MOVD	(topSamples_u)(R1), R6
+	MOVD	(topSamples_v)(R1), R7
+	MOVD	R4, (const_yOff-const_bps)(R0)
+	MOVD	R5, (const_yOff-const_bps+8)(R0)
+	MOVD	R6, (const_uOff-const_bps)(R0)
+	MOVD	R7, (const_vOff-const_bps)(R0)
+
+noTop:
+	TBZ	$3, R3, done // edgeI4
+	TBZ	$2, R3, noTopRight // edgeTopRight
+	MOVW	R2, (const_yOff-const_bps+16)(R0)
+
+noTopRight:
+	MOVWU	(const_yOff-const_bps+16)(R0), R4
+	MOVW	R4, (const_yOff+3*const_bps+16)(R0)
+	MOVW	R4, (const_yOff+7*const_bps+16)(R0)
+	MOVW	R4, (const_yOff+11*const_bps+16)(R0)
+
+done:
+	RET
+
+// func storeMBRowsNEON(b *[yuvSize]byte, top *topSamples, cy, cu, cv *byte, ys, uvs int)
+//
+// Mirrors storeMBRowsRef; the Go wrapper has checked that cy has
+// 15*ys+16 bytes and cu, cv 7*uvs+8. Registers: R0 b, R1 top (may be nil),
+// R2 cy, R3 cu, R4 cv, R5 ys, R6 uvs, R7 source rows, R8 scratch.
+TEXT ·storeMBRowsNEON(SB), NOSPLIT, $0-56
+	MOVD	b+0(FP), R0
+	MOVD	top+8(FP), R1
+	MOVD	cy+16(FP), R2
+	MOVD	cu+24(FP), R3
+	MOVD	cv+32(FP), R4
+	MOVD	ys+40(FP), R5
+	MOVD	uvs+48(FP), R6
+	CBZ	R1, noStash
+	MOVD	(const_yOff+15*const_bps)(R0), R7
+	MOVD	(const_yOff+15*const_bps+8)(R0), R8
+	MOVD	R7, (topSamples_y)(R1)
+	MOVD	R8, (topSamples_y+8)(R1)
+	MOVD	(const_uOff+7*const_bps)(R0), R7
+	MOVD	R7, (topSamples_u)(R1)
+	MOVD	(const_vOff+7*const_bps)(R0), R7
+	MOVD	R7, (topSamples_v)(R1)
+
+noStash:
+	MOVD	$const_bps, R8
+	ADD	$const_yOff, R0, R7
+	VLD1.P	(R7)(R8), [V0.B16]
+	VLD1.P	(R7)(R8), [V1.B16]
+	VLD1.P	(R7)(R8), [V2.B16]
+	VLD1.P	(R7)(R8), [V3.B16]
+	VLD1.P	(R7)(R8), [V4.B16]
+	VLD1.P	(R7)(R8), [V5.B16]
+	VLD1.P	(R7)(R8), [V6.B16]
+	VLD1.P	(R7)(R8), [V7.B16]
+	VLD1.P	(R7)(R8), [V16.B16]
+	VLD1.P	(R7)(R8), [V17.B16]
+	VLD1.P	(R7)(R8), [V18.B16]
+	VLD1.P	(R7)(R8), [V19.B16]
+	VLD1.P	(R7)(R8), [V20.B16]
+	VLD1.P	(R7)(R8), [V21.B16]
+	VLD1.P	(R7)(R8), [V22.B16]
+	VLD1	(R7), [V23.B16]
+	VST1.P	[V0.B16], (R2)(R5)
+	VST1.P	[V1.B16], (R2)(R5)
+	VST1.P	[V2.B16], (R2)(R5)
+	VST1.P	[V3.B16], (R2)(R5)
+	VST1.P	[V4.B16], (R2)(R5)
+	VST1.P	[V5.B16], (R2)(R5)
+	VST1.P	[V6.B16], (R2)(R5)
+	VST1.P	[V7.B16], (R2)(R5)
+	VST1.P	[V16.B16], (R2)(R5)
+	VST1.P	[V17.B16], (R2)(R5)
+	VST1.P	[V18.B16], (R2)(R5)
+	VST1.P	[V19.B16], (R2)(R5)
+	VST1.P	[V20.B16], (R2)(R5)
+	VST1.P	[V21.B16], (R2)(R5)
+	VST1.P	[V22.B16], (R2)(R5)
+	VST1	[V23.B16], (R2)
+
+	// U and V rows 0-6 are the low halves of the 32 bytes at uOff + j*bps
+	// (vOff = uOff + 16): one load per row. Row 7 is loaded as two halves,
+	// as 32 bytes would run past the end of b.
+	ADD	$const_uOff, R0, R7
+	VLD1.P	const_bps(R7), [V0.B16, V1.B16]
+	VLD1.P	const_bps(R7), [V2.B16, V3.B16]
+	VLD1.P	const_bps(R7), [V4.B16, V5.B16]
+	VLD1.P	const_bps(R7), [V6.B16, V7.B16]
+	VLD1.P	const_bps(R7), [V16.B16, V17.B16]
+	VLD1.P	const_bps(R7), [V18.B16, V19.B16]
+	VLD1.P	const_bps(R7), [V20.B16, V21.B16]
+	MOVD	$(const_vOff-const_uOff), R8
+	VLD1.P	(R7)(R8), [V22.B8]
+	VLD1	(R7), [V23.B8]
+	VST1.P	[V0.B8], (R3)(R6)
+	VST1.P	[V2.B8], (R3)(R6)
+	VST1.P	[V4.B8], (R3)(R6)
+	VST1.P	[V6.B8], (R3)(R6)
+	VST1.P	[V16.B8], (R3)(R6)
+	VST1.P	[V18.B8], (R3)(R6)
+	VST1.P	[V20.B8], (R3)(R6)
+	VST1	[V22.B8], (R3)
+	VST1.P	[V1.B8], (R4)(R6)
+	VST1.P	[V3.B8], (R4)(R6)
+	VST1.P	[V5.B8], (R4)(R6)
+	VST1.P	[V7.B8], (R4)(R6)
+	VST1.P	[V17.B8], (R4)(R6)
+	VST1.P	[V19.B8], (R4)(R6)
+	VST1.P	[V21.B8], (R4)(R6)
+	VST1	[V23.B8], (R4)
+	RET

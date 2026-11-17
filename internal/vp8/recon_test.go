@@ -460,6 +460,38 @@ func BenchmarkRecon(b *testing.B) {
 	}
 }
 
+// BenchmarkReconGlue measures the per-macroblock edge setup and row cache
+// copy (kernel and reference) on a 1024-pixel wide cache.
+func BenchmarkReconGlue(b *testing.B) {
+	var buf [yuvSize]byte
+	var top topSamples
+	const ys, uvs = 1024, 512
+	cy, cu, cv := make([]byte, 16*ys), make([]byte, 8*uvs), make([]byte, 8*uvs)
+	flags := uint32(edgeRotate | edgeTop | edgeTopRight | edgeI4)
+	b.Run("load/kernel", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			loadEdges(&buf, &top, 0x01020304, flags)
+		}
+	})
+	b.Run("load/ref", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			loadEdgesRef(&buf, &top, 0x01020304, flags)
+		}
+	})
+	b.Run("store/kernel", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			o := i & 63 * 16
+			storeMBRows(&buf, &top, cy[o:], cu[o/2:], cv[o/2:], ys, uvs)
+		}
+	})
+	b.Run("store/ref", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			o := i & 63 * 16
+			storeMBRowsRef(&buf, &top, cy[o:], cu[o/2:], cv[o/2:], ys, uvs)
+		}
+	})
+}
+
 // FuzzRecon compares the reconstruction entry points with the reference on
 // arbitrary work buffers, coefficients, non-zero bits and modes. The input
 // bytes seed the buffers (repeated as needed); the first bytes pick the
@@ -488,6 +520,119 @@ func FuzzRecon(f *testing.F) {
 			c.coeffs[i] = int16(uint16(at(24+yuvSize+2*i)) | uint16(at(25+yuvSize+2*i))<<8)
 		}
 		if !checkI4(t, &c) || !checkI16(t, &c) || !checkUV(t, &c) {
+			t.FailNow()
+		}
+	})
+}
+
+// checkEdges compares loadEdges with loadEdgesRef.
+func checkEdges(t *testing.T, b *[yuvSize]byte, top *topSamples, tr, flags uint32) bool {
+	t.Helper()
+	got, want := *b, *b
+	top0 := *top
+	loadEdges(&got, top, tr, flags)
+	loadEdgesRef(&want, top, tr, flags)
+	if *top != top0 {
+		t.Errorf("loadEdges modified top")
+		return false
+	}
+	return diffBuffers(t, fmt.Sprintf("loadEdges flags=%#x tr=%#x", flags, tr), &got, &want)
+}
+
+// checkStoreRows compares storeMBRows with storeMBRowsRef on a cache of the
+// given geometry, with guard bytes around the cache rows.
+func checkStoreRows(t *testing.T, r *rand.Rand, b *[yuvSize]byte, withTop bool, ys, uvs int) bool {
+	t.Helper()
+	ny, nuv := max(15*ys+16, 0), max(7*uvs+8, 0)
+	mk := func(n int) []byte {
+		s := make([]byte, n+64)
+		for i := range s {
+			s[i] = byte(r.Uint32())
+		}
+		return s
+	}
+	cy, cu, cv := mk(ny), mk(nuv), mk(nuv)
+	cy2, cu2, cv2 := bytes.Clone(cy), bytes.Clone(cu), bytes.Clone(cv)
+	var top topSamples
+	for i := range top.y {
+		top.y[i] = byte(r.Uint32())
+	}
+	top2 := top
+	var tp, tp2 *topSamples
+	if withTop {
+		tp, tp2 = &top, &top2
+	}
+	b0 := *b
+	storeMBRows(b, tp, cy[32:32+ny], cu[32:32+nuv], cv[32:32+nuv], ys, uvs)
+	storeMBRowsRef(&b0, tp2, cy2[32:32+ny], cu2[32:32+nuv], cv2[32:32+nuv], ys, uvs)
+	if !bytes.Equal(cy, cy2) || !bytes.Equal(cu, cu2) || !bytes.Equal(cv, cv2) || top != top2 || *b != b0 {
+		t.Errorf("storeMBRows ys=%d uvs=%d top=%v differs from the reference", ys, uvs, withTop)
+		return false
+	}
+	return true
+}
+
+func TestReconEdgesAndStore(t *testing.T) {
+	r := rand.New(rand.NewPCG(9, 10))
+	var b [yuvSize]byte
+	var top topSamples
+	n := reconIters(t) / 10
+	for i := 0; i < n; i++ {
+		fillPixels(r, b[:])
+		fillPixels(r, top.y[:])
+		fillPixels(r, top.u[:])
+		fillPixels(r, top.v[:])
+		if !checkEdges(t, &b, &top, r.Uint32(), uint32(r.IntN(16))) {
+			t.Fatalf("iteration %d", i)
+		}
+		if i%8 == 0 {
+			ys, uvs := 16+r.IntN(200), 8+r.IntN(100)
+			if r.IntN(4) == 0 {
+				ys, uvs = 16, 8 // a single macroblock column
+			}
+			if !checkStoreRows(t, r, &b, r.IntN(2) == 0, ys, uvs) {
+				t.Fatalf("iteration %d", i)
+			}
+		}
+	}
+	// Geometries the kernel does not take go to the reference (which may
+	// panic on overlapping rows; only the absence of a crash or of a
+	// mismatch matters here).
+	for _, g := range [][2]int{{0, 0}, {1, 1}, {15, 7}} {
+		func() {
+			defer func() { _ = recover() }()
+			checkStoreRows(t, r, &b, true, g[0], g[1])
+		}()
+	}
+}
+
+// FuzzReconGlue compares loadEdges and storeMBRows with the reference on
+// arbitrary buffers, flags and cache geometries.
+func FuzzReconGlue(f *testing.F) {
+	f.Add([]byte{0})
+	f.Add([]byte{0x0f, 0x10, 0x08, 1, 2, 3, 4, 5, 6, 7, 8})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) < 3 {
+			return
+		}
+		at := func(i int) byte { return data[i%len(data)] }
+		var b [yuvSize]byte
+		var top topSamples
+		for i := range b {
+			b[i] = at(8 + i)
+		}
+		for i := range top.y {
+			top.y[i] = at(3 + 7*i)
+		}
+		for i := range top.u {
+			top.u[i], top.v[i] = at(5+3*i), at(6+5*i)
+		}
+		tr := uint32(at(3)) | uint32(at(4))<<8 | uint32(at(5))<<16 | uint32(at(6))<<24
+		if !checkEdges(t, &b, &top, tr, uint32(at(0))) {
+			t.FailNow()
+		}
+		r := rand.New(rand.NewPCG(uint64(at(1)), uint64(at(2))))
+		if !checkStoreRows(t, r, &b, at(0)&0x10 != 0, 16+int(at(1)), 8+int(at(2))) {
 			t.FailNow()
 		}
 	})

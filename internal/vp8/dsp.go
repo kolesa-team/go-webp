@@ -228,6 +228,66 @@ func reconUVRef(b *[yuvSize]byte, coeffs *[384]int16, bits uint32, mode int) {
 	doUVTransform(bits>>8, coeffs, 20*16, b[:], vOff)
 }
 
+// loadEdges flags.
+const (
+	edgeRotate   = 1 << iota // copy the right samples of the previous macroblock to the left
+	edgeTop                  // load the top samples
+	edgeTopRight             // store tr as the top-right samples (intra 4x4)
+	edgeI4                   // replicate the top-right samples below (intra 4x4)
+)
+
+// loadEdgesRef sets up the context samples of the next macroblock in the
+// work buffer (the first half of libwebp's ReconstructRow loop body): the
+// left column from the previous macroblock, the top row from top and the
+// four top-right samples tr (little endian), replicated on the rows above
+// sub-block rows 1-3 for intra 4x4.
+func loadEdgesRef(b *[yuvSize]byte, top *topSamples, tr, flags uint32) {
+	if flags&edgeRotate != 0 {
+		for j := -1; j < 16; j++ {
+			o := yOff + j*bps
+			*(*[4]byte)(b[o-4:]) = *(*[4]byte)(b[o+12:])
+		}
+		for j := -1; j < 8; j++ {
+			o := uOff + j*bps
+			*(*[4]byte)(b[o-4:]) = *(*[4]byte)(b[o+4:])
+			o = vOff + j*bps
+			*(*[4]byte)(b[o-4:]) = *(*[4]byte)(b[o+4:])
+		}
+	}
+	if flags&edgeTop != 0 {
+		*(*[16]byte)(b[yOff-bps:]) = top.y
+		*(*[8]byte)(b[uOff-bps:]) = top.u
+		*(*[8]byte)(b[vOff-bps:]) = top.v
+	}
+	if flags&edgeI4 != 0 {
+		const tro = yOff - bps + 16
+		if flags&edgeTopRight != 0 {
+			binary.LittleEndian.PutUint32(b[tro:], tr)
+		}
+		for k := 1; k <= 3; k++ {
+			*(*[4]byte)(b[tro+4*k*bps:]) = *(*[4]byte)(b[tro:])
+		}
+	}
+}
+
+// storeMBRowsRef saves the bottom samples of the reconstructed macroblock
+// in top (unless it is nil) and copies the macroblock into the row cache:
+// luma row j to cy[j*ys:], chroma row j to cu[j*uvs:] and cv[j*uvs:].
+func storeMBRowsRef(b *[yuvSize]byte, top *topSamples, cy, cu, cv []byte, ys, uvs int) {
+	if top != nil {
+		top.y = *(*[16]byte)(b[yOff+15*bps:])
+		top.u = *(*[8]byte)(b[uOff+7*bps:])
+		top.v = *(*[8]byte)(b[vOff+7*bps:])
+	}
+	for j := 0; j < 16; j++ {
+		*(*[16]byte)(cy[j*ys:]) = *(*[16]byte)(b[yOff+j*bps:])
+	}
+	for j := 0; j < 8; j++ {
+		*(*[8]byte)(cu[j*uvs:]) = *(*[8]byte)(b[uOff+j*bps:])
+		*(*[8]byte)(cv[j*uvs:]) = *(*[8]byte)(b[vOff+j*bps:])
+	}
+}
+
 // --- intra prediction -------------------------------------------------------
 
 func avg3(a, b, c int) uint8 { return uint8((a + 2*b + c + 2) >> 2) }

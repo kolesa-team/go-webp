@@ -21,6 +21,12 @@ func reconI16NEON(b *[yuvSize]byte, coeffs *[384]int16, bits uint32, mode int)
 //go:noescape
 func reconUVNEON(b *[yuvSize]byte, coeffs *[384]int16, codes uint32, mode int)
 
+//go:noescape
+func loadEdgesNEON(b *[yuvSize]byte, top *topSamples, tr, flags uint32)
+
+//go:noescape
+func storeMBRowsNEON(b *[yuvSize]byte, top *topSamples, cy, cu, cv *byte, ys, uvs int)
+
 func reconI4(b *[yuvSize]byte, coeffs *[384]int16, bits uint32, modes *[16]uint8) {
 	reconI4NEON(b, coeffs, bits, modes)
 }
@@ -31,6 +37,22 @@ func reconI16(b *[yuvSize]byte, coeffs *[384]int16, bits uint32, mode int) {
 
 func reconUV(b *[yuvSize]byte, coeffs *[384]int16, bits uint32, mode int) {
 	reconUVNEON(b, coeffs, uvCodes(bits&0xff, coeffs[16*16:])|uvCodes(bits>>8&0xff, coeffs[20*16:])<<8, mode)
+}
+
+func loadEdges(b *[yuvSize]byte, top *topSamples, tr, flags uint32) {
+	loadEdgesNEON(b, top, tr, flags)
+}
+
+// storeMBRows checks the cache geometry once and lets the kernel copy the
+// rows; anything unusual goes to the reference (which panics on a cache
+// that is too small).
+func storeMBRows(b *[yuvSize]byte, top *topSamples, cy, cu, cv []byte, ys, uvs int) {
+	if ys < 0 || uvs < 0 || ys > len(cy) || uvs > len(cu) ||
+		len(cy) < 15*ys+16 || len(cu) < 7*uvs+8 || len(cv) < 7*uvs+8 {
+		storeMBRowsRef(b, top, cy, cu, cv, ys, uvs)
+		return
+	}
+	storeMBRowsNEON(b, top, &cy[0], &cu[0], &cv[0], ys, uvs)
 }
 
 // uvCodes maps the non-zero bits of one chroma plane to the per-block
