@@ -2,6 +2,7 @@ package vp8enc
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/kolesa-team/go-webp/v2/internal/status"
 )
@@ -65,6 +66,10 @@ type encoder struct {
 	flat  [numProbaSlots]uint8
 
 	it iterator
+
+	// analysis pass row bands (analysis.go)
+	bands    [maxAnalysisBands]segmentJob
+	nextBand atomic.Int32
 }
 
 var encoderPool = sync.Pool{New: func() any { return new(encoder) }}
