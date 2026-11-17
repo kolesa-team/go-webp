@@ -6,6 +6,7 @@ package vp8l
 import (
 	"encoding/binary"
 
+	"github.com/kolesa-team/go-webp/v2/internal/resample"
 	"github.com/kolesa-team/go-webp/v2/internal/status"
 )
 
@@ -484,11 +485,23 @@ func (d *decoder) emitPalette(t *transform, src []uint32, dst []byte) {
 	}
 }
 
-// paletteRGBA returns the palette of t converted to RGBA words.
+// paletteRGBA returns the palette of t converted to RGBA words,
+// alpha-premultiplied with d.premulPal.
 func (d *decoder) paletteRGBA(t *transform) *[256]uint32 {
 	if !d.palReady {
 		for i, c := range t.data {
 			d.pal[i] = toRGBA(c)
+		}
+		if d.premulPal {
+			var b [4 * 256]byte
+			n := len(t.data)
+			for i, c := range d.pal[:n] {
+				binary.LittleEndian.PutUint32(b[4*i:], c)
+			}
+			resample.PremultiplyRGBA(b[:4*n])
+			for i := range d.pal[:n] {
+				d.pal[i] = binary.LittleEndian.Uint32(b[4*i:])
+			}
 		}
 		d.palReady = true
 	}

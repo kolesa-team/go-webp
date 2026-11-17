@@ -73,6 +73,7 @@ type decoder struct {
 	colorCache  *[1 << maxCacheBits]uint32
 	pal         [256]uint32 // RGBA palette for fused color-index output
 	palReady    bool
+	premulPal   bool   // pal is alpha-premultiplied (pipeline.PremultipliedSink)
 	bundle      []byte // RGBA bytes of the pixels of each bundled index byte
 	bundleReady bool
 
@@ -126,6 +127,7 @@ func getDecoder() *decoder {
 	d.use8b = false
 	d.inTail = false
 	d.palReady = false
+	d.premulPal = false
 	d.bundleReady = false
 	return d
 }
@@ -421,6 +423,15 @@ func (d *decoder) decodeLevel0(w, h int) error {
 		return nil
 	}
 	d.inPixels = true
+	// When the palette lookup is the last step, a sink that premultiplies
+	// its rows (scaling) can be fed premultiplied palette colors instead:
+	// premultiplying 256 palette entries once gives the same pixels as
+	// premultiplying every pixel.
+	if d.nTransforms > 0 && d.transforms[0].kind == colorIndexingTransform {
+		if ps, ok := d.sink.(pipeline.PremultipliedSink); ok && ps.AcceptPremultiplied() {
+			d.premulPal = true
+		}
+	}
 	d.initBuffer32()
 	return d.decodePixels(&d.md0, d.buf, d.xsize, h, true, d.sliding, d.window, &d.px)
 }
