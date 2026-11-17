@@ -45,6 +45,10 @@ type Params struct {
 	// (VP8L) frames. libwebp rescales lossy frames in the YUV domain with
 	// non-premultiplied alpha; leave Premultiply false for them.
 	Premultiply bool
+	// Dst, if not nil, lends its pixel memory to the output image (see
+	// newOutput): no allocation when cap(Dst.Pix) is large enough. Dst
+	// itself is never modified.
+	Dst *image.NRGBA
 }
 
 // SnapCropForYUV returns r with its top-left corner rounded down to even
@@ -108,6 +112,7 @@ func NewSink(p Params) (Sink, func() *image.NRGBA, error) {
 			flip:    p.Flip,
 			premult: p.Premultiply,
 		}
+		s.reuse = p.Dst
 		if err := s.rs.Init(cw, ch, w, h, 4, nil); err != nil {
 			return nil, nil, status.InvalidParam("invalid scaled dimensions")
 		}
@@ -118,7 +123,7 @@ func NewSink(p Params) (Sink, func() *image.NRGBA, error) {
 		return nil, nil, err
 	}
 	if !p.Flip && cw == p.SrcW && ch == p.SrcH {
-		d := &lazyDirect{w: cw, h: ch}
+		d := &lazyDirect{w: cw, h: ch, reuse: p.Dst}
 		return d, d.image, nil
 	}
 	s := &cropSink{
@@ -126,6 +131,7 @@ func NewSink(p Params) (Sink, func() *image.NRGBA, error) {
 		flip:      p.Flip,
 		fullWidth: cw == p.SrcW,
 	}
+	s.reuse = p.Dst
 	return s, s.image, nil
 }
 
@@ -155,13 +161,14 @@ func checkRescalerSize(w int) error {
 // allocates the (possibly huge) output frame. libwebp likewise validates the
 // frame headers before WebPAllocateDecBuffer.
 type lazyDirect struct {
-	img  *image.NRGBA
-	w, h int
+	img   *image.NRGBA
+	w, h  int
+	reuse *image.NRGBA // Params.Dst
 }
 
 func (d *lazyDirect) image() *image.NRGBA {
 	if d.img == nil {
-		d.img = image.NewNRGBA(image.Rect(0, 0, d.w, d.h))
+		d.img = newOutput(d.w, d.h, d.reuse)
 	}
 	return d.img
 }
@@ -196,6 +203,7 @@ type base struct {
 	// dst is the output image, allocated on first use (see lazyDirect).
 	dst        *image.NRGBA
 	dstW, dstH int
+	reuse      *image.NRGBA // Params.Dst
 }
 
 func newBase(srcW int, crop image.Rectangle, dstW, dstH int) base {
@@ -213,7 +221,7 @@ func newBase(srcW int, crop image.Rectangle, dstW, dstH int) base {
 // out returns the output image, allocating it on the first call.
 func (b *base) out() *image.NRGBA {
 	if b.dst == nil {
-		b.dst = image.NewNRGBA(image.Rect(0, 0, b.dstW, b.dstH))
+		b.dst = newOutput(b.dstW, b.dstH, b.reuse)
 	}
 	return b.dst
 }
