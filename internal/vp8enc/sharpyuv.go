@@ -206,10 +206,10 @@ func sharpRGBToYUV(pix []byte, stride, width, height int, pic *Picture) {
 	h := (height + 1) &^ 1
 	uvw := w >> 1
 	uvh := h >> 1
-	// Scratch from the pools: every element is written before it is read
-	// (the setup loop below covers all w*h luma and uvw*3*uvh chroma
-	// samples, the per-row buffers are filled before use).
-	// The planes are separate buffers so that each stays within the
+	// Scratch from the pools, not cleared: every element is written before
+	// it is read (the setup loop below covers all w*h luma and uvw*3*uvh
+	// chroma samples, the per-row buffers are filled before use). The
+	// planes are separate buffers so that each stays within the
 	// per-buffer share of the pool budget for large pictures.
 	rows := uint16Pool.Get(w*3*2 + w*2)
 	defer uint16Pool.Put(rows)
