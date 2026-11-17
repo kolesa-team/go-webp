@@ -132,6 +132,43 @@ func BenchmarkDecodeContext(b *testing.B) {
 	}
 }
 
+// TestDecodeContextAlphaHelper cancels lossy+alpha decodes while the alpha
+// helper works ahead (tiny bands, every helper budget): the outcome must be
+// the sequential one, and the helper must be gone when the call returns.
+func TestDecodeContextAlphaHelper(t *testing.T) {
+	const w, h = 97, 61
+	smallBands(t, 3, w)
+	files := alphaFiles(t, w, h)
+	g := runtime.NumGoroutine()
+	for name, data := range files {
+		for _, o := range []*Options{
+			{UseThreads: true},
+			{UseThreads: true, Crop: image.Rect(0, 10, w, 40), Flip: true},
+			{UseThreads: true, Scale: image.Rect(0, 0, 40, 30)},
+		} {
+			seq := *o
+			seq.UseThreads = false
+			want := decode(t, data, &seq)
+			for _, b := range budgets {
+				restore := b.set()
+				for _, n := range []int{1, 2, 3} {
+					dst := dirty(len(want.Pix))
+					before := *dst
+					img, err := newDec(t, data, o).DecodeIntoContext(newCountdown(n), dst)
+					assert.Nil(t, img)
+					checkAbort(t, err, context.Canceled, name)
+					assert.Equal(t, before, *dst, "%s %+v budget %s", name, o, b.name)
+				}
+				got, err := newDec(t, data, o).DecodeIntoContext(newCountdown(1<<30), dirty(len(want.Pix)))
+				restore()
+				require.NoError(t, err, "%s %+v budget %s", name, o, b.name)
+				require.Equal(t, want, got, "%s %+v budget %s", name, o, b.name)
+			}
+		}
+	}
+	waitGoroutines(t, g)
+}
+
 // TestDecodeContextStopsEarly checks that a cancelled decode does not run to
 // the end of the picture: the number of context checks is bounded by the
 // batches decoded before the cancellation.
