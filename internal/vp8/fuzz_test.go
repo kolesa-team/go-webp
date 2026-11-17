@@ -1,6 +1,8 @@
 package vp8
 
 import (
+	"fmt"
+	"hash/fnv"
 	"image"
 	"os"
 	"path/filepath"
@@ -8,12 +10,13 @@ import (
 )
 
 // discardSink accepts any rows into a reused buffer, so fuzzing huge declared
-// dimensions does not allocate a full frame.
+// dimensions does not allocate a full frame. It hashes the committed rows.
 type discardSink struct {
 	buf    []byte
 	stride int
 	height int
 	next   int
+	sum    uint64
 }
 
 func (s *discardSink) Buffer(y, n int) []byte {
@@ -28,6 +31,9 @@ func (s *discardSink) Buffer(y, n int) []byte {
 func (s *discardSink) Stride() int { return s.stride }
 func (s *discardSink) Commit(y, n int) error {
 	s.next = y + n
+	h := fnv.New64a()
+	h.Write(s.buf[:n*s.stride])
+	s.sum = s.sum*31 + h.Sum64()
 	return nil
 }
 func (s *discardSink) NeedRows() int { return s.height }
@@ -62,23 +68,36 @@ func FuzzDecode(f *testing.F) {
 		if mode&8 != 0 {
 			opts.DitheringStrength = 100
 		}
-		if opts.UseThreads {
-			// Small batches, so that small inputs use the helper too.
-			setBatch(t, 1+47*int(mode>>5&1))
-		}
-		if mode&16 != 0 {
-			r := image.Rect(w/3, h/3, w/3+w/2+1, h/3+h/2+1).Intersect(image.Rect(0, 0, w, h))
-			r.Min.X &^= 1
-			r.Min.Y &^= 1
-			s := &discardSink{stride: 4 * r.Dx(), height: r.Dy()}
-			if err := DecodeRegion(data, nil, opts, r, s); err == nil && s.next != r.Dy() {
-				t.Fatalf("region: success but only %d of %d rows", s.next, r.Dy())
+		run := func(opts *Options) string {
+			if mode&16 != 0 {
+				r := image.Rect(w/3, h/3, w/3+w/2+1, h/3+h/2+1).Intersect(image.Rect(0, 0, w, h))
+				r.Min.X &^= 1
+				r.Min.Y &^= 1
+				s := &discardSink{stride: 4 * r.Dx(), height: r.Dy()}
+				err := DecodeRegion(data, nil, opts, r, s)
+				if err == nil && s.next != r.Dy() {
+					t.Fatalf("region: success but only %d of %d rows", s.next, r.Dy())
+				}
+				return fmt.Sprint(s.next, s.sum, err)
 			}
-			return
+			s := &discardSink{stride: 4 * w, height: h}
+			err := Decode(data, nil, opts, s)
+			if err == nil && s.next != h {
+				t.Fatalf("success but only %d of %d rows", s.next, h)
+			}
+			return fmt.Sprint(s.next, s.sum, err)
 		}
-		s := &discardSink{stride: 4 * w, height: h}
-		if err := Decode(data, nil, opts, s); err == nil && s.next != h {
-			t.Fatalf("success but only %d of %d rows", s.next, h)
+		got := run(opts)
+		if opts.UseThreads {
+			// The threaded decoder must deliver the same rows and error as
+			// the sequential one, also with small batches, so that small
+			// inputs use the helper too.
+			setBatch(t, 1+47*int(mode>>5&1))
+			small := run(opts)
+			opts.UseThreads = false
+			if want := run(opts); got != want || small != want {
+				t.Fatalf("UseThreads: rows, hash, error %s (small batches %s), sequential %s", got, small, want)
+			}
 		}
 	})
 }
