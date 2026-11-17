@@ -206,13 +206,24 @@ func sharpRGBToYUV(pix []byte, stride, width, height int, pic *Picture) {
 	h := (height + 1) &^ 1
 	uvw := w >> 1
 	uvh := h >> 1
-	tmp := make([]uint16, w*3*2)
-	bestYBase := make([]uint16, w*h)
-	targetYBase := make([]uint16, w*h)
-	bestRGBY := make([]uint16, w*2)
-	bestUVBase := make([]int16, uvw*3*uvh)
-	targetUVBase := make([]int16, uvw*3*uvh)
-	bestRGBUV := make([]int16, uvw*3)
+	// Scratch from the pools, not cleared: every element is written before
+	// it is read (the setup loop below covers all w*h luma and uvw*3*uvh
+	// chroma samples, the per-row buffers are filled before use). The
+	// planes are separate buffers so that each stays within the
+	// per-buffer share of the pool budget for large pictures.
+	rows := uint16Pool.Get(w*3*2 + w*2)
+	defer uint16Pool.Put(rows)
+	tmp, bestRGBY := rows[:w*3*2:w*3*2], rows[w*3*2:]
+	bestYBase := uint16Pool.Get(w * h)
+	defer uint16Pool.Put(bestYBase)
+	targetYBase := uint16Pool.Get(w * h)
+	defer uint16Pool.Put(targetYBase)
+	bestUVBase := int16Pool.Get(uvw * 3 * uvh)
+	defer int16Pool.Put(bestUVBase)
+	targetUVBase := int16Pool.Get(uvw * 3 * uvh)
+	defer int16Pool.Put(targetUVBase)
+	bestRGBUV := int16Pool.Get(uvw * 3)
+	defer int16Pool.Put(bestRGBUV)
 	diffYThreshold := uint64(3.0 * float64(w) * float64(h))
 
 	src1 := tmp[0 : 3*w]
