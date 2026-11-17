@@ -167,6 +167,41 @@ func TestAlphaHelperLogo(t *testing.T) {
 	assert.Equal(t, 0, workers.InUse())
 }
 
+// TestAlphaHelperStopsAtCrop checks that the helper does not decode alpha
+// rows below the crop (no request goes there), and that a crop whose rows
+// hold too little alpha work does not start it at all.
+func TestAlphaHelperStopsAtCrop(t *testing.T) {
+	const w, h = 97, 61
+	data := alphaFiles(t, w, h)[fmt.Sprintf("%dx%d comp1 filter1", w, h)]
+	defer func(old int) { workers.SetLimitForTest(old) }(workers.SetLimitForTest(8))
+	steps := 0
+	testHookHelperStep = func() { steps++ }
+	defer func() { testHookHelperStep = nil }()
+
+	smallBands(t, 3, w) // steps of 2 rows
+	for _, o := range []*Options{
+		{UseThreads: true, Crop: image.Rect(0, 0, w, 20)},
+		{UseThreads: true, Crop: image.Rect(10, 4, 30, 16), Flip: true},
+		{UseThreads: true, Crop: image.Rect(0, 0, w, 20), Scale: image.Rect(0, 0, 50, 10)},
+	} {
+		steps = 0
+		seq := *o
+		seq.UseThreads = false
+		require.Equal(t, decodeOutcome(t, data, &seq), decodeOutcome(t, data, o), "%+v", o)
+		bottom := o.Crop.Min.Y&^1 + o.Crop.Max.Y
+		assert.Positive(t, steps, "%+v: helper not used", o)
+		assert.LessOrEqual(t, steps, (bottom+1)/2, "%+v: helper decoded rows below the crop", o)
+	}
+
+	// 97 x 20 alpha pixels to decode: below the threshold.
+	minHelperPixels = w*20 + 1
+	steps = 0
+	o := &Options{UseThreads: true, Crop: image.Rect(0, 0, w, 20)}
+	require.Equal(t, decodeOutcome(t, data, &Options{Crop: o.Crop}), decodeOutcome(t, data, o))
+	assert.Zero(t, steps, "helper started for a small crop")
+	assert.Equal(t, 0, workers.InUse())
+}
+
 // TestAlphaHelperErrors corrupts and truncates the ALPH (and VP8) data in
 // many places: the helper must report exactly the sequential errors (and
 // pixels), whatever the band in which the decoder fails.

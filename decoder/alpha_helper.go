@@ -63,7 +63,7 @@ type alphaHelper struct {
 	step  int // rows decoded and published at once
 	band  int // rows of work the sleeping helper waits for
 	ahead int // rows the helper may decode past the last request
-	limit int // the helper never decodes this row and the following ones
+	limit int // the helper never decodes this row and the following ones (the last row of the plane, or the crop bottom)
 
 	mu   sync.Mutex
 	cond sync.Cond
@@ -91,7 +91,8 @@ func (a *lazyAlpha) useHelper() bool {
 	if a.hdr.PreProcessing == alpha.PreprocessingLevels && a.dithering > 0 {
 		return false
 	}
-	return a.w*a.h >= minHelperPixels && a.h > 1
+	// Only the rows down to the bottom of the output region are decoded.
+	return a.w*a.crop.Max.Y >= minHelperPixels && a.h > 1
 }
 
 // startHelper starts the helper goroutine, if the worker budget allows;
@@ -99,7 +100,10 @@ func (a *lazyAlpha) useHelper() bool {
 func (a *lazyAlpha) startHelper() bool {
 	band := max((alphaBandPixels+a.w-1)/a.w, 1)
 	step := min(max((alphaStepPixels+a.w-1)/a.w, 1), band)
-	hp := &alphaHelper{step: step, band: band, ahead: 2 * band, limit: a.h - 1,
+	// No request goes past the bottom of the output region (crop), so the
+	// helper stops there instead of working ahead on rows nobody needs.
+	limit := min(a.h-1, a.crop.Max.Y)
+	hp := &alphaHelper{step: step, band: band, ahead: 2 * band, limit: limit,
 		// The VP8 decoder requests rows once per macroblock row.
 		reqs: make([]int, 0, a.h/16+4)}
 	hp.cond.L = &hp.mu
