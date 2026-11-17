@@ -70,6 +70,34 @@ func parallel(items, helpers int, body func(worker int, claim func() (int, bool)
 	finished = true
 }
 
+// intraHelpers is the largest number of helper goroutines one parallel stage
+// of an encode (hash chain stripes, predictor tiles, histogram remap) asks
+// for; the process-wide budget may grant fewer.
+const intraHelpers = 7
+
+// minParallelPixels is the smallest image (in pixels) whose stages are run
+// in parallel: below it, the hand-off costs more than it saves. (A variable
+// for the tests.)
+var minParallelPixels = 1 << 18
+
+// stageHelpers returns the number of helpers for a parallel stage of an
+// image of n pixels.
+func (p *params) stageHelpers(n int) int {
+	if !p.parallel || n < minParallelPixels {
+		return 0
+	}
+	return intraHelpers
+}
+
+// remapHelpers returns the number of helpers of the histogram remap (gated
+// on its amount of work instead of the image size).
+func (p *params) remapHelpers() int {
+	if !p.parallel {
+		return 0
+	}
+	return intraHelpers
+}
+
 // configHelpers is the number of helper goroutines (besides the caller)
 // that encode candidate configurations concurrently. Each encoding
 // configuration holds a full working set (15-100 bytes per pixel), so, like

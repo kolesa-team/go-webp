@@ -278,8 +278,11 @@ func predictionCostSpatialHistogram(acc, tile *histo4, ae *[4]accEntropy) float6
 //
 // clean enables libwebp's exact=0 handling of fully transparent pixels
 // (ignored with lowEffort, as in libwebp).
+//
+// With helpers > 0, the single-sampling mode search (minBits == maxBits)
+// is spread over helper goroutines (see predSearch.runPar).
 func predictorImage(width, height, minBits, maxBits int, lowEffort bool, maxQuant int, usedSubGreen, clean bool,
-	argb []uint32, modes []uint32, sc *scratch) int {
+	argb []uint32, modes []uint32, sc *scratch, helpers int) int {
 	n := width * height
 	var md []uint8
 	nl := maxQuant > 1 && !lowEffort && height >= 3 && width >= 3
@@ -302,7 +305,11 @@ func predictorImage(width, height, minBits, maxBits int, lowEffort bool, maxQuan
 	} else {
 		ps := predSearch{width: width, height: height, minBits: minBits, maxBits: maxBits,
 			maxQuant: maxQuant, md: md, usedSubGreen: usedSubGreen, clean: clean, slow: slow, argb: argb, sc: sc}
-		bits = ps.run(modes)
+		if helpers > 0 && minBits == maxBits {
+			bits = ps.runPar(modes, helpers)
+		} else {
+			bits = ps.run(modes)
+		}
 	}
 	// Replace the image by residuals, row by row, keeping the original (or,
 	// with near-lossless, reconstructed) previous row.
@@ -369,6 +376,29 @@ type predSearch struct {
 	predHisto [(maxTransformBits - minTransformBits + 1) * numPredModes]int32
 }
 
+// setup prepares the mode images and the accumulated histograms of every
+// sampling level.
+func (ps *predSearch) setup() {
+	width, height, minBits := ps.width, ps.height, ps.minBits
+	levels := ps.maxBits - minBits + 1
+	total := 0
+	for l := 0; l < levels; l++ {
+		total += subSampleSize(width, minBits+l) * subSampleSize(height, minBits+l)
+	}
+	all := ps.sc.predModeBuf(total)
+	if cap(ps.levelMode) < levels {
+		ps.levelMode = make([][]uint32, levels)
+	}
+	ps.levelMode = ps.levelMode[:levels]
+	off := 0
+	for l := 0; l < levels; l++ {
+		sz := subSampleSize(width, minBits+l) * subSampleSize(height, minBits+l)
+		ps.levelMode[l] = all[off : off+sz]
+		off += sz
+	}
+	ps.acc = ps.sc.predAcc(levels)
+}
+
 func (ps *predSearch) run(modes []uint32) int {
 	width, height := ps.width, ps.height
 	minBits := ps.minBits
@@ -381,27 +411,12 @@ func (ps *predSearch) run(modes []uint32) int {
 	// histograms of the finished smaller ones.
 	updateUpTo := max(min(4, ps.maxBits), minBits) - minBits
 	levels := maxSub + 1
-
-	total := 0
-	for l := 0; l < levels; l++ {
-		total += subSampleSize(width, minBits+l) * subSampleSize(height, minBits+l)
-	}
-	all := sc.predModeBuf(total)
-	if cap(ps.levelMode) < levels {
-		ps.levelMode = make([][]uint32, levels)
-	}
-	ps.levelMode = ps.levelMode[:levels]
-	off := 0
-	for l := 0; l < levels; l++ {
-		sz := subSampleSize(width, minBits+l) * subSampleSize(height, minBits+l)
-		ps.levelMode[l] = all[off : off+sz]
-		off += sz
-	}
+	ps.setup()
 	ps.hist = sc.predHistos(levels * numPredModes)
-	ps.acc = sc.predAcc(levels)
 
 	tile := 1 << uint(minBits)
 	resid := sc.residBuf(tile * tile)
+	rowCur, rowUp := sc.rowA(width+1), sc.rowB(width+1)
 	maxTileSize := 1 << uint(maxSub) // in tiles
 	var localX, localY, maxTileX, maxTileY, tileX, tileY int
 	for tileY < tilesPerCol {
@@ -411,7 +426,7 @@ func (ps *predSearch) run(modes []uint32) int {
 		maxY := min(tile, height-sy)
 		for mode := 0; mode < numPredModes; mode++ {
 			r := resid[:maxX*maxY]
-			ps.tileResiduals(mode, sx, sy, maxX, maxY, r)
+			ps.tileResiduals(mode, sx, sy, maxX, maxY, r, rowCur, rowUp)
 			for l := 0; l <= updateUpTo; l++ {
 				h := &ps.hist[l*numPredModes+mode]
 				for _, p := range r {
@@ -470,9 +485,15 @@ func (ps *predSearch) run(modes []uint32) int {
 		tileX = maxTileX*maxTileSize + localX
 		tileY = maxTileY*maxTileSize + localY
 	}
+	return ps.finish(modes)
+}
 
-	// Pick the sampling with the lowest cost: entropy of the mode image
-	// plus entropy of the residuals.
+// finish picks the sampling with the lowest cost (entropy of the mode image
+// plus entropy of the residuals), copies its mode image into modes and
+// returns its (optimized) bits.
+func (ps *predSearch) finish(modes []uint32) int {
+	width, height, minBits := ps.width, ps.height, ps.minBits
+	levels := ps.maxBits - minBits + 1
 	bestCost := math.Inf(1)
 	best := 0
 	for l := 0; l < levels; l++ {
@@ -488,6 +509,82 @@ func (ps *predSearch) run(modes []uint32) int {
 	bits := minBits + best
 	copy(modes, ps.levelMode[best])
 	return optimizeSampling(modes, width, height, bits, maxTransformBits)
+}
+
+// predWorker holds the working buffers of one goroutine of runPar.
+type predWorker struct {
+	resid, rowCur, rowUp []uint32
+}
+
+// runPar is run for a single sampling (minBits == maxBits), with the
+// residual histograms of the tiles (for every mode) computed by the caller
+// and up to helpers helper goroutines, a batch of tiles at a time, while
+// the caller chooses the modes of the previous batch in raster order (the
+// choice of a tile depends on the choices before it). The histograms are
+// pure functions of the tiles, so the modes are those of run.
+func (ps *predSearch) runPar(modes []uint32, helpers int) int {
+	width, height, bits := ps.width, ps.height, ps.minBits
+	sc := ps.sc
+	tilesX := subSampleSize(width, bits)
+	nt := tilesX * subSampleSize(height, bits)
+	ps.setup()
+	tile := 1 << uint(bits)
+	// Batches of about 32K pixels (at least 16 tiles), double-buffered:
+	// their histograms take 56 KB per tile.
+	batch := min(max(32768/(tile*tile), 16), 64)
+	nb := (nt + batch - 1) / batch
+	bufs := sc.predBatchBufs(2 * batch * numPredModes)
+	work := sc.predWorkers(helpers+1, tile*tile, width+1)
+	compute := func(b, worker int, claim func() (int, bool)) {
+		w := &work[worker]
+		buf := bufs[(b&1)*batch*numPredModes:]
+		for {
+			k, ok := claim()
+			if !ok {
+				return
+			}
+			t := b*batch + k
+			sx, sy := (t%tilesX)<<uint(bits), (t/tilesX)<<uint(bits)
+			maxX, maxY := min(tile, width-sx), min(tile, height-sy)
+			hs := buf[k*numPredModes : (k+1)*numPredModes]
+			clear(hs)
+			r := w.resid[:maxX*maxY]
+			for mode := range hs {
+				ps.tileResiduals(mode, sx, sy, maxX, maxY, r, w.rowCur, w.rowUp)
+				h := &hs[mode]
+				for _, p := range r {
+					h.add(p)
+				}
+			}
+		}
+	}
+	consume := func(b int) {
+		buf := bufs[(b&1)*batch*numPredModes:]
+		for t := b * batch; t < min((b+1)*batch, nt); t++ {
+			k := t - b*batch
+			ps.hist = buf[k*numPredModes : (k+1)*numPredModes]
+			ps.bestForTile(0, t%tilesX, t/tilesX, tilesX)
+		}
+	}
+	batchTiles := func(b int) int { return min(batch, nt-b*batch) }
+	parallel(batchTiles(0), helpers, func(worker int, claim func() (int, bool)) {
+		compute(0, worker, claim)
+	})
+	for b := 0; b < nb; b++ {
+		if b+1 == nb {
+			consume(b)
+			break
+		}
+		// The caller chooses the modes of batch b while the helpers
+		// compute batch b+1 (into the other buffer), then joins them.
+		parallel(batchTiles(b+1), helpers, func(worker int, claim func() (int, bool)) {
+			if worker == 0 {
+				consume(b)
+			}
+			compute(b+1, worker, claim)
+		})
+	}
+	return ps.finish(modes)
 }
 
 // bestForTile chooses the mode of the (super-)tile (tx, ty) at level sub
@@ -550,8 +647,9 @@ func shannonEntropy(x []int32) float64 {
 	return r + slog2(sum)
 }
 
-// tileResiduals computes into out the residuals of one tile for mode.
-func (ps *predSearch) tileResiduals(mode, sx, sy, maxX, maxY int, out []uint32) {
+// tileResiduals computes into out the residuals of one tile for mode. cur
+// and up (width+1 entries each) are working rows (for the slow path).
+func (ps *predSearch) tileResiduals(mode, sx, sy, maxX, maxY int, out, cur, up []uint32) {
 	width := ps.width
 	argb := ps.argb
 	if !ps.slow {
@@ -568,8 +666,6 @@ func (ps *predSearch) tileResiduals(mode, sx, sy, maxX, maxY int, out []uint32) 
 	}
 	// Row copies, so that predictions use the reconstructed (near-lossless)
 	// or cleaned (transparent) pixels.
-	cur := ps.sc.rowA(width + 1)
-	up := ps.sc.rowB(width + 1)
 	lo := sx
 	if lo > 0 {
 		lo--

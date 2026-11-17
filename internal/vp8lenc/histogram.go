@@ -345,10 +345,15 @@ func (c *clusterer) remove(i int) {
 	c.size--
 }
 
+// minParallelRemap is the smallest remap (tiles times clusters) spread over
+// helper goroutines (a variable for the tests).
+var minParallelRemap = 1 << 12
+
 // buildHistoImage computes the clustered histograms for refs. It returns the
 // final histograms (in out) and fills c.symbols with the tile->histogram map.
+// helpers > 0 allows a parallel remap.
 func (c *clusterer) buildHistoImage(xsize, ysize int, refs []pixOrCopy, quality int,
-	lowEffort bool, histoBits, cacheBits int, out *histoSet) int {
+	lowEffort bool, histoBits, cacheBits int, out *histoSet, helpers int) int {
 	hx := subSampleSize(xsize, histoBits)
 	hy := subSampleSize(ysize, histoBits)
 	nt := hx * hy
@@ -423,7 +428,7 @@ func (c *clusterer) buildHistoImage(xsize, ysize int, refs []pixOrCopy, quality 
 			c.greedyCombine(out)
 		}
 	}
-	c.remap(out)
+	c.remap(out, helpers)
 	return len(out.h)
 }
 
@@ -619,15 +624,51 @@ func (c *clusterer) greedyCombine(s *histoSet) {
 	}
 }
 
+// remapChunk is the number of tiles per work item of a parallel remap.
+const remapChunk = 32
+
 // remap assigns each tile histogram to the best final cluster (libwebp
 // HistogramRemap), renumbers the clusters by first use (dropping the
-// unused ones) and recomputes the final histograms into out.
-func (c *clusterer) remap(out *histoSet) {
+// unused ones) and recomputes the final histograms into out. With helpers
+// > 0 and enough work, the assignments (independent per tile) are spread
+// over helper goroutines.
+func (c *clusterer) remap(out *histoSet, helpers int) {
 	set := c.set[:c.size]
 	syms := c.symbols
 	orig := c.orig.h
 	if len(set) > 1 {
-		var costs [5]float64
+		assign := func(lo, hi int) {
+			var costs [5]float64
+			for i := lo; i < hi; i++ {
+				if !orig[i].used {
+					continue
+				}
+				best := 0
+				bestBits := math.MaxFloat64
+				for k, h := range set {
+					cmb, ok := out.combinedCost(h, &orig[i], h.bitCost+bestBits, &costs)
+					if ok {
+						bestBits = cmb - h.bitCost
+						best = k
+					}
+				}
+				syms[i] = uint16(best)
+			}
+		}
+		if chunks := (len(orig) + remapChunk - 1) / remapChunk; helpers > 0 && chunks > 1 && len(orig)*len(set) >= minParallelRemap {
+			parallel(chunks, helpers, func(_ int, claim func() (int, bool)) {
+				for {
+					k, ok := claim()
+					if !ok {
+						return
+					}
+					assign(k*remapChunk, min((k+1)*remapChunk, len(orig)))
+				}
+			})
+		} else {
+			assign(0, len(orig))
+		}
+		// Unused tiles take the cluster of the previous tile.
 		for i := range orig {
 			if !orig[i].used {
 				if i > 0 {
@@ -635,18 +676,7 @@ func (c *clusterer) remap(out *histoSet) {
 				} else {
 					syms[i] = 0
 				}
-				continue
 			}
-			best := 0
-			bestBits := math.MaxFloat64
-			for k, h := range set {
-				cmb, ok := out.combinedCost(h, &orig[i], h.bitCost+bestBits, &costs)
-				if ok {
-					bestBits = cmb - h.bitCost
-					best = k
-				}
-			}
-			syms[i] = uint16(best)
 		}
 	} else {
 		clear(syms)
