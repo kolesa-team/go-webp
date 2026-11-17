@@ -1,5 +1,7 @@
 package vp8enc
 
+import "encoding/binary"
+
 // DSP primitives: transforms, intra predictors, distortion metrics and
 // quantization. All blocks live in 32-byte-stride work buffers.
 // Algorithm adapted from libwebp (BSD-3-Clause).
@@ -231,11 +233,16 @@ func iTransform(ref []byte, in *[16]int16, dst []byte) {
 //------------------------------------------------------------------------------
 // Intra predictions
 
+// splat8 returns v in each byte of a uint64.
+func splat8(v byte) uint64 { return uint64(v) * 0x0101010101010101 }
+
+// fill sets a size x size block (size 8 or 16) to v, 8 bytes per store.
 func fill(dst []byte, v byte, size int) {
+	w := splat8(v)
 	for j := 0; j < size; j++ {
 		row := dst[j*bps : j*bps+size]
-		for i := range row {
-			row[i] = v
+		for i := 0; i < len(row); i += 8 {
+			binary.LittleEndian.PutUint64(row[i:], w)
 		}
 	}
 }
@@ -250,7 +257,8 @@ func verticalPred(dst []byte, top []byte, size int) {
 	}
 }
 
-// left[0] is the top-left sample, left[1..size] the left column.
+// left[0] is the top-left sample, left[1..size] the left column (size 8
+// or 16).
 func horizontalPred(dst []byte, left []byte, size int) {
 	if left == nil {
 		fill(dst, 129, size)
@@ -258,9 +266,9 @@ func horizontalPred(dst []byte, left []byte, size int) {
 	}
 	for j := 0; j < size; j++ {
 		row := dst[j*bps : j*bps+size]
-		v := left[1+j]
-		for i := range row {
-			row[i] = v
+		w := splat8(left[1+j])
+		for i := 0; i < len(row); i += 8 {
+			binary.LittleEndian.PutUint64(row[i:], w)
 		}
 	}
 }
@@ -315,17 +323,18 @@ func dcMode(dst []byte, left, top []byte, size int, round int, shift uint) {
 	fill(dst, byte(dc), size)
 }
 
-// predLuma16 computes the 4 intra16 predictions into p.
-func predLuma16(p []byte, left, top []byte) {
+// predLuma16Ref computes the 4 intra16 predictions into p (nil left or top:
+// not available).
+func predLuma16Ref(p []byte, left, top []byte) {
 	dcMode(p[i16DC16:], left, top, 16, 16, 5)
 	verticalPred(p[i16VE16:], top, 16)
 	horizontalPred(p[i16HE16:], left, 16)
 	trueMotion(p[i16TM16:], left, top, 16)
 }
 
-// predChroma8 computes the 4 chroma predictions (U and V side by side).
+// predChroma8Ref computes the 4 chroma predictions (U and V side by side).
 // uvTop holds 8 U then 8 V samples.
-func predChroma8(p []byte, uLeft, vLeft, uvTop []byte) {
+func predChroma8Ref(p []byte, uLeft, vLeft, uvTop []byte) {
 	var top []byte
 	if uvTop != nil {
 		top = uvTop[0:8]
@@ -351,11 +360,11 @@ func put4(dst []byte, a, b, c, d byte) {
 	dst[0], dst[1], dst[2], dst[3] = a, b, c, d
 }
 
-// predLuma4 computes the 10 intra4 predictions. 'b' is the boundary array
+// predLuma4Ref computes the 10 intra4 predictions. 'b' is the boundary array
 // and 't' the index of the top sample: left samples are b[t-5..t-2]
 // (bottom to top), top-left is b[t-1], top is b[t..t+3] and top-right is
 // b[t+4..t+7].
-func predLuma4(p []byte, b []byte, t int) {
+func predLuma4Ref(p []byte, b []byte, t int) {
 	s := b[t-5 : t+8]
 	_ = s[12]
 	L := uint32(s[0])
@@ -532,7 +541,7 @@ func sseRow4(a, b []byte) int {
 	return d0*d0 + d1*d1 + d2*d2 + d3*d3
 }
 
-func sse16x16(a, b []byte) int {
+func sse16x16Ref(a, b []byte) int {
 	s := 0
 	for y := 0; y < 16; y++ {
 		s += sseRow16(a[y*bps:], b[y*bps:])
@@ -540,7 +549,7 @@ func sse16x16(a, b []byte) int {
 	return s
 }
 
-func sse16x8(a, b []byte) int {
+func sse16x8Ref(a, b []byte) int {
 	s := 0
 	for y := 0; y < 8; y++ {
 		s += sseRow16(a[y*bps:], b[y*bps:])
@@ -607,6 +616,30 @@ type matrix struct {
 	bias    [16]uint32 // rounding bias
 	zthresh [16]uint32 // value below which a coefficient is zeroed
 	sharpen [16]uint32 // frequency boosters for slight sharpening
+
+	// 16-bit copies of q, iq and sharpen for the vector quantizer, valid
+	// when vecOK is set (see prepareVec).
+	q16, iq16, sharpen16 [16]uint16
+	vecOK                bool
+}
+
+// prepareVec fills the 16-bit copies of the quantizer parameters. A vector
+// quantizer working on 16-bit lanes (|coeff| <= 32768, then
+// coeff+sharpen and (coeff+sharpen)*iq computed exactly in 16 and 32 bits)
+// matches quantizeBlock bit for bit when iq < 2^16 and sharpen < 2^15; only
+// the low 16 bits of q matter, since the dequantized value is truncated to
+// int16. The encoder's quantizers (q >= 4, so iq <= 32768, and sharpen <=
+// 12) always qualify; vecOK records it for any other matrix.
+func (m *matrix) prepareVec() {
+	m.vecOK = true
+	for i := range m.q {
+		m.q16[i] = uint16(m.q[i])
+		m.iq16[i] = uint16(m.iq[i])
+		m.sharpen16[i] = uint16(m.sharpen[i])
+		if m.iq[i] > 0xffff || m.sharpen[i] > 0x7fff {
+			m.vecOK = false
+		}
+	}
 }
 
 // kInvZigzag maps a natural-order coefficient index to its zigzag position.
@@ -628,22 +661,6 @@ func quantizeBlock(in *[16]int16, out *[16]int16, m *matrix) bool {
 		nz |= level
 	}
 	return nz != 0
-}
-
-// isFlat returns true if the number of non-zero AC levels is <= thresh.
-func isFlat(levels []([16]int16), thresh int) bool {
-	score := 0
-	for b := range levels {
-		l := &levels[b]
-		for i := 1; i < 16; i++ {
-			v := uint16(l[i])
-			score += int((v | -v) >> 15)
-		}
-		if score > thresh {
-			return false
-		}
-	}
-	return true
 }
 
 func isFlatSource16(src []byte) bool {
@@ -677,12 +694,75 @@ func copy16x8(src, dst []byte) {
 const maxCoeffThresh = 31
 
 // collectHistogram returns the (maxValue, lastNonZero) of the histogram of
-// DCT coefficients of ref-pred over the given blocks.
-func collectHistogram(ref, pred []byte, scan []int) (int, int) {
+// DCT coefficients of ref-pred over the blocks of t (tabY16 or tabUV).
+func collectHistogram(ref, pred []byte, t *pairTable) (int, int) {
+	var coeffs [16][16]int16
+	n := 2 * t.n
+	fTransformPairs(ref, pred, t, coeffs[:n])
+	if vecKernels {
+		// When more than half of the coefficients fall in bin 0, no other
+		// bin can have more: the histogram reduces to two vector
+		// reductions (the common case).
+		count0, maxBin := zeroBinStats(coeffs[:n])
+		if 2*count0 > 16*n {
+			return count0, maxBin
+		}
+	}
+	return histogramStats(coeffs[:n])
+}
+
+// zeroBinStatsRef returns the number of coefficients in histogram bin 0
+// and the largest bin (coeffBin).
+func zeroBinStatsRef(coeffs [][16]int16) (int, int) {
+	count0, maxBin := 0, 0
+	for b := range coeffs {
+		for _, v := range coeffs[b] {
+			bin := coeffBin(v)
+			count0 += b2i(bin == 0)
+			maxBin = max(maxBin, bin)
+		}
+	}
+	return count0, maxBin
+}
+
+// coeffBin is the histogram bin of a DCT coefficient: min(|v| >> 3, 31).
+func coeffBin(v int16) int {
+	a := int32(v)
+	s := a >> 31
+	return int(min((a^s-s)>>3, maxCoeffThresh)) & maxCoeffThresh
+}
+
+// histogramStats returns the largest bin count and the last non-empty bin
+// of the histogram of coeffBin over the coefficients (at most 4096 of
+// them). Most coefficients fall in bin 0, so the counting uses four
+// interleaved sub-histograms: the increments do not form one serial chain
+// through memory.
+func histogramStats(coeffs [][16]int16) (int, int) {
+	var dist [4][maxCoeffThresh + 1]uint16
+	for b := range coeffs {
+		c := &coeffs[b]
+		for k := 0; k < 16; k += 4 {
+			dist[0][coeffBin(c[k])]++
+			dist[1][coeffBin(c[k+1])]++
+			dist[2][coeffBin(c[k+2])]++
+			dist[3][coeffBin(c[k+3])]++
+		}
+	}
+	maxValue, lastNonZero := 0, 1
+	for k := 0; k <= maxCoeffThresh; k++ {
+		value := int(dist[0][k]) + int(dist[1][k]) + int(dist[2][k]) + int(dist[3][k])
+		if value > 0 {
+			maxValue = max(maxValue, value)
+			lastNonZero = k
+		}
+	}
+	return maxValue, lastNonZero
+}
+
+// histogramStatsRef is the straightforward version of histogramStats.
+func histogramStatsRef(coeffs [][16]int16) (int, int) {
 	var distribution [maxCoeffThresh + 1]int
-	var out [16]int16
-	for _, off := range scan {
-		fTransform(ref[off:], pred[off:], &out)
+	for _, out := range coeffs {
 		for k := 0; k < 16; k++ {
 			v := int32(out[k])
 			s := v >> 31
