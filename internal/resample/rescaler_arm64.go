@@ -363,6 +363,18 @@ func exportShrinkZero(dst []byte, irow []uint32, fxy uint32) {
 	exportShrinkZeroGo(dst, irow, fxy)
 }
 
-func premultiplyRow(row []byte) { multRGBA(row, &premulScale) }
+// premultiplyNEON is PremultiplyRGBA on n bytes, n > 0 and a multiple of
+// 16.
+//
+//go:noescape
+func premultiplyNEON(row *byte, n int)
+
+func premultiplyRow(row []byte) {
+	if n := len(row) &^ 15; n > 0 {
+		premultiplyNEON(&row[0], n)
+		row = row[n:]
+	}
+	multRGBA(row, &premulScale)
+}
 
 func unpremultiplyRow(row []byte) { multRGBA(row, &unpremulScale) }
