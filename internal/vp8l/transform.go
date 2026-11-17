@@ -70,39 +70,6 @@ func absDiff(a, b uint32) int32 {
 	return (d ^ m) - m
 }
 
-// clip255 clamps a to [0, 255].
-func clip255(a int32) uint32 {
-	if uint32(a) < 256 {
-		return uint32(a)
-	}
-	if a < 0 {
-		return 0
-	}
-	return 255
-}
-
-// clampAddSubFull implements predictor 12: per channel clip(a + b - c).
-func clampAddSubFull(a, b, c uint32) uint32 {
-	return clip255(int32(a>>24)+int32(b>>24)-int32(c>>24))<<24 |
-		clip255(int32(a>>16&0xff)+int32(b>>16&0xff)-int32(c>>16&0xff))<<16 |
-		clip255(int32(a>>8&0xff)+int32(b>>8&0xff)-int32(c>>8&0xff))<<8 |
-		clip255(int32(a&0xff)+int32(b&0xff)-int32(c&0xff))
-}
-
-func addSubHalf(a, b int32) uint32 {
-	return clip255(a + (a-b)/2)
-}
-
-// clampAddSubHalf implements predictor 13: per channel
-// clip(avg + (avg - tl) / 2) with avg = average2(l, t).
-func clampAddSubHalf(l, t, tl uint32) uint32 {
-	a := average2(l, t)
-	return addSubHalf(int32(a>>24), int32(tl>>24))<<24 |
-		addSubHalf(int32(a>>16&0xff), int32(tl>>16&0xff))<<16 |
-		addSubHalf(int32(a>>8&0xff), int32(tl>>8&0xff))<<8 |
-		addSubHalf(int32(a&0xff), int32(tl&0xff))
-}
-
 // predictLeft is predictor mode 1 (L) over in[x0:x1]: a running sum of the
 // residuals. Per-channel addition modulo 256 is associative, so 4 pixels at
 // a time are summed among themselves first, off the critical path, and the
@@ -130,6 +97,50 @@ func predictLeft(in, out []uint32, x0, x1 int) {
 	for ; x < x1; x++ {
 		l = addPixels(in[x], l)
 		out[x] = l
+	}
+}
+
+// clampByte clamps a to [0, 255] without branches.
+func clampByte(a int32) int32 { return min(max(a, 0), 255) }
+
+// predictAddSubFull is predictor mode 12 (ClampedAddSubtractFull) over
+// in[x0:x1]. The left pixel is kept as four channel values, so that the
+// serial dependency per pixel is one add, clamp, add and mask per channel,
+// with the channels in parallel; everything from the top row is computed
+// off that path. in may alias out.
+func predictAddSubFull(in, out, up []uint32, x0, x1 int) {
+	in, out, up = in[:x1], out[:x1], up[:x1]
+	l := out[x0-1]
+	la, lr, lg, lb := int32(l>>24), int32(l>>16&0xff), int32(l>>8&0xff), int32(l&0xff)
+	for x := x0; x < x1; x++ {
+		t, tl, c := up[x], up[x-1], in[x]
+		la = (clampByte(la+int32(t>>24)-int32(tl>>24)) + int32(c>>24)) & 0xff
+		lr = (clampByte(lr+int32(t>>16&0xff)-int32(tl>>16&0xff)) + int32(c>>16&0xff)) & 0xff
+		lg = (clampByte(lg+int32(t>>8&0xff)-int32(tl>>8&0xff)) + int32(c>>8&0xff)) & 0xff
+		lb = (clampByte(lb+int32(t&0xff)-int32(tl&0xff)) + int32(c&0xff)) & 0xff
+		out[x] = uint32(la)<<24 | uint32(lr)<<16 | uint32(lg)<<8 | uint32(lb)
+	}
+}
+
+// predictAddSubHalf is predictor mode 13 (ClampedAddSubtractHalf) over
+// in[x0:x1]: per channel clip(avg + (avg - tl) / 2) with avg the floor
+// average of the left and top pixels, the division truncating toward zero
+// as in C. Channel-parallel like predictAddSubFull. in may alias out.
+func predictAddSubHalf(in, out, up []uint32, x0, x1 int) {
+	in, out, up = in[:x1], out[:x1], up[:x1]
+	l := out[x0-1]
+	la, lr, lg, lb := int32(l>>24), int32(l>>16&0xff), int32(l>>8&0xff), int32(l&0xff)
+	for x := x0; x < x1; x++ {
+		t, tl, c := up[x], up[x-1], in[x]
+		a := (la + int32(t>>24)) >> 1
+		la = (clampByte(a+(a-int32(tl>>24))/2) + int32(c>>24)) & 0xff
+		a = (lr + int32(t>>16&0xff)) >> 1
+		lr = (clampByte(a+(a-int32(tl>>16&0xff))/2) + int32(c>>16&0xff)) & 0xff
+		a = (lg + int32(t>>8&0xff)) >> 1
+		lg = (clampByte(a+(a-int32(tl>>8&0xff))/2) + int32(c>>8&0xff)) & 0xff
+		a = (lb + int32(t&0xff)) >> 1
+		lb = (clampByte(a+(a-int32(tl&0xff))/2) + int32(c&0xff)) & 0xff
+		out[x] = uint32(la)<<24 | uint32(lr)<<16 | uint32(lg)<<8 | uint32(lb)
 	}
 }
 
@@ -228,17 +239,9 @@ func predictRun(mode uint32, in, out, up []uint32, x0, x1 int) {
 			out[x] = l
 		}
 	case 12:
-		l := out[x0-1]
-		for x := x0; x < x1; x++ {
-			l = addPixels(in[x], clampAddSubFull(l, up[x], up[x-1]))
-			out[x] = l
-		}
+		predictAddSubFull(in, out, up, x0, x1)
 	case 13:
-		l := out[x0-1]
-		for x := x0; x < x1; x++ {
-			l = addPixels(in[x], clampAddSubHalf(l, up[x], up[x-1]))
-			out[x] = l
-		}
+		predictAddSubHalf(in, out, up, x0, x1)
 	default: // 0, and 14/15 which libwebp treats as black too
 		x := x0
 		for ; x+2 <= x1; x += 2 {
