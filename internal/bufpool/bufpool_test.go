@@ -4,6 +4,7 @@ import (
 	"math/bits"
 	"math/rand"
 	"runtime"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -248,5 +249,15 @@ func BenchmarkGetPut(b *testing.B) {
 	var p Pool[byte]
 	for b.Loop() {
 		p.Put(p.Get(1 << 20))
+	}
+}
+
+func TestDefaultLimitByWordSize(t *testing.T) {
+	want := int64(256 << 20)
+	if strconv.IntSize == 32 {
+		want = 64 << 20
+	}
+	if DefaultLimit != want {
+		t.Fatalf("DefaultLimit = %d, want %d on %d-bit", int64(DefaultLimit), want, strconv.IntSize)
 	}
 }
