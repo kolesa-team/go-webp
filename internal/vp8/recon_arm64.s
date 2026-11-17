@@ -39,8 +39,8 @@
 
 // reconConst: TBL indices that turn the column-major int16 output of the
 // inverse DCT into rows (rows 2-3, rows 0-1), the multipliers of MUL1/MUL2
-// as SQDMULH constants, the AC3 coefficient mask, the DC4 edge mask and the
-// TBL indices that gather the 4x4 edge vector e (see reconI4NEON).
+// as SQDMULH constants, the AC3 coefficient mask and the TBL indices that
+// gather the 4x4 edge vector e (see reconI4NEON).
 DATA reconConst<>+0(SB)/8, $0x1D1C15140D0C0504  // idx23: rows 2,3
 DATA reconConst<>+8(SB)/8, $0x1F1E17160F0E0706
 DATA reconConst<>+16(SB)/8, $0x1918111009080100 // idx01: rows 0,1
@@ -49,11 +49,9 @@ DATA reconConst<>+32(SB)/8, $0x45460000273D8000 // S[0]=20091<<15, S[1]=35468<<1
 DATA reconConst<>+40(SB)/8, $0
 DATA reconConst<>+48(SB)/8, $0x00000000FFFFFFFF // AC3: keep in[0], in[1], in[4]
 DATA reconConst<>+56(SB)/8, $0x000000000000FFFF
-DATA reconConst<>+64(SB)/8, $0xFFFF00FFFFFFFF00 // DC4: edge bytes 1-4, 6-9
-DATA reconConst<>+72(SB)/8, $0x000000000000FFFF
-DATA reconConst<>+80(SB)/8, $0x19181703070B0F0F // e: 15 15 11 7 3 23 24 25
-DATA reconConst<>+88(SB)/8, $0x1F1F1F1E1D1C1B1A //    26 27 28 29 30 31 31 31
-GLOBL reconConst<>(SB), RODATA|NOPTR, $96
+DATA reconConst<>+64(SB)/8, $0x19181703070B0F0F // e: 15 15 11 7 3 23 24 25
+DATA reconConst<>+72(SB)/8, $0x1F1F1F1E1D1C1B1A //    26 27 28 29 30 31 31 31
+GLOBL reconConst<>(SB), RODATA|NOPTR, $80
 
 // reconI4Tab: for each 4x4 mode, the TBL indices (row-major 4x4) into the
 // table {m3, m2, tm, dc} built by reconI4NEON (0-15: m3, 16-31: m2, 32-47:
@@ -80,6 +78,21 @@ DATA reconI4Tab<>+136(SB)/8, $0x0312021104130312
 DATA reconI4Tab<>+144(SB)/8, $0x0111021202120313 // HU
 DATA reconI4Tab<>+152(SB)/8, $0x1010101010100111
 GLOBL reconI4Tab<>(SB), RODATA|NOPTR, $160
+
+// reconI4Gather: per-sub-block TBL indices into {V0 = left neighbour,
+// V1 = row above} (see reconI4NEON): e[k+1], e[k-1], the left column
+// I..L across the rows, and the 8 DC samples (I..L, A..D, then zeros).
+DATA reconI4Gather<>+0(SB)/8, $0x1A19181703070B0F  // e[k+1]
+DATA reconI4Gather<>+8(SB)/8, $0x1F1F1F1F1E1D1C1B
+DATA reconI4Gather<>+16(SB)/8, $0x181703070B0F0F0F // e[k-1]
+DATA reconI4Gather<>+24(SB)/8, $0x1F1F1E1D1C1B1A19
+DATA reconI4Gather<>+32(SB)/8, $0x0707070703030303 // I x4, J x4, K x4, L x4
+DATA reconI4Gather<>+40(SB)/8, $0x0F0F0F0F0B0B0B0B
+DATA reconI4Gather<>+48(SB)/8, $0x1B1A19180F0B0703 // I J K L A B C D
+DATA reconI4Gather<>+56(SB)/8, $-1
+DATA reconI4Gather<>+64(SB)/8, $0x0B0A09080B0A0908 // A B C D on each row (in V1 alone)
+DATA reconI4Gather<>+72(SB)/8, $0x0B0A09080B0A0908
+GLOBL reconI4Gather<>(SB), RODATA|NOPTR, $80
 
 // reconCodeMask: per transform code (0-3), the mask applied to in[0..15]
 // before the full inverse DCT, which then equals the code's transform: none
@@ -194,13 +207,11 @@ GLOBL reconCodeMask<>(SB), RODATA|NOPTR, $128
 	VST1.P	V12.S[2], (R8)(R10) \
 	VST1	V12.S[3], (R8)
 
-// LOADCONST loads V29-V31 (IDCT constants) and V2 (AC3 mask), V28 (DC4
-// mask). Clobbers R8.
+// LOADCONST loads V29-V31 (IDCT constants) and V2 (AC3 mask). Clobbers R8.
 #define LOADCONST \
 	MOVD	$reconConst<>(SB), R8 \
 	VLD1.P	48(R8), [V29.B16, V30.B16, V31.B16] \
-	VLD1.P	16(R8), [V2.B16] \
-	VLD1	(R8), [V28.B16]
+	VLD1	(R8), [V2.B16]
 
 // --- intra 4x4 -----------------------------------------------------------------
 
@@ -210,20 +221,24 @@ GLOBL reconCodeMask<>(SB), RODATA|NOPTR, $128
 // modes[n] then doTransform with the code bits>>30 (bits <<= 2).
 //
 // Each sub-block depends on the reconstruction of its left and upper
-// neighbours, so the kernel is built to keep that chain short: it has no
-// data-dependent branch, and the left neighbour comes from a register.
+// neighbours, and that chain, not the arithmetic, bounds the speed. So the
+// kernel has no data-dependent branch per sub-block and keeps the left
+// neighbour in a register: from one sub-block to the next the chain is
+// TBL, at most three vector ops, TBL4, UQADD, UQSUB.
 //
-// Prediction. The edge of the sub-block is gathered by one TBL into
-//   e = [L L K J I X A B C D E F G H H .]    (V2)
-// (I..L the left column top to bottom, X the top-left, A..H the top row and
-// top-right) from the reconstructed left neighbour V0 (I..L are its bytes
-// 3, 7, 11, 15; at the start of a row V0 is a pseudo-block holding the left
-// context) and the 16 bytes V1 at columns -8..7 of the row above (X in byte
-// 7, A..H in bytes 8..15). Then
+// Prediction. V0 is the reconstructed left neighbour (I..L, its right
+// column, are bytes 3, 7, 11, 15; at the start of a row V0 is a pseudo
+// block holding the left context) and V1 the 16 bytes at columns -8..7 of
+// the row above (X, the top-left sample, in byte 7, the top row A..H with
+// the top-right samples in bytes 8..15). TBLs over {V0, V1} (indices in
+// reconConst and reconI4Gather) gather
+//   e = [L L K J I X A B C D E F G H H .]
+// and e shifted by one either way, and then
 //   m3[k] = avg3(e[k-1], e[k], e[k+1])  (V4, UHADD + URHADD as in libwebp)
 //   m2[k] = avg2(e[k], e[k+1])          (V5, URHADD; m2[0] = avg2(L, L) = L)
-//   tm    = clip8(top + left - X)       (V6, as UQSUB(UQADD(top, left-X),
-//                                        X-left) with saturating byte ops)
+//   tm    = clip8(left + top - X)       (V6, UQSUB(UQADD(left, max(top-X, 0)),
+//                                        max(X-top, 0)), exact with
+//                                        saturating byte ops)
 //   dc    = (A+B+C+D+I+J+K+L + 4) >> 3  (V7 byte 0, UADDLV + SRSHR)
 // are all computed, and the prediction of any of the 10 modes is one TBL
 // over {m3, m2, tm, dc} with the mode's index row from reconI4Tab.
@@ -233,14 +248,17 @@ GLOBL reconCodeMask<>(SB), RODATA|NOPTR, $128
 // equals TransformDC on a DC-only block, TransformAC3 on in[0], in[1],
 // in[4], and gives 0 on a zero block. The int16 residual is split into its
 // positive and negative parts clamped to [0, 255] (SQXTUN of r and of -r),
-// and clip8(pred + r) = UQSUB(UQADD(pred, pos), neg).
+// and clip8(pred + r) = UQSUB(UQADD(pred, pos), neg). Once all remaining
+// codes are zero (a branch that flips at most once per macroblock) the
+// prediction is stored as is.
 //
 // Registers: R0 b, R1 coefficients of the current block, R2 bits, R3 modes,
 // R4 reconCodeMask, R5 current sub-block, R6 mode, R7/R8 scratch, R9 = 9,
 // R10 = const_bps, R11/R13 loop counters, R12 reconI4Tab, R14-R17 left
-// context. V0 left neighbour, V1 row above, V2 e, V3/V8-V10/V13 scratch,
-// V4-V7 TBL table, V11 e gather indices, V12 mode indices, V15 prediction,
-// V16-V27 inverse DCT, V24/V25 residual parts, V28 DC mask, V29-V31 IDCT
+// context, R19 reconI4Gather. V0 left neighbour, V1 row above, V2 e,
+// V3/V13 e shifted, V8-V10/V14 TM terms, V4-V7 TBL table, V11 e indices,
+// V12 mode indices, V15 prediction, V16-V19 gather indices then V16-V27
+// inverse DCT, V24/V25 residual parts, V28 top-row indices, V29-V31 IDCT
 // constants.
 TEXT ·reconI4NEON(SB), NOSPLIT, $0-32
 	MOVD	b+0(FP), R0
@@ -250,8 +268,10 @@ TEXT ·reconI4NEON(SB), NOSPLIT, $0-32
 	MOVD	$reconConst<>(SB), R8
 	VLD1.P	48(R8), [V29.B16, V30.B16, V31.B16]
 	ADD	$16, R8, R8
-	VLD1.P	16(R8), [V28.B16]
 	VLD1	(R8), [V11.B16]
+	MOVD	$reconI4Gather<>(SB), R19
+	ADD	$64, R19, R8
+	VLD1	(R8), [V28.B16]
 	MOVD	$reconI4Tab<>(SB), R12
 	MOVD	$reconCodeMask<>(SB), R4
 	MOVD	$9, R9
@@ -282,26 +302,29 @@ i4blk:
 	VLD1	(R7), [V12.B16]
 	SUB	$(const_bps+8), R5, R8
 	VLD1	(R8), [V1.B16]
-	VTBL	V11.B16, [V0.B16, V1.B16], V2.B16 // e
+	VLD1	(R19), [V16.B16, V17.B16, V18.B16, V19.B16] // reconI4Gather
 
-	VEXT	$1, V2.B16, V2.B16, V3.B16   // e[k+1]
-	VEXT	$15, V2.B16, V2.B16, V13.B16 // e[k-1]
+	// Everything that depends on the left neighbour is gathered from
+	// {V0, V1} directly, so that the chain from one sub-block to the next
+	// is TBL, at most three vector ops, TBL4, UQADD, UQSUB.
+	VTBL	V11.B16, [V0.B16, V1.B16], V2.B16  // e
+	VTBL	V16.B16, [V0.B16, V1.B16], V3.B16  // e[k+1]
+	VTBL	V17.B16, [V0.B16, V1.B16], V13.B16 // e[k-1]
+	VTBL	V18.B16, [V0.B16, V1.B16], V9.B16  // I, J, K, L across the rows
+	VTBL	V19.B16, [V0.B16, V1.B16], V7.B16  // DC samples
+	VTBL	V28.B16, [V1.B16], V8.B16          // A B C D on each row
+	VDUP	V1.B[7], V10.B16                   // X
+
 	VUHADD	V3.B16, V13.B16, V13.B16
 	VURHADD	V13.B16, V2.B16, V4.B16      // m3
 	VURHADD	V3.B16, V2.B16, V5.B16       // m2
 
-	ADD	$32, R12, R7
-	VLD1	(R7), [V8.B16, V9.B16]       // VE and HE rows: A..D and I..L in e
-	VTBL	V8.B16, [V2.B16], V8.B16     // A B C D on each row
-	VTBL	V9.B16, [V2.B16], V9.B16     // I, J, K, L across the rows
-	VDUP	V2.B[5], V10.B16             // X
-	VUQSUB	V10.B16, V9.B16, V3.B16      // max(left - X, 0)
-	VUQSUB	V9.B16, V10.B16, V9.B16      // max(X - left, 0)
-	VUQADD	V3.B16, V8.B16, V8.B16
-	VUQSUB	V9.B16, V8.B16, V6.B16       // tm
+	VUQSUB	V10.B16, V8.B16, V14.B16     // max(top - X, 0)
+	VUQSUB	V8.B16, V10.B16, V8.B16      // max(X - top, 0)
+	VUQADD	V14.B16, V9.B16, V9.B16
+	VUQSUB	V8.B16, V9.B16, V6.B16       // tm = clip8(left + (top - X))
 
-	VAND	V28.B16, V2.B16, V7.B16      // A..D and I..L
-	VUADDLV	V7.B16, V7
+	VUADDLV	V7.B8, V7
 	VSRSHR	$3, V7.H4, V7.H4             // dc in byte 0
 
 	VTBL	V12.B16, [V4.B16, V5.B16, V6.B16, V7.B16], V15.B16
