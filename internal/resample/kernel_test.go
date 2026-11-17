@@ -122,7 +122,7 @@ func FuzzImportKernels(f *testing.F) {
 	})
 }
 
-// exportCase runs ExportRow with the selected kernels and with the
+// checkExport runs ExportRow with the selected kernels and with the
 // reference ones on a copy of rs, and compares the rows and the state.
 func checkExport(t testing.TB, rs *Rescaler, dst []byte) {
 	t.Helper()

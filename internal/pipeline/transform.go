@@ -113,7 +113,9 @@ func NewSink(p Params) (Sink, func() *image.NRGBA, error) {
 			premult: p.Premultiply,
 		}
 		s.reuse = p.Dst
-		if err := s.rs.Init(cw, ch, w, h, 4, nil); err != nil {
+		s.work = getWork(resample.BufferSize(w, 4))
+		if err := s.rs.Init(cw, ch, w, h, 4, *s.work); err != nil {
+			s.releaseWork()
 			return nil, nil, status.InvalidParam("invalid scaled dimensions")
 		}
 		return s, s.image, nil
@@ -192,6 +194,22 @@ func (d *lazyDirect) NeedRows() int { return d.h }
 
 // scratchPool recycles row-batch buffers between decodes.
 var scratchPool sync.Pool // of *[]byte
+
+// workPool recycles rescaler work buffers (rows and column tables, see
+// resample.BufferSize) between decodes.
+var workPool sync.Pool // of *[]uint32
+
+// getWork returns a pooled rescaler work buffer of at least n cells.
+func getWork(n int) *[]uint32 {
+	w, ok := workPool.Get().(*[]uint32)
+	if !ok {
+		w = new([]uint32)
+	}
+	if cap(*w) < n {
+		*w = make([]uint32, n)
+	}
+	return w
+}
 
 // base holds the geometry and scratch buffer shared by the sinks.
 type base struct {
@@ -331,6 +349,24 @@ type scaleSink struct {
 	preDone bool // rows arrive premultiplied (see PremultipliedSink)
 	rs      resample.Rescaler
 	yuv     yuvScaler // YUV-domain path, see YUVSink
+	// work backs the rescalers of rs or yuv (from workPool); nil once
+	// released.
+	work *[]uint32
+}
+
+// releaseWork returns the rescaler work buffer to the pool once the last
+// output row is out. The rescalers are reset first: a zero Rescaler
+// imports and exports nothing, so a late call cannot touch the buffer
+// after another decode took it.
+func (s *scaleSink) releaseWork() {
+	if s.work == nil {
+		return
+	}
+	s.rs = resample.Rescaler{}
+	q := &s.yuv
+	q.ry, q.ru, q.rv, q.ra = resample.Rescaler{}, resample.Rescaler{}, resample.Rescaler{}, resample.Rescaler{}
+	workPool.Put(s.work)
+	s.work = nil
 }
 
 func (s *scaleSink) image() *image.NRGBA { return s.out() }
@@ -357,6 +393,7 @@ func (s *scaleSink) Commit(y, n int) error {
 	if y+n >= s.bottom {
 		s.done = true
 		s.release()
+		s.releaseWork()
 	}
 	return nil
 }
