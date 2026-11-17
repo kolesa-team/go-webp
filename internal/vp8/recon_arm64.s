@@ -3,29 +3,36 @@
 #include "go_asm.h"
 #include "textflag.h"
 
-// NEON macroblock reconstruction: intra prediction plus inverse transforms.
+// NEON macroblock reconstruction for the VP8 decoder: intra prediction and
+// inverse transforms (reconI4NEON, reconI16NEON, reconUVNEON, one call per
+// macroblock), the inverse WHT (transformWHTNEON) and the per-macroblock
+// edge setup and row cache copy (loadEdgesNEON, storeMBRowsNEON).
 //
-// Algorithm adapted from libwebp (BSD-3-Clause): dsp/dec.c and
-// dsp/dec_neon.c (TransformOne, TransformDC, TransformAC3, the 4x4, 8x8 and
-// 16x16 intra predictors). The results are bit-exact with the Go reference
-// in dsp.go for every input, which differs from libwebp's NEON code in one
-// respect: libwebp computes the inverse DCT in saturating 16-bit lanes,
-// which is only exact for coefficients in the range a valid encoder emits.
-// Here the transform runs in 32-bit lanes (SQDMULH by 20091<<15 and
-// 35468<<15 is exactly (x*20091)>>16 and (x*35468)>>16), so any int16 input
-// gives the same pixels as the scalar C and Go code.
+// Algorithm adapted from libwebp (BSD-3-Clause): dsp/dec.c,
+// dsp/dec_neon.c (TransformOne, TransformDC, TransformAC3, TransformWHT,
+// the 4x4, 8x8 and 16x16 intra predictors) and dec/frame_dec.c
+// (ReconstructRow). Every kernel is bit-exact with its Go reference in
+// dsp.go for every input. That is stricter than libwebp's NEON code, whose
+// inverse DCT works in 16-bit lanes and is only exact for coefficients in
+// the range a valid encoder emits: here the transforms run in 32-bit lanes
+// (SQDMULH by 20091<<15 and 35468<<15 is exactly (x*20091)>>16 and
+// (x*35468)>>16), so any int16 input gives the same pixels as the scalar C
+// and Go code.
 //
 // The work buffer b (*[yuvSize]byte, stride const_bps) holds the luma block
 // at const_yOff and the chroma blocks at const_uOff/const_vOff, each with
 // its top row (and top-left/top-right samples) and left column of context.
-// The kernels write only the samples the Go reference writes, and read only
-// the samples it reads plus this over-read, which stays inside b:
+// The kernels write only what the Go reference writes, and read only what it
+// reads plus these over-reads, which stay inside b:
 //   - reconI4NEON loads columns -8..7 of the row above each 4x4 sub-block
 //     (16 bytes); the lowest byte read is b[const_yOff - const_bps - 8] =
-//     b[0], the highest b[const_yOff + 11*const_bps + 19].
-// coeffs is *[384]int16 and modes *[16]uint8; only their elements are read,
-// and nothing but b is written. TestReconGuardPages checks all of this with
-// the buffers placed against inaccessible pages.
+//     b[0], the highest b[const_yOff + 11*const_bps + 19];
+//   - storeMBRowsNEON loads chroma rows 0-6 as the 32 bytes from
+//     const_uOff + j*const_bps (U and V row j are bytes 0-7 and 16-23).
+// coeffs (*[384]int16), modes (*[16]uint8) and top (*topSamples) are only
+// accessed element by element, and the row cache only within the bounds the
+// Go wrapper checked. TestReconGuardPages and TestReconGlueGuardPages check
+// this with every buffer placed against inaccessible pages.
 
 // Instructions the Go arm64 assembler lacks, as raw encodings (checked
 // against clang: see the comment at each use).
@@ -368,7 +375,7 @@ i4store:
 	CBNZ	R11, i4row
 	RET
 
-// --- residual loop shared by the 16x16 and chroma kernels ----------------------
+// --- row helpers shared by the 16x16 and chroma kernels ------------------------
 
 // SUMLEFT16 sets R7 to the sum of the 16 left samples of the block at R5.
 // Clobbers R15.
@@ -467,12 +474,20 @@ i4store:
 
 // func reconI16NEON(b *[yuvSize]byte, coeffs *[384]int16, bits uint32, mode int)
 //
-// Mirrors reconI16Ref: predLuma16(mode) written to b, then for each of the
-// 16 sub-blocks with a non-zero code the DC-only, AC3 (masked full
-// transform: identical by construction) or full residual is added in place.
+// Mirrors reconI16Ref (predLuma16 and the TrueMotion/DC/VE/HE NEON
+// predictors of libwebp): the prediction is written to b row by row (DC:
+// UADDLV of the top row plus the left column summed in GPRs, with the edge
+// variants of checkMode; TM: top - X in 16 bits plus each left sample,
+// SQXTUN), then each sub-block with a non-zero code gets its residual added
+// in place (ADDBLOCK): DC only, AC3 (the full transform of the masked
+// coefficients, identical by construction) or the full transform. The loop
+// stops as soon as the remaining codes are all zero. Unlike the 4x4 kernel
+// the sub-blocks are independent, so per-block branches are cheap here.
 //
-// Registers: R0 b, R1 coefficients, R2 bits, R3 mode, R5 block, R6/R7/R9
-// scratch, R8/R9 row pointers, R10 = const_bps, R11/R13 loop counters.
+// Registers: R0 b, R1 coefficients, R2 bits, R3 mode, R5 block, R6/R7/R15
+// scratch, R8/R9 row pointers, R10 = const_bps, R11/R13 loop counters;
+// V0-V7 prediction, V2 AC3 mask during the residual loop, V12-V14 ADDBLOCK,
+// V16-V27 inverse DCT, V29-V31 IDCT constants.
 TEXT ·reconI16NEON(SB), NOSPLIT, $0-32
 	MOVD	b+0(FP), R0
 	MOVD	coeffs+8(FP), R1
@@ -626,15 +641,17 @@ i16done:
 
 // func reconUVNEON(b *[yuvSize]byte, coeffs *[384]int16, codes uint32, mode int)
 //
-// Mirrors reconUVRef for both planes: predChroma8(mode) then the residuals
-// of the four 4x4 blocks. codes holds one 2-bit code per block (U in bits
-// 0-7, V in bits 8-15, block 0 in the top bits of each byte) as computed
-// by uvCodes: 0 none, 1 DC only, 3 full transform.
+// Mirrors reconUVRef for both planes: predChroma8(mode) (as in the 16x16
+// kernel, 8 bytes wide) then the residuals of the four 4x4 blocks. codes
+// holds one 2-bit code per block (U in bits 0-7, V in bits 8-15, block 0 in
+// the top bits of each byte) as computed by uvCodes, which reproduces
+// doUVTransform's choice: 0 none, 1 DC only, 3 full transform.
 //
 // Registers: R0 b, R1 coefficients, R2 V codes, R3 mode, R4 codes of the
-// current plane, R5 plane, R6/R7/R9 scratch, R8/R9 row pointers,
+// current plane, R5 plane, R6/R7/R15 scratch, R8/R9 row pointers,
 // R10 = const_bps, R11 plane counter, R12 block, R13 block counter,
-// R14 coefficients of the current plane.
+// R14 coefficients of the current plane; vector registers as in the 16x16
+// kernel.
 TEXT ·reconUVNEON(SB), NOSPLIT, $0-32
 	MOVD	b+0(FP), R0
 	MOVD	coeffs+8(FP), R14
