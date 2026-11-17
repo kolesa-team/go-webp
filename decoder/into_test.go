@@ -52,7 +52,12 @@ func newDec(t testing.TB, data []byte, o *Options) *Decoder {
 // TestDecodeIntoMatchesDecode decodes into dirty buffers (large enough, and
 // too small) and compares with Decode.
 func TestDecodeIntoMatchesDecode(t *testing.T) {
-	for _, file := range intoFiles {
+	files, sizes := intoFiles, []int{0, 4096, -1}
+	if testing.Short() {
+		// The 3000x2000 pictures are covered by TestDecodeIntoReuse.
+		files, sizes = []string{"m4_q75.webp", "100x150_lossy.webp", "100x150_lossless.webp"}, []int{0, -1}
+	}
+	for _, file := range files {
 		data := readFile(t, file)
 		for _, o := range intoOptions {
 			if o != nil && !o.Crop.Empty() {
@@ -63,7 +68,8 @@ func TestDecodeIntoMatchesDecode(t *testing.T) {
 			}
 			want := decode(t, data, o)
 			n := len(want.Pix)
-			for _, c := range []int{n, n + 4096, n - 1} {
+			for _, extra := range sizes {
+				c := n + extra
 				dst := dirty(c)
 				got, err := newDec(t, data, o).DecodeInto(dst)
 				require.NoError(t, err, "%s %+v", file, o)
@@ -120,8 +126,11 @@ func TestDecodeIntoReuse(t *testing.T) {
 		require.Same(t, p0, &got.Pix[0])
 		require.Equal(t, 3000*2000*4, cap(got.Pix))
 		require.True(t, bytes.Equal(want.Pix, got.Pix))
-		// The output alone would be 2.4-24 MB.
-		assert.Less(t, m1.TotalAlloc-m0.TotalAlloc, uint64(2<<20), "%+v", c.o)
+		// The output alone would be 2.4-24 MB. (With the race detector
+		// sync.Pool drops objects at random.)
+		if !raceEnabled {
+			assert.Less(t, m1.TotalAlloc-m0.TotalAlloc, uint64(2<<20), "%+v", c.o)
+		}
 	}
 }
 
