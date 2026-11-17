@@ -100,17 +100,22 @@ func insertCache8(cache *[1 << maxCacheBits]uint16, hash *[256]uint16, px []byte
 	}
 }
 
-// settleCache8 is settleCache for index bytes, for a cache of 1<<bits
-// slots (bits <= 6). It is small enough to be inlined (see settleCache).
-func settleCache8(cache *[1 << maxCacheBits]uint16, hash *[256]uint16, px []byte, bits int) {
-	full := ^uint64(0) >> ((64 - 1<<(bits&7)) & 63) // one bit per slot
+// settleCache8 is settleCache for index bytes, for a cache of full (a mask
+// of one bit per slot, at most 64 slots). A run of equal bytes changes
+// nothing after its last byte, so runs are skipped 8 bytes at a time.
+func settleCache8(cache *[1 << maxCacheBits]uint16, hash *[256]uint16, px []byte, full uint64) {
 	var seen uint64
 	for i := len(px) - 1; i >= 0 && seen != full; i-- {
 		b := px[i]
-		h := hash[b] & 63
-		if seen>>h&1 == 0 {
+		if h := hash[b] & 63; seen>>h&1 == 0 {
 			seen |= 1 << h
 			cache[h] = cacheSet | uint16(b)
+		}
+		if i > 0 && px[i-1] == b {
+			rep := uint64(b) * 0x0101010101010101
+			for i >= 8 && binary.LittleEndian.Uint64(px[i-8:i]) == rep {
+				i -= 8
+			}
 		}
 	}
 }
@@ -165,9 +170,12 @@ func (d *decoder) decodeIdx8(md *metadata, buf []byte, w, h int, sliding bool, w
 	cacheBits := md.cacheBits
 	cacheSize := 0
 	eager := false
+	settleFull := uint64(0) // one bit per slot
+	minRun := max(lazyCacheMinRun, 1)
 	if cacheBits > 0 {
 		cacheSize = 1 << cacheBits
 		eager = cacheBits > min(lazyCacheMaxBits, 6)
+		settleFull = ^uint64(0) >> ((64 - 1<<(min(cacheBits, 6))) & 63)
 	}
 	const lenCodeLimit = numLiteralCodes + numLengthCodes
 	cacheLimit := lenCodeLimit + cacheSize
@@ -183,6 +191,7 @@ func (d *decoder) decodeIdx8(md *metadata, buf []byte, w, h int, sliding bool, w
 		g = md.group(groups, col, row)
 	}
 	var err error
+	settle := false // a lookup needs the pending pixels settled first
 outer:
 	for {
 		stop := lastPixel - base
@@ -196,6 +205,7 @@ outer:
 		if idx8TestWidenAt > 0 {
 			stop = min(stop, idx8TestWidenAt-base)
 		}
+	inner:
 		for p < stop {
 			if col&mask == 0 {
 				g = md.group(groups, col, row)
@@ -293,11 +303,13 @@ outer:
 					}
 					continue
 				case code < cacheLimit:
-					if !eager && p-lastCached >= lazyCacheMinRun {
-						settleCache8(cache, hash, buf[lastCached:p], cacheBits)
-					} else {
-						insertCache8(cache, hash, buf[lastCached:p])
+					if !eager && p-lastCached >= minRun {
+						// Settle outside this loop, where the call does not
+						// slow down the loop, then decode the symbol again.
+						settle = true
+						break inner
 					}
+					insertCache8(cache, hash, buf[lastCached:p])
 					lastCached = p
 					v := cache[(code-lenCodeLimit)&(1<<maxCacheBits-1)]
 					if v&cacheSet == 0 {
@@ -333,6 +345,12 @@ outer:
 				}
 			}
 		}
+		if settle {
+			settle = false
+			settleCache8(cache, hash, buf[lastCached:p], settleFull)
+			lastCached = p
+			continue
+		}
 		if base+p >= lastPixel {
 			break
 		}
@@ -349,8 +367,8 @@ outer:
 		}
 		// Slide the window (see decodePixels).
 		if cacheBits > 0 {
-			if !eager && p-lastCached >= lazyCacheMinRun {
-				settleCache8(cache, hash, buf[lastCached:p], cacheBits)
+			if !eager && p-lastCached >= minRun {
+				settleCache8(cache, hash, buf[lastCached:p], settleFull)
 			} else {
 				insertCache8(cache, hash, buf[lastCached:p])
 			}

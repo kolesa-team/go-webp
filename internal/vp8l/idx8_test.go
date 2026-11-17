@@ -326,3 +326,43 @@ func BenchmarkPaletteEmit(b *testing.B) {
 		})
 	}
 }
+
+// TestSettleCache8MatchesInsert checks the backward settle of index bytes,
+// which skips runs of equal bytes, against forward insertion.
+func TestSettleCache8MatchesInsert(t *testing.T) {
+	rng := rand.New(rand.NewSource(2))
+	for iter := 0; iter < 3000; iter++ {
+		bits := 1 + rng.Intn(6)
+		var hash [256]uint16
+		arb := rng.Uint32() &^ 0xff00
+		for i := range hash {
+			hash[i] = uint16((arb | uint32(i)<<8) * colorCacheMult >> (32 - bits))
+		}
+		values := make([]byte, 1+rng.Intn(12))
+		for i := range values {
+			values[i] = byte(rng.Intn(256))
+		}
+		px := make([]byte, rng.Intn(400))
+		for i := 0; i < len(px); {
+			run := 1 + rng.Intn(8)
+			if rng.Intn(4) == 0 {
+				run = 1 + rng.Intn(100)
+			}
+			c := values[rng.Intn(len(values))]
+			for ; run > 0 && i < len(px); run-- {
+				px[i] = c
+				i++
+			}
+		}
+		var a, b [1 << maxCacheBits]uint16
+		for i := range a[:1<<bits] {
+			a[i] = uint16(rng.Intn(0x200))
+		}
+		b = a
+		insertCache8(&a, &hash, px)
+		settleCache8(&b, &hash, px, ^uint64(0)>>(64-1<<bits))
+		if a != b {
+			t.Fatalf("iter %d: bits %d, %d pixels: settle differs from insert", iter, bits, len(px))
+		}
+	}
+}
