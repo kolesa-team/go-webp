@@ -1,0 +1,223 @@
+package encoder
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"image"
+	"image/draw"
+	"runtime"
+	"sync"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/kolesa-team/go-webp/v2/internal/workers"
+)
+
+// TestParallelAlphaSubImage codes the alpha plane of sub-images (non-zero
+// origin, stride wider than the picture) on the helper: the output must
+// equal the sequential one for every helper budget, for a shared *image.NRGBA
+// and for a pooled snapshot of an *image.RGBA.
+func TestParallelAlphaSubImage(t *testing.T) {
+	checkNoLeak(t)
+	full := alphaImage(420, 330, 9)
+	sub := full.SubImage(image.Rect(37, 21, 37+301, 21+251)).(*image.NRGBA) // 75551 px
+	rgba := image.NewRGBA(full.Rect)
+	draw.Draw(rgba, rgba.Rect, full, image.Point{}, draw.Src)
+	srcs := []image.Image{rgba.SubImage(sub.Rect), sub}
+	filters := []int{1, 0, 2}
+	if testing.Short() {
+		srcs, filters = srcs[:1], filters[:1]
+	}
+	for _, src := range srcs {
+		for _, af := range filters {
+			o, err := NewLossyEncoderOptions(PresetDefault, 75)
+			require.NoError(t, err)
+			o.AlphaFiltering = af
+			want := encodeBytes(t, src, o)
+			o.ThreadLevel = true
+			for _, b := range budgets {
+				withBudget(t, b, func() {
+					require.Equal(t, want, encodeBytes(t, src, o), "%T filter %d budget %s", src, af, b)
+				})
+				require.Zero(t, workers.InUse())
+			}
+		}
+	}
+}
+
+// TestReleaseWaitsForParallelAlpha releases Encoders (pooled snapshots)
+// while ThreadLevel encodes with an alpha helper run on other goroutines,
+// and scribbles over every buffer taken from the snapshot pool meanwhile:
+// a snapshot recycled under the helper would change the output (or be
+// reported by -race).
+func TestReleaseWaitsForParallelAlpha(t *testing.T) {
+	checkNoLeak(t)
+	img := alphaImage(300, 260, 12)
+	rgba := image.NewRGBA(img.Rect)
+	draw.Draw(rgba, rgba.Rect, img, image.Point{}, draw.Src)
+	o, err := NewLossyEncoderOptions(PresetDefault, 75)
+	require.NoError(t, err)
+	o.Method = 0
+	want := encodeBytes(t, rgba, o)
+	o.ThreadLevel = true
+	prev := workers.SetLimitForTest(8)
+	defer workers.SetLimitForTest(prev)
+
+	stop := make(chan struct{})
+	var scribbler sync.WaitGroup
+	scribbler.Go(func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if p, ok := pixPool.Get().(*[]byte); ok {
+				for i := range *p {
+					(*p)[i] = 0x5a
+				}
+			}
+			runtime.Gosched()
+		}
+	})
+	defer func() {
+		close(stop)
+		scribbler.Wait()
+	}()
+
+	rounds := 6
+	if testing.Short() {
+		rounds = 2
+	}
+	for i := 0; i < rounds; i++ {
+		e, err := NewEncoder(rgba, o)
+		require.NoError(t, err)
+		var wg sync.WaitGroup
+		results := make([]error, 2)
+		outs := make([][]byte, 2)
+		for g := range results {
+			wg.Go(func() {
+				var buf bytes.Buffer
+				results[g] = e.Encode(&buf)
+				outs[g] = buf.Bytes()
+			})
+		}
+		runtime.Gosched()
+		e.Release()
+		wg.Wait()
+		for g, err := range results {
+			if errors.Is(err, ErrReleased) {
+				continue
+			}
+			require.NoError(t, err)
+			require.Equal(t, want, outs[g])
+		}
+	}
+}
+
+// TestEncodeContextThreadsAll cancels ThreadLevel encodes (lossy with and
+// without alpha, lossless, whose encoders run their own helpers) at many
+// points under every helper budget: each must either finish with the
+// sequential bytes or return exactly context.Canceled without writing,
+// and leave no helper behind.
+func TestEncodeContextThreadsAll(t *testing.T) {
+	checkNoLeak(t)
+	lossy, err := NewLossyEncoderOptions(PresetDefault, 75)
+	require.NoError(t, err)
+	bestFilter, err := NewLossyEncoderOptions(PresetDefault, 75)
+	require.NoError(t, err)
+	bestFilter.AlphaFiltering = 2
+	ll, err := NewLosslessEncoderOptions(PresetDefault, 6)
+	require.NoError(t, err)
+	// 65780 pixels: the alpha plane is coded on a helper when one is free.
+	transparent := alphaImage(260, 253, 14)
+	cases := []struct {
+		name string
+		img  image.Image
+		o    *Options
+	}{
+		{"lossy YCbCr", sourceImages(260, 253, 13)[3], lossy},
+		{"lossy alpha", transparent, lossy},
+		{"lossy alpha best filter", transparent, bestFilter},
+		{"lossless", alphaImage(150, 110, 15), ll},
+	}
+	points := 16
+	if testing.Short() {
+		cases, points = cases[1:3], 6
+	}
+	// A sample of the polls: the first and last ones and some in between.
+	sample := func(n int64) []int64 {
+		ks := pollPoints(n)
+		if len(ks) <= points {
+			return ks
+		}
+		var out []int64
+		for i := 0; i < points; i++ {
+			out = append(out, ks[i*(len(ks)-1)/(points-1)])
+		}
+		return out
+	}
+	for _, tc := range cases {
+		want := encodeBytes(t, tc.img, tc.o)
+		o := *tc.o
+		o.ThreadLevel = true
+		for _, b := range budgets {
+			withBudget(t, b, func() {
+				e, err := NewEncoder(tc.img, &o)
+				require.NoError(t, err)
+				defer e.Release()
+				never := newPollCtx(0)
+				var got bytes.Buffer
+				require.NoError(t, e.EncodeContext(never, &got))
+				require.Equal(t, want, got.Bytes(), "%s budget %s", tc.name, b)
+				n := never.polls.Load()
+				for _, k := range sample(n) {
+					name := fmt.Sprintf("%s budget %s poll %d of %d", tc.name, b, k, n)
+					var cw countWriter
+					err := e.EncodeContext(newPollCtx(k), &cw)
+					if err == nil { // the helpers polled less often this time
+						continue
+					}
+					require.Equal(t, context.Canceled, err, name)
+					require.Zero(t, cw.calls, name)
+				}
+			})
+			require.Zero(t, workers.InUse(), tc.name)
+		}
+	}
+}
+
+// TestPooledNRGBALargeSkipsPool checks that a snapshot too large to be
+// pooled neither takes nor returns pooled storage: taking a pooled buffer
+// would only discard it.
+func TestPooledNRGBALargeSkipsPool(t *testing.T) {
+	if raceEnabled {
+		t.Skip("sync.Pool drops items at random under the race detector")
+	}
+	// With a single P, Get returns what this goroutine Put.
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	for pixPool.Get() != nil { // drain
+	}
+	small := make([]byte, 64)
+	pixPool.Put(&small)
+	img, pp := pooledNRGBA(1449, 1449) // just above maxPooledPixels
+	require.Greater(t, 1449*1449, maxPooledPixels)
+	require.Len(t, img.Pix, 4*1449*1449)
+	putPix(pp)
+	p, ok := pixPool.Get().(*[]byte)
+	require.True(t, ok, "the pooled buffer was taken")
+	require.Equal(t, &small, p)
+	require.Nil(t, pixPool.Get(), "the large buffer was pooled")
+
+	// A poolable size reuses a large enough pooled buffer.
+	big := make([]byte, 4*64*64)
+	pixPool.Put(&big)
+	img, pp = pooledNRGBA(63, 64)
+	require.Equal(t, &big, pp)
+	require.Len(t, img.Pix, 4*63*64)
+	require.Equal(t, 4*63, img.Stride)
+	putPix(pp)
+}

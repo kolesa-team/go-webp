@@ -228,6 +228,9 @@ func (j *segmentJob) run(it *iterator) {
 		return
 	}
 	for {
+		if it.x == 0 && e.cfg.Interrupt != nil && e.pollInterrupt() {
+			return
+		}
 		it.importMB()
 		mb := it.mb()
 		it.setIntra16Mode(0)
@@ -281,9 +284,24 @@ func (e *encoder) analysisBands() int {
 	return max(1, min(maxAnalysisBands, e.mbH, e.mbW*e.mbH/minMBs))
 }
 
+// pollInterrupt polls Config.Interrupt (not nil) from an analysis band,
+// about once per macroblock row. Once it has fired, every band stops
+// without polling it again.
+func (e *encoder) pollInterrupt() bool {
+	if e.stopped.Load() {
+		return true
+	}
+	if e.cfg.Interrupt() {
+		e.stopped.Store(true)
+		return true
+	}
+	return false
+}
+
 // analyze decides the segmentation and complexity, and assigns a first
-// guess of the prediction modes.
-func (e *encoder) analyze() {
+// guess of the prediction modes. It reports whether Config.Interrupt fired
+// (the analysis is then incomplete and the encode must stop).
+func (e *encoder) analyze() bool {
 	doSegments := e.cfg.EmulateJPEGSize || e.numSegments > 1 || e.method <= 1
 	if !doSegments {
 		for i := range e.mbInfo {
@@ -293,9 +311,11 @@ func (e *encoder) analyze() {
 		e.dqm[0].beta = 0
 		e.alpha = 0
 		e.uvAlpha = 0
-		return
+		return false
 	}
+	e.stopped.Store(false)
 	e.analyzeInBands(e.analysisBands())
+	return e.stopped.Load()
 }
 
 // analyzeInBands runs the analysis pass in nb (1..min(maxAnalysisBands,
@@ -316,6 +336,9 @@ func (e *encoder) analyzeInBands(nb int) {
 		e.analyzeBands(nb)
 	}
 	it.analysis = false
+	if e.stopped.Load() {
+		return // interrupted: the bands are incomplete (and may be empty)
+	}
 
 	// Integer sums: the merge order does not matter.
 	var alphas [maxAlphaValue + 1]int
@@ -349,7 +372,7 @@ func (e *encoder) analyzeBands(nb int) {
 	work := func(it *iterator) {
 		for {
 			b := int(e.nextBand.Add(1)) - 1
-			if b >= nb {
+			if b >= nb || e.stopped.Load() {
 				return
 			}
 			if testHookAnalysisBand != nil {

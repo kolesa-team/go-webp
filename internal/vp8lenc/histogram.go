@@ -348,6 +348,10 @@ type clusterer struct {
 	owned     []*histo // working histograms (kept for later calls)
 	numOwned  int      // owned[:numOwned] are in use or in free
 	freeOwned []*histo
+
+	// interrupt is Config.Interrupt during buildHistoImage: when it fires,
+	// the clustering loops stop early (the clustering stays valid).
+	interrupt func() bool
 }
 
 // newHisto returns an unused working histogram (contents unspecified).
@@ -390,6 +394,8 @@ func (c *clusterer) mergeInto(i, j int) *histo {
 	c.set[i] = dst
 	return dst
 }
+
+func (c *clusterer) interrupted() bool { return c.interrupt != nil && c.interrupt() }
 
 // remove removes set[i], replacing it by the last histogram (libwebp
 // HistogramSetRemoveHistogram).
@@ -589,7 +595,7 @@ func (c *clusterer) stochasticCombine(s *histoSet, minClusterSize int) bool {
 	outerIters := c.size
 	numTriesNoSuccess := outerIters / 2
 	triesNoSuccess := 0
-	for iter := 0; iter < outerIters && c.size >= minClusterSize; iter++ {
+	for iter := 0; iter < outerIters && c.size >= minClusterSize && !c.interrupted(); iter++ {
 		triesNoSuccess++
 		if triesNoSuccess >= numTriesNoSuccess {
 			break
@@ -659,7 +665,7 @@ func (c *clusterer) greedyCombine(s *histoSet) {
 			pq.push(s, set, i, j, 0)
 		}
 	}
-	for len(pq.q) > 0 {
+	for len(pq.q) > 0 && !c.interrupted() {
 		i1, i2 := pq.q[0].i1, pq.q[0].i2
 		m := c.mergeInto(i1, i2)
 		m.bitCost = pq.q[0].costCmb
@@ -715,26 +721,36 @@ func (c *clusterer) remap(out *histoSet, helpers int) {
 				syms[i] = uint16(best)
 			}
 		}
-		if chunks := (len(orig) + remapChunk - 1) / remapChunk; helpers > 0 && chunks > 1 && len(orig)*len(set) >= minParallelRemap {
+		// Config.Interrupt is polled once per chunk of remapChunk tiles,
+		// also on the helpers; an interrupted remap leaves every tile in
+		// cluster 0 (a valid, if useless, clustering).
+		chunks := (len(orig) + remapChunk - 1) / remapChunk
+		if helpers > 0 && chunks > 1 && len(orig)*len(set) >= minParallelRemap {
 			parallel(chunks, helpers, func(_ int, claim func() (int, bool)) {
 				for {
 					k, ok := claim()
-					if !ok {
+					if !ok || c.interrupted() {
 						return
 					}
 					assign(k*remapChunk, min((k+1)*remapChunk, len(orig)))
 				}
 			})
 		} else {
-			assign(0, len(orig))
+			for k := 0; k < chunks && !c.interrupted(); k++ {
+				assign(k*remapChunk, min((k+1)*remapChunk, len(orig)))
+			}
 		}
-		// Unused tiles take the cluster of the previous tile.
-		for i := range orig {
-			if !orig[i].used {
-				if i > 0 {
-					syms[i] = syms[i-1]
-				} else {
-					syms[i] = 0
+		if c.interrupted() {
+			clear(syms)
+		} else {
+			// Unused tiles take the cluster of the previous tile.
+			for i := range orig {
+				if !orig[i].used {
+					if i > 0 {
+						syms[i] = syms[i-1]
+					} else {
+						syms[i] = 0
+					}
 				}
 			}
 		}

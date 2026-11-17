@@ -35,6 +35,8 @@
 package vp8enc
 
 import (
+	"errors"
+
 	"github.com/kolesa-team/go-webp/v2/internal/status"
 )
 
@@ -85,7 +87,17 @@ type Config struct {
 	// compact token buffer; like libwebp's low_memory it only re-enables
 	// multiple partitions (Partitions) for Method >= 3.
 	LowMemory bool
+	// Interrupt, if not nil, is polled about once per macroblock row; when
+	// it returns true, Encode stops and returns ErrInterrupted. It must be
+	// safe for concurrent use and, once it has returned true, keep doing so.
+	Interrupt func() bool
 }
+
+// ErrInterrupted is returned by Encode when Config.Interrupt asked it to stop.
+var ErrInterrupted = errors.New("vp8enc: interrupted")
+
+// interrupted polls c.Interrupt.
+func (c *Config) interrupted() bool { return c.Interrupt != nil && c.Interrupt() }
 
 // DefaultConfig returns libwebp's default lossy configuration (quality 75,
 // method 4, the "default" preset).

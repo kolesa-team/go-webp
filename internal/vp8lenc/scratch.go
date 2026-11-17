@@ -48,7 +48,13 @@ type scratch struct {
 	// pixels is the largest image (in pixels) this scratch has served; its
 	// buffers are sized accordingly.
 	pixels int
+
+	// interrupt is Config.Interrupt of the encode the scratch serves: long
+	// loops poll it to stop early.
+	interrupt func() bool
 }
+
+func (s *scratch) interrupted() bool { return s.interrupt != nil && s.interrupt() }
 
 // maxPooledPixels bounds the image size whose buffers are kept in the
 // sync.Pools (the free lists, see freelist.go, have their own budget): the
@@ -70,6 +76,7 @@ func getScratch() *scratch {
 // pool unless it served an image larger than maxPooledPixels (dropping it
 // bounds the memory retained by the pool).
 func putScratch(s *scratch) {
+	s.interrupt = nil // do not retain the caller's closure in the free list or pool
 	if scratchFree.put(s, s.bytes()) || s.pixels > maxPooledPixels {
 		return
 	}

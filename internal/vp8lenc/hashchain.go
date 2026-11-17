@@ -309,7 +309,7 @@ func (s *hcSearcher) fillStripes(helpers int, sc *scratch) {
 	parallel(stripes, helpers, func(worker int, claim func() (int, bool)) {
 		for {
 			k, ok := claim()
-			if !ok {
+			if !ok || sc.interrupted() {
 				return
 			}
 			k = stripes - 1 - k // top stripes first: the fix-up starts there
@@ -317,6 +317,11 @@ func (s *hcSearcher) fillStripes(helpers int, sc *scratch) {
 			exits[k], _ = s.run(min((k+1)*per-1, size-2), lo, lo, marks)
 		}
 	})
+	if sc.interrupted() {
+		// Some stripes may not have run: the matches are garbage, and the
+		// caller (encodeImageInternal) stops right after the fill.
+		return
+	}
 	// Fix-up, from the top: every position above t is final.
 	for t := size - 2; t > 0; {
 		if marks[t>>6]&(1<<uint(t&63)) != 0 {
