@@ -1,0 +1,161 @@
+package vp8lenc
+
+import (
+	"sync/atomic"
+
+	"github.com/kolesa-team/go-webp/v2/internal/workers"
+)
+
+// ThreadLevel parallelism.
+//
+// By default an encode runs on the caller's goroutine only. With
+// Config.ThreadLevel, independent work items (candidate configurations,
+// image stripes, histogram tiles) are spread over the caller and helper
+// goroutines started through the process-wide budget of internal/workers:
+// when no slot is free, the caller does all the work itself. Items are
+// claimed through an atomic counter (no channel operation per item) and
+// are coarse (at least about half a millisecond of work each). Every
+// result is independent of the number of goroutines, so the output is
+// byte-identical to the sequential encode.
+
+// parallel runs body on the calling goroutine (worker 0) and on up to
+// helpers helper goroutines (workers 1..helpers, never more than items-1),
+// each started only while the process-wide budget has a free slot. The
+// bodies claim the items 0..items-1 through claim, which hands out every
+// item exactly once (in increasing order) and then reports false. parallel
+// returns when every body has returned. A panic in a helper is re-raised on
+// the caller once all helpers are done; when the caller's body panics, the
+// helpers stop claiming items and are waited for before the panic unwinds
+// further.
+//
+// A body must not block waiting for another body (the item it waits for
+// may never be claimed when the budget is exhausted): items are
+// independent, and per-worker state (e.g. a scratch taken from a pool) is
+// acquired and released inside the body, on the goroutine that runs it.
+func parallel(items, helpers int, body func(worker int, claim func() (int, bool))) {
+	var next atomic.Int64
+	const stopped = 1 << 62
+	claim := func() (int, bool) {
+		i := next.Add(1) - 1
+		return int(i), i < int64(items)
+	}
+	helpers = min(helpers, items-1)
+	var tasks []*workers.Task
+	finished := false
+	defer func() {
+		if !finished {
+			next.Store(stopped) // the caller panicked: stop the helpers early
+		}
+		var failed *workers.Task
+		for _, t := range tasks {
+			if t.Panicked() && failed == nil {
+				failed = t
+			}
+		}
+		if finished && failed != nil {
+			failed.Wait() // re-raises the helper's panic
+		}
+	}()
+	for k := 1; k <= helpers; k++ {
+		t := workers.Spawn(func() error {
+			body(k, claim)
+			return nil
+		})
+		if t == nil {
+			break
+		}
+		tasks = append(tasks, t)
+	}
+	body(0, claim)
+	finished = true
+}
+
+// configHelpers is the number of helper goroutines (besides the caller)
+// that encode candidate configurations concurrently. Each encoding
+// configuration holds a full working set (15-100 bytes per pixel), so, like
+// libwebp's multi-threaded lossless encoder, at most two configurations
+// are encoded at a time: at level 9 this halves the time of the sequential
+// encode for about twice its peak memory (instead of one working set per
+// configuration, up to 8).
+const configHelpers = 1
+
+// configCost ranks the configurations by expected encoding time (spatial
+// prediction with its mode search and cross-color is the slowest, palette
+// encodes the fastest), so that the slowest start first.
+func configCost(cc crunchConfig) int {
+	switch cc.entropy {
+	case modeSpatial, modeSpatialSubGreen:
+		return 3
+	case modeDirect, modeSubGreen, modePaletteAndSpatial:
+		return 2
+	}
+	return 1
+}
+
+// configResult is the outcome of the configurations encoded by one worker:
+// its smallest stream (lowest configuration index on ties) and a spare
+// output buffer.
+type configResult struct {
+	best, spare []byte
+	idx         int
+}
+
+// encodeConfigs encodes argb with every configuration and returns the
+// smallest stream (the first one in configuration order on ties) and a
+// losing buffer (or spare if unused). Each worker writes each trial into
+// the buffer of its previous loser, so it keeps at most two streams.
+func encodeConfigs(argb []uint32, w, h int, p *params, configs []crunchConfig, prefix int, sc *scratch, spare []byte, helpers int) (best, spareOut []byte) {
+	order := make([]int, len(configs))
+	for i := range order {
+		order[i] = i
+	}
+	if helpers > 0 {
+		// Longest first (stable), for a better balance.
+		for i := 1; i < len(order); i++ {
+			for j := i; j > 0 && configCost(configs[order[j]]) > configCost(configs[order[j-1]]); j-- {
+				order[j], order[j-1] = order[j-1], order[j]
+			}
+		}
+	}
+	res := make([]configResult, 1+min(helpers, len(configs)-1))
+	parallel(len(configs), helpers, func(worker int, claim func() (int, bool)) {
+		s, buf := sc, spare
+		if worker > 0 {
+			s, buf = getScratch(), nil
+			defer putScratch(s)
+		}
+		r := &res[worker]
+		r.idx = -1
+		for {
+			k, ok := claim()
+			if !ok {
+				break
+			}
+			i := order[k]
+			out := encodeStream(argb, false, w, h, p, configs[i], prefix, s, buf)
+			if r.best == nil || len(out) < len(r.best) || len(out) == len(r.best) && i < r.idx {
+				buf, r.best, r.idx = r.best, out, i
+			} else {
+				buf = out
+			}
+		}
+		r.spare = buf
+	})
+	bi := -1
+	for k := range res {
+		r := &res[k]
+		if r.best != nil && (bi < 0 || len(r.best) < len(res[bi].best) || len(r.best) == len(res[bi].best) && r.idx < res[bi].idx) {
+			bi = k
+		}
+	}
+	best = res[bi].best
+	for k := range res {
+		cands := [2][]byte{res[k].spare, res[k].best}
+		for c, b := range cands {
+			if (k != bi || c == 0) && cap(b) > cap(spareOut) {
+				spareOut = b
+			}
+		}
+	}
+	return best, spareOut
+}
