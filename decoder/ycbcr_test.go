@@ -77,7 +77,11 @@ func withNoFancy(o *Options) *Options {
 }
 
 func TestDecodeYCbCr(t *testing.T) {
-	for _, file := range []string{"m4_q75.webp", "webp-logo-lossy.webp", "100x150_lossy.webp"} {
+	files := []string{"m4_q75.webp", "webp-logo-lossy.webp", "100x150_lossy.webp"}
+	if testing.Short() {
+		files = []string{"m4_q75.webp", "100x150_lossy.webp"}
+	}
+	for _, file := range files {
 		data := readFile(t, file)
 		f := newDec(t, data, nil).GetFeatures()
 		hasAlpha := f.HasAlpha

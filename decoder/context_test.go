@@ -94,6 +94,9 @@ func TestDecodeContextCancel(t *testing.T) {
 			}
 
 			// Not cancelled: same result as Decode.
+			if testing.Short() && file != "m4_q75.webp" {
+				continue
+			}
 			want := decode(t, data, o)
 			got, err := newDec(t, data, o).DecodeContext(newCountdown(1 << 30))
 			require.NoError(t, err)
