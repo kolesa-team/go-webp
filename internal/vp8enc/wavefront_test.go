@@ -90,10 +90,18 @@ func wavefrontCases(tb testing.TB) []wavefrontCase {
 	return cases
 }
 
+// forceWavefrontForTest lifts the size gate of the wavefront pass for the
+// rest of the test.
+func forceWavefrontForTest(tb testing.TB) {
+	forceWavefront = true
+	tb.Cleanup(func() { forceWavefront = false })
+}
+
 // TestWavefrontIdentical checks that the wavefront coding pass
 // (ThreadLevel) writes exactly the sequential pass's bytes for every
 // helper budget, including none.
 func TestWavefrontIdentical(t *testing.T) {
+	forceWavefrontForTest(t)
 	defer workers.SetLimitForTest(workers.SetLimitForTest(0))
 	defer func() { testHookWavefrontRow = nil }()
 	limits := []int{1, 2, 3, 4, 5, 6, 7, 8}
@@ -139,7 +147,7 @@ func TestWavefrontIdentical(t *testing.T) {
 
 // TestWavefrontGOMAXPROCS checks the output for GOMAXPROCS 1..8 with the
 // default budget (GOMAXPROCS-1 helpers), and with more helpers than
-// processors.
+// processors, under the default size gate.
 func TestWavefrontGOMAXPROCS(t *testing.T) {
 	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(0))
 	defer workers.SetLimitForTest(workers.SetLimitForTest(0))
@@ -166,21 +174,32 @@ func TestWavefrontGOMAXPROCS(t *testing.T) {
 }
 
 // TestWavefrontWorkers checks which pictures are coded as a wavefront and
-// on how many rows at once.
+// on how many rows at once (the cases hold with the vector kernels and
+// with the Go reference ones).
 func TestWavefrontWorkers(t *testing.T) {
-	for _, tc := range []struct{ w, h, want int }{
-		{1, 1, 1}, {255 * 16, 16, 1}, {16 * 16, 16 * 16, 8}, {675, 900, 16},
-		{4000, 3000, 16}, {16 * 3, 16 * 100, 1}, {16 * 5, 16 * 100, 2},
-		{16 * 300, 16 * 2, 2}, {16 * 100, 16 * 3, 3},
+	for _, tc := range []struct{ w, h, method, want int }{
+		{1, 1, 4, 1}, {256, 256, 4, 1}, {256, 256, 0, 1}, {960, 1280, 0, 1},
+		{960, 1280, 4, 7}, {640, 480, 6, 5}, {4000, 3000, 4, 8}, {4000, 3000, 2, 8},
+		{16, 4000, 6, 1}, {4000, 16, 6, 1}, {4000, 32, 6, 2},
 	} {
-		e := &encoder{mbW: (tc.w + 15) >> 4, mbH: (tc.h + 15) >> 4}
+		e := &encoder{mbW: (tc.w + 15) >> 4, mbH: (tc.h + 15) >> 4, method: tc.method}
 		e.cfg.ThreadLevel = true
 		if got := e.wavefrontWorkers(); got != tc.want {
-			t.Errorf("%dx%d: %d workers, want %d", tc.w, tc.h, got, tc.want)
+			t.Errorf("%dx%d m%d: %d workers, want %d", tc.w, tc.h, tc.method, got, tc.want)
 		}
 		e.cfg.ThreadLevel = false
 		if got := e.wavefrontWorkers(); got != 1 {
-			t.Errorf("%dx%d without ThreadLevel: %d workers", tc.w, tc.h, got)
+			t.Errorf("%dx%d m%d without ThreadLevel: %d workers", tc.w, tc.h, tc.method, got)
+		}
+	}
+	// Forced (tests): any picture of two rows or more, rows two
+	// macroblocks apart at least.
+	forceWavefrontForTest(t)
+	for _, tc := range []struct{ w, h, want int }{{16, 160, 1}, {64, 64, 2}, {64, 16, 1}, {640, 480, 8}} {
+		e := &encoder{mbW: (tc.w + 15) >> 4, mbH: (tc.h + 15) >> 4}
+		e.cfg.ThreadLevel = true
+		if got := e.wavefrontWorkers(); got != tc.want {
+			t.Errorf("forced %dx%d: %d workers, want %d", tc.w, tc.h, got, tc.want)
 		}
 	}
 }
@@ -189,6 +208,7 @@ func TestWavefrontWorkers(t *testing.T) {
 // on the calling goroutine, surfaces on the caller of Encode once all
 // helpers have stopped, and that no helper slot or goroutine leaks.
 func TestWavefrontPanic(t *testing.T) {
+	forceWavefrontForTest(t)
 	defer workers.SetLimitForTest(workers.SetLimitForTest(4))
 	defer func() { testHookWavefrontRow = nil }()
 	img := synthImage(512, 512, 1, 9) // 32x32 macroblocks
@@ -252,6 +272,7 @@ func TestWavefrontPanic(t *testing.T) {
 // ThreadLevel encode (analysis bands and wavefront rows, on helpers or on
 // the caller): Encode returns ErrInterrupted with every helper joined.
 func TestWavefrontInterrupt(t *testing.T) {
+	forceWavefrontForTest(t)
 	defer workers.SetLimitForTest(workers.SetLimitForTest(0))
 	img := synthImage(640, 480, 3, 13) // 40x30 macroblocks
 	for _, pass := range []int{1, 3} {
@@ -291,6 +312,7 @@ func TestWavefrontInterrupt(t *testing.T) {
 // compete for the budget, some passes get none, and every output must be
 // the sequential one.
 func TestWavefrontConcurrent(t *testing.T) {
+	forceWavefrontForTest(t)
 	defer workers.SetLimitForTest(workers.SetLimitForTest(3))
 	img := synthImage(400, 300, 3, 11)
 	cfgs := []Config{DefaultConfig(), DefaultConfig(), DefaultConfig()}
@@ -328,7 +350,7 @@ func TestWavefrontConcurrent(t *testing.T) {
 }
 
 // FuzzWavefront codes small random pictures as a wavefront (the size gate
-// lowered) on 1..9 workers and checks the output against the sequential
+// lifted) on 1..9 workers and checks the output against the sequential
 // pass.
 func FuzzWavefront(f *testing.F) {
 	f.Add(uint8(70), uint8(90), uint8(4), uint8(3), uint8(4), []byte{1, 2, 3})
@@ -357,8 +379,7 @@ func FuzzWavefront(f *testing.F) {
 			c.p0Limit = 1 << 14
 		}
 		want := c.encode(t)
-		defer func(n int) { minWavefrontMBs = n }(minWavefrontMBs)
-		minWavefrontMBs = 1
+		forceWavefrontForTest(t)
 		defer workers.SetLimitForTest(workers.SetLimitForTest(1 + int(limit8)%9))
 		c.cfg.ThreadLevel = true
 		if got := c.encode(t); !bytes.Equal(got, want) {

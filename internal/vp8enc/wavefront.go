@@ -50,29 +50,55 @@ import (
 // to a few rows of tokens on top of the frame's.
 //
 // Every wait blocks on a sync.Cond (one per worker) and is woken only when
-// its condition holds: a row's progress is published with an atomic store
-// and the worker of the row below is signalled only once that row is
-// wavefrontSlack macroblocks past what it needs, so that each wake-up
-// carries some work.
+// its condition holds: a row's progress is published with an atomic store,
+// and the worker of the row below, if it sleeps, is signalled only once the
+// row is a full gap (see minWavefrontGap) ahead. Hand-offs are expensive
+// (on Linux a woken goroutine may wait tens of microseconds, or until the
+// waker blocks, before another thread picks it up), so the rows are kept
+// far enough apart that workers rarely have to sleep.
 
 const (
-	// maxWavefrontWorkers bounds the number of rows coded at once.
-	maxWavefrontWorkers = 16
-	// wavefrontSlack is how far (in macroblocks) a row must have moved
-	// beyond what the row below needs before that row's worker, once it
-	// had to sleep, is woken.
-	wavefrontSlack = 4
-	noWant         = math.MaxInt32
+	// maxWavefrontWorkers bounds the number of rows coded at once (the
+	// refresh points limit the gain beyond).
+	maxWavefrontWorkers = 8
+	// minWavefrontGap is the smallest distance (in macroblocks) between
+	// two rows coded at once: a worker that has to sleep until the row
+	// above is far enough ahead is woken only once that row is
+	// max(minWavefrontGap, mbW/workers) macroblocks ahead, the spacing
+	// rows naturally take, so that each wake-up is followed by a run of
+	// work rather than another wait.
+	minWavefrontGap = 8
+	noWant          = math.MaxInt32
+
+	// The wavefront is used only when the pass is long enough to pay for
+	// its hand-offs (each worker sleeps and is woken a few times per
+	// refresh point, which costs from tens of microseconds to about half a
+	// millisecond in virtual machines): at least minWavefrontWork of
+	// estimated work in all, minWavefrontRowWork per row and
+	// wavefrontWorkPerWorker per worker (nanoseconds).
+	minWavefrontWork       = 8_000_000
+	minWavefrontRowWork    = 250_000
+	wavefrontWorkPerWorker = 4_000_000
 )
+
+// wavefrontMBCost estimates the coding pass time per macroblock (ns) of
+// each method, measured on a photo (Apple M5) with the vector kernels and
+// with the Go reference ones.
+var wavefrontMBCost = func() [7]int {
+	if vecKernels {
+		return [7]int{1500, 1500, 2400, 7400, 7800, 9400, 24000}
+	}
+	return [7]int{3200, 3500, 4800, 24600, 23600, 24800, 35200}
+}()
 
 var (
 	wavefrontPool = sync.Pool{New: func() any { return new(wfState) }}
 	// lfValuePool holds the autofilter SSIM lists of the row slots.
 	lfValuePool bufpool.Pool[float64]
 
-	// minWavefrontMBs is the smallest picture (in macroblocks) coded as a
-	// wavefront; smaller ones are not worth the hand-offs. Tests lower it.
-	minWavefrontMBs = 256
+	// forceWavefront (tests only) codes every picture of two rows or more
+	// as a wavefront, whatever its size.
+	forceWavefront bool
 	// testHookWavefrontRow, if set (tests only), is called on the worker
 	// goroutine before it codes a row of a wavefront pass.
 	testHookWavefrontRow func(row int)
@@ -81,11 +107,18 @@ var (
 // wavefrontWorkers returns how many rows the coding pass may code at once
 // (1: sequential).
 func (e *encoder) wavefrontWorkers() int {
-	if !e.cfg.ThreadLevel || e.mbW*e.mbH < minWavefrontMBs {
+	if !e.cfg.ThreadLevel {
 		return 1
 	}
-	// Rows are at least two macroblocks apart.
-	return max(1, min(maxWavefrontWorkers, e.mbH, e.mbW/2))
+	if forceWavefront {
+		return max(1, min(maxWavefrontWorkers, e.mbH, e.mbW/2))
+	}
+	cost := wavefrontMBCost[e.method]
+	work := e.mbW * e.mbH * cost
+	if work < minWavefrontWork || e.mbW*cost < minWavefrontRowWork {
+		return 1
+	}
+	return max(1, min(maxWavefrontWorkers, e.mbH, e.mbW/minWavefrontGap, work/wavefrontWorkPerWorker))
 }
 
 // wfWorker is one goroutine of a wavefront pass.
@@ -117,8 +150,9 @@ type wfState struct {
 	e        *encoder
 	mbW, mbH int
 	rdOpt    int
-	period   int  // cost tables refresh period, 0: none
-	lf       bool // record the autofilter statistics
+	period   int   // cost tables refresh period, 0: none
+	lf       bool  // record the autofilter statistics
+	gap      int32 // see minWavefrontGap
 
 	nextRow     atomic.Int32 // next row to take
 	epoch       atomic.Int32 // cost table refreshes done
@@ -227,6 +261,7 @@ func (wf *wfState) init(e *encoder, nw int, isLastPass bool, maxCount int) {
 		wf.period = maxCount + 1
 	}
 	wf.lf = isLastPass && e.lfStats != nil
+	wf.gap = int32(max(minWavefrontGap, wf.mbW/nw))
 	wf.nextRow.Store(0)
 	wf.epoch.Store(0)
 	wf.committed.Store(0)
@@ -362,7 +397,7 @@ func (wf *wfState) awaitMB(w *wfWorker, r, x int) bool {
 	if (r == 0 || wf.prog[r-1].Load() >= need) && wf.epoch.Load() >= epoch && !wf.stopped.Load() {
 		return true
 	}
-	return wf.await(w, r-1, need, min(need+wavefrontSlack, int32(wf.mbW)), epoch, 0)
+	return wf.await(w, r-1, need, min(int32(x)+wf.gap, int32(wf.mbW)), epoch, 0)
 }
 
 // refresh refreshes the cost tables before macroblock x of row r, a
