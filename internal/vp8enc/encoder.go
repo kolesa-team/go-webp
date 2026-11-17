@@ -2,7 +2,9 @@ package vp8enc
 
 import (
 	"sync"
+	"sync/atomic"
 
+	"github.com/kolesa-team/go-webp/v2/internal/bufpool"
 	"github.com/kolesa-team/go-webp/v2/internal/status"
 )
 
@@ -65,8 +67,15 @@ type encoder struct {
 	flat  [numProbaSlots]uint8
 
 	it iterator
+
+	// analysis pass row bands (analysis.go)
+	bands    [maxAnalysisBands]segmentJob
+	nextBand atomic.Int32
 }
 
+// encoderPool holds encoder structs (a few tens of KB, whatever the picture
+// size): their buffers proportional to the picture area or to the output
+// are detached by release and kept in the size-class pools instead.
 var encoderPool = sync.Pool{New: func() any { return new(encoder) }}
 
 func resize[T any](s []T, n int) []T {
@@ -78,12 +87,46 @@ func resize[T any](s []T, n int) []T {
 	return s
 }
 
+// getCleared returns a zeroed buffer of length n from pool.
+func getCleared[T any](pool *bufpool.Pool[T], n int) []T {
+	s := pool.Get(n)
+	clear(s)
+	return s
+}
+
+// release returns the buffers proportional to the picture area or to the
+// output size to their pools.
+func (e *encoder) release() {
+	e.pic = nil
+	e.tokens.release()
+	mbInfoPool.Put(e.mbInfo)
+	bytePool.Put(e.preds)
+	int32Pool.Put(e.mbTokStart)
+	e.mbInfo, e.preds, e.mbTokStart = nil, nil, nil
+	for i := range e.parts {
+		e.parts[i].release()
+	}
+	e.bw0.release()
+}
+
 // Encode encodes pic and returns the VP8 chunk payload (frame header,
 // partition #0 and token partitions). The returned slice is owned by the
 // caller.
 func Encode(pic *Picture, cfg *Config) ([]byte, error) {
+	return EncodeWithHeadroom(pic, cfg, 0)
+}
+
+// EncodeWithHeadroom is Encode, with the payload written after headroom
+// bytes reserved at the start of the returned slice: out[headroom:] is the
+// VP8 chunk payload, and the caller can write the container headers into
+// out[:headroom] instead of copying the payload. out is owned by the
+// caller.
+func EncodeWithHeadroom(pic *Picture, cfg *Config, headroom int) ([]byte, error) {
 	if pic == nil {
 		return nil, status.InvalidParam("vp8enc: nil picture")
+	}
+	if headroom < 0 {
+		return nil, status.InvalidParam("vp8enc: negative headroom")
 	}
 	c := DefaultConfig()
 	if cfg != nil {
@@ -103,18 +146,15 @@ func Encode(pic *Picture, cfg *Config) ([]byte, error) {
 	}
 	e := encoderPool.Get().(*encoder)
 	defer func() {
-		e.pic = nil
-		e.tokens.release()
-		if pic.Width*pic.Height <= maxPooledPixels {
-			encoderPool.Put(e)
-		}
+		e.release()
+		encoderPool.Put(e)
 	}()
 	e.setup(pic, &c)
 	e.analyze()
 	if err := e.tokenLoop(); err != nil {
 		return nil, err
 	}
-	return e.write()
+	return e.write(headroom)
 }
 
 func (e *encoder) setup(pic *Picture, cfg *Config) {
@@ -125,8 +165,8 @@ func (e *encoder) setup(pic *Picture, cfg *Config) {
 	e.predsW = 4*e.mbW + 1
 	predsH := 4*e.mbH + 1
 	e.numParts = 1 << uint(cfg.Partitions)
-	e.mbInfo = resize(e.mbInfo, e.mbW*e.mbH)
-	e.preds = resize(e.preds, e.predsW*predsH)
+	e.mbInfo = getCleared(&mbInfoPool, e.mbW*e.mbH)
+	e.preds = getCleared(&bytePool, e.predsW*predsH)
 	e.nz = resize(e.nz, e.mbW+1)
 	e.yTop = resize(e.yTop, e.mbW*16)
 	e.uvTop = resize(e.uvTop, e.mbW*16)
@@ -185,5 +225,5 @@ func (e *encoder) setup(pic *Picture, cfg *Config) {
 	e.alpha, e.uvAlpha = 0, 0
 
 	e.tokens.reset()
-	e.mbTokStart = resize(e.mbTokStart, e.mbW*e.mbH+1)
+	e.mbTokStart = getCleared(&int32Pool, e.mbW*e.mbH+1)
 }

@@ -1,7 +1,5 @@
 package vp8enc
 
-import "sync"
-
 // Token buffer: records the coefficient coding events before the final
 // probabilities are known, then emits them.
 // Algorithm adapted from libwebp (BSD-3-Clause).
@@ -21,7 +19,7 @@ func tokenID(t, b, ctx int) int {
 // Tokens are stored in fixed-size pages, like libwebp's VP8TBuffer: the
 // buffer grows one page at a time without ever copying, its footprint
 // follows the actual number of tokens, and pages are recycled through
-// tokenPagePool across encodes.
+// tokenPagePool across encodes (1.5-2.5 B/px of pages for photos).
 const (
 	tokenPageShift = 13
 	tokenPageSize  = 1 << tokenPageShift
@@ -29,8 +27,6 @@ const (
 )
 
 type tokenPage = [tokenPageSize]uint16
-
-var tokenPagePool = sync.Pool{New: func() any { return new(tokenPage) }}
 
 // tokenBuffer is a paged list of tokens. Tokens are addressed by a global
 // index; index i lives in pages[i>>tokenPageShift][i&tokenPageMask].
@@ -52,7 +48,7 @@ func (tb *tokenBuffer) reset() {
 // release returns all pages to the pool.
 func (tb *tokenBuffer) release() {
 	for i, pg := range tb.pages {
-		tokenPagePool.Put(pg)
+		tokenPagePool.Put(pg[:])
 		tb.pages[i] = nil
 	}
 	tb.pages = tb.pages[:0]
@@ -69,7 +65,8 @@ func (tb *tokenBuffer) nextPage() {
 		tb.n++
 	}
 	if tb.n == len(tb.pages) {
-		tb.pages = append(tb.pages, tokenPagePool.Get().(*tokenPage))
+		// Pages are written before they are read: no clearing needed.
+		tb.pages = append(tb.pages, (*tokenPage)(tokenPagePool.Get(tokenPageSize)))
 	}
 	tb.cur = tb.pages[tb.n][:0]
 }
@@ -223,28 +220,63 @@ func (tb *tokenBuffer) recordStatsRange(start, end int, stats *[numTypes]statsAr
 	}
 }
 
-// emitTokens codes the tokens with the final probabilities.
-func emitTokens(bw *bitWriter, toks []uint16, probas *[numProbaSlots]uint8) {
-	for _, t := range toks {
-		bit := int(t >> 15)
-		if t&tokenFixedProba != 0 {
-			bw.putBitInt(bit, int(t&0xff))
+// tokenProba returns the probability a token is coded with: its constant
+// probability, or its slot in probas. For a constant token t&0x3fff is the
+// probability itself (< 256), so the table load is always in range, and
+// the two are selected with a mask rather than a branch (constant and slot
+// tokens alternate unpredictably).
+func tokenProba(t uint16, probas *[numProbaSlots]uint8) uint8 {
+	p := probas[int(t&0x3fff)%numProbaSlots]
+	m := -uint8(t >> 14 & 1) // 0xff for a constant-probability token
+	return p&^m | uint8(t)&m
+}
+
+// kNorm256 and kNewRange256 extend kNorm and kNewRange to every value of
+// range-1: values >= 127 need no renormalization (shift 0, same range).
+var kNorm256, kNewRange256 = func() (norm, newRange [256]uint8) {
+	for r := range 256 {
+		if r < 127 {
+			norm[r], newRange[r] = kNorm[r], kNewRange[r]
 		} else {
-			bw.putBitInt(bit, int(probas[t&0x3fff%numProbaSlots]))
+			newRange[r] = uint8(r)
 		}
 	}
+	return
+}()
+
+// emitTokens codes the tokens with the final probabilities. It is libwebp's
+// VP8PutBit for every token, with the coder state kept in locals and the
+// bit update and renormalization done without branches; only the byte
+// output (flush) goes through the bitWriter. TestEmitTokensExact checks it
+// against the straightforward coder.
+func emitTokens(bw *bitWriter, toks []uint16, probas *[numProbaSlots]uint8) {
+	rng, value, nbBits := bw.rng, bw.value, bw.nbBits
+	for _, t := range toks {
+		split := (rng * int32(tokenProba(t, probas))) >> 8
+		mask := -int32(t >> 15) // bit ? -1 : 0
+		value += (split + 1) & mask
+		// bit ? rng - (split + 1) : split; rng stays in [0, 254].
+		rng = split ^ ((split ^ (rng - split - 1)) & mask)
+		shift := kNorm256[uint8(rng)]
+		rng = int32(kNewRange256[uint8(rng)])
+		value <<= shift & 7
+		nbBits += int(shift)
+		if nbBits > 0 {
+			bw.rng, bw.value, bw.nbBits = rng, value, nbBits
+			bw.flush()
+			value, nbBits = bw.value, bw.nbBits
+		}
+	}
+	bw.rng, bw.value, bw.nbBits = rng, value, nbBits
 }
 
 // estimateTokenSize returns the cost (1/256 bits) of the tokens.
 func estimateTokenSize(toks []uint16, probas *[numProbaSlots]uint8) uint64 {
 	var size uint64
 	for _, t := range toks {
-		bit := int(t >> 15)
-		if t&tokenFixedProba != 0 {
-			size += uint64(bitCost(bit, uint8(t)))
-		} else {
-			size += uint64(bitCost(bit, probas[t&0x3fff%numProbaSlots]))
-		}
+		// bitCost(bit, p) is entropyCost[p] for a 0 and entropyCost[255-p]
+		// (= p^0xff) for a 1.
+		size += uint64(entropyCost[tokenProba(t, probas)^uint8(-(t>>15))])
 	}
 	return size
 }

@@ -43,9 +43,26 @@ func (bw *bitWriter) init(capHint int) {
 	bw.run = 0
 	bw.nbBits = -8
 	if cap(bw.buf) < capHint {
-		bw.buf = make([]byte, 0, capHint)
+		bytePool.Put(bw.buf)
+		bw.buf = bytePool.Get(capHint)
 	}
 	bw.buf = bw.buf[:0]
+}
+
+// release returns the output buffer to its pool.
+func (bw *bitWriter) release() {
+	bytePool.Put(bw.buf)
+	bw.buf = nil
+}
+
+// grow makes room for n more bytes when the output outgrows its estimate:
+// the larger buffer comes from bytePool and the outgrown one goes back to
+// it (append would leave it to the garbage collector).
+func (bw *bitWriter) grow(n int) {
+	nb := bytePool.Get(max(2*cap(bw.buf), len(bw.buf)+n, 1024))
+	nb = append(nb[:0], bw.buf...)
+	bytePool.Put(bw.buf)
+	bw.buf = nb
 }
 
 func (bw *bitWriter) flush() {
@@ -54,6 +71,9 @@ func (bw *bitWriter) flush() {
 	bw.value -= bits << s
 	bw.nbBits -= 8
 	if bits&0xff != 0xff {
+		if len(bw.buf)+bw.run >= cap(bw.buf) {
+			bw.grow(bw.run + 1)
+		}
 		if bits&0x100 != 0 { // overflow -> propagate carry over pending 0xff's
 			if n := len(bw.buf); n > 0 {
 				bw.buf[n-1]++
@@ -78,27 +98,6 @@ func (bw *bitWriter) flush() {
 func (bw *bitWriter) putBit(bit bool, prob int) bool {
 	split := (bw.rng * int32(prob)) >> 8
 	if bit {
-		bw.value += split + 1
-		bw.rng -= split + 1
-	} else {
-		bw.rng = split
-	}
-	if bw.rng < 127 {
-		shift := kNorm[bw.rng&127]
-		bw.rng = int32(kNewRange[bw.rng&127])
-		bw.value <<= shift
-		bw.nbBits += int(shift)
-		if bw.nbBits > 0 {
-			bw.flush()
-		}
-	}
-	return bit
-}
-
-// putBitInt is putBit for a 0/1 integer value.
-func (bw *bitWriter) putBitInt(bit int, prob int) int {
-	split := (bw.rng * int32(prob)) >> 8
-	if bit != 0 {
 		bw.value += split + 1
 		bw.rng -= split + 1
 	} else {
