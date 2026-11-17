@@ -17,7 +17,7 @@ import (
 func setRing(t testing.TB, rows int) {
 	oldBytes, oldRows := alphaRingBytes, minAlphaRingRows
 	if rows == 0 {
-		alphaRingBytes = 1 << 40
+		alphaRingBytes = 1 << 30
 	} else {
 		alphaRingBytes, minAlphaRingRows = 0, rows
 	}
