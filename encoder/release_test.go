@@ -2,6 +2,7 @@ package encoder
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"image"
@@ -56,6 +57,8 @@ func lossyLossless(t testing.TB) []*Options {
 }
 
 func TestRelease(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	for _, o := range lossyLossless(t) {
 		for _, src := range sourceImages(37, 29, 1) {
 			name := fmt.Sprintf("%T lossless=%v", src, o.Lossless)
@@ -66,6 +69,7 @@ func TestRelease(t *testing.T) {
 			e.Release()
 			var cw countWriter
 			require.ErrorIs(t, e.Encode(&cw), ErrReleased, name)
+			require.ErrorIs(t, e.EncodeContext(ctx, &cw), ErrReleased, name)
 			require.Zero(t, cw.calls, name)
 			e.Release() // no-op
 			require.Nil(t, e.img, name)

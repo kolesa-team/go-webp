@@ -25,6 +25,7 @@
 package webp
 
 import (
+	"context"
 	"errors"
 	"image"
 	"image/color"
@@ -151,4 +152,18 @@ func Encode(w io.Writer, src image.Image, options *encoder.Options) error {
 	// One shot: the snapshot of src goes back to the pools right away.
 	defer enc.Release()
 	return enc.Encode(w)
+}
+
+// EncodeContext is Encode, but gives up when ctx is done and then returns
+// ctx.Err(), writing nothing to w (see encoder.Encoder.EncodeContext).
+func EncodeContext(ctx context.Context, w io.Writer, src image.Image, options *encoder.Options) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	enc, err := encoder.NewEncoder(src, options)
+	if err != nil {
+		return err
+	}
+	defer enc.Release()
+	return enc.EncodeContext(ctx, w)
 }

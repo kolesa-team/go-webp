@@ -2,6 +2,7 @@ package webp
 
 import (
 	"bytes"
+	"context"
 	"image"
 	"image/draw"
 	"testing"
@@ -32,6 +33,9 @@ func TestEncodeOneShotIdentical(t *testing.T) {
 				var want, got bytes.Buffer
 				require.NoError(t, e.Encode(&want))
 				require.NoError(t, Encode(&got, src, o))
+				require.Equal(t, want.Bytes(), got.Bytes(), "%T lossless=%v", src, o.Lossless)
+				got.Reset()
+				require.NoError(t, EncodeContext(context.Background(), &got, src, o))
 				require.Equal(t, want.Bytes(), got.Bytes(), "%T lossless=%v", src, o.Lossless)
 			}
 		}

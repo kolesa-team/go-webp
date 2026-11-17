@@ -24,6 +24,7 @@
 package encoder
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"image"
@@ -39,7 +40,8 @@ import (
 // maxDimension is the largest width or height of a WebP image.
 const maxDimension = 16383
 
-// ErrReleased is returned by Encode when it is called after Release.
+// ErrReleased is returned by Encode and EncodeContext when they are called
+// after Release.
 var ErrReleased = errors.New("encoder: Encode called after Release")
 
 // Encoder stores information to encode image
@@ -141,10 +143,35 @@ func (e *Encoder) Encode(w io.Writer) error {
 	return err
 }
 
+// EncodeContext is Encode, but gives up when ctx is done: the encoders
+// check ctx about once per macroblock row (lossy) and between their passes
+// and search rows (lossless), stop together with their helper goroutines,
+// and EncodeContext returns ctx.Err() (not wrapped). Nothing is written to
+// w unless ctx is still not done once the file is complete. Converting the
+// source picture, which NewEncoder does, is not covered.
+func (e *Encoder) EncodeContext(ctx context.Context, w io.Writer) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	var interrupt func() bool
+	if ctx.Done() != nil { // nil for contexts that can never be canceled
+		interrupt = func() bool { return ctx.Err() != nil }
+	}
+	out, err := e.encode(interrupt)
+	if cerr := ctx.Err(); cerr != nil && (err == nil || interrupted(err)) {
+		return cerr
+	}
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(out)
+	return err
+}
+
 // Release hands the Encoder's copy of its source picture back to internal
-// pools, so that later encodes can reuse the memory. Encode returns
-// ErrReleased afterwards. Release waits for the encodes in progress on
-// other goroutines; calling it again does nothing.
+// pools, so that later encodes can reuse the memory. Encode and
+// EncodeContext return ErrReleased afterwards. Release waits for the encodes
+// in progress on other goroutines; calling it again does nothing.
 //
 // Calling Release is optional: otherwise the memory is reclaimed by the
 // garbage collector (and returned to the pools once the Encoder is
@@ -168,7 +195,7 @@ func (e *Encoder) Release() {
 }
 
 // encode returns the WebP file. interrupt, if not nil, is polled by the
-// encoders, which give up when it returns true.
+// encoders (see EncodeContext).
 func (e *Encoder) encode(interrupt func() bool) ([]byte, error) {
 	// Holding the read lock until the snapshot is no longer used also keeps
 	// e reachable meanwhile, so that its cleanup cannot recycle the storage
