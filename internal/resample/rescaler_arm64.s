@@ -580,3 +580,47 @@ enext:
 
 edone:
 	RET
+
+// func premultiplyNEON(row *byte, n int)
+//
+// WebPMultARGBRow(..., inverse=0) on n bytes (n > 0, a multiple of 16),
+// four RGBA pixels per iteration. For every channel value x of a pixel
+// with alpha a, libwebp computes (x * (a * KINV_255) + 2^23) >> 24 (and
+// leaves a = 255 pixels alone, zeroes a = 0 ones); for all 8-bit x and a
+// that equals
+//
+//	(u + (u >> 8)) >> 8, u = x*a + 128
+//
+// (checked exhaustively by TestPremultiplyExhaustive). Alpha itself is
+// multiplied by 255, which the same formula maps back to a. u fits 16 bits.
+//
+// R0 row, R1 bytes left. V0 pixels, V1 multipliers, V2/V3 products,
+// V4 result, V16 TBL indices broadcasting alpha, V17 255 in the alpha
+// bytes, V18 128 per 16-bit lane.
+TEXT ·premultiplyNEON(SB), NOSPLIT, $0-16
+	MOVD  row+0(FP), R0
+	MOVD  n+8(FP), R1
+	CBZ   R1, pdone
+	VMOVQ $0xff070707ff030303, $0xff0f0f0fff0b0b0b, V16
+	VMOVQ $0xff000000ff000000, $0xff000000ff000000, V17
+	MOVD  $128, R2
+	VDUP  R2, V18.H8
+
+ploop:
+	VLD1    (R0), [V0.B16]
+	VTBL    V16.B16, [V0.B16], V1.B16
+	VORR    V17.B16, V1.B16, V1.B16
+	VUMULL  V1.B8, V0.B8, V2.H8
+	VUMULL2 V1.B16, V0.B16, V3.H8
+	VADD    V18.H8, V2.H8, V2.H8
+	VADD    V18.H8, V3.H8, V3.H8
+	VUSRA   $8, V2.H8, V2.H8
+	VUSRA   $8, V3.H8, V3.H8
+	VSHRN   $8, V2.H8, V4.B8
+	VSHRN2  $8, V3.H8, V4.B16
+	VST1.P  [V4.B16], 16(R0)
+	SUBS    $16, R1, R1
+	BNE     ploop
+
+pdone:
+	RET
