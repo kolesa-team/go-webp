@@ -130,6 +130,11 @@ outer:
 		if sliding {
 			stop = min(stop, len(buf)-maxCopyLength)
 		}
+		if a := d.async; a != nil && level0 && a.guard > 0 {
+			// Do not overwrite the rows the helper still reads (copies
+			// write up to maxCopyLength pixels past stop).
+			stop = min(stop, a.guard-maxCopyLength)
+		}
 		for p < stop {
 			if col&mask == 0 {
 				g = md.group(groups, col, row)
@@ -290,6 +295,13 @@ outer:
 		if base+p >= lastPixel {
 			break
 		}
+		if a := d.async; a != nil && level0 && a.guard > 0 && p < len(buf)-maxCopyLength {
+			// Stopped at the guard: wait for the helper, then go on.
+			if err = a.waitGuard(); err != nil {
+				break
+			}
+			continue
+		}
 		// Slide the window: keep the LZ77 window and the rows not yet
 		// emitted. The pending cache pixels move, so settle them first.
 		if cache != nil && !eager && p-lastCached >= lazyCacheMinRun {
@@ -298,6 +310,11 @@ outer:
 			insertCache(cache, buf[lastCached:p], cacheShift)
 		}
 		keep := min(base+p-window, d.lastRow*w)
+		if a := d.async; a != nil && level0 {
+			if err = a.beforeSlide(p - (keep - base)); err != nil {
+				break
+			}
+		}
 		n := copy(buf, buf[keep-base:p])
 		base = keep
 		p = n
@@ -322,6 +339,9 @@ outer:
 // the output conversion when it is subtract-green or color indexing.
 func (d *decoder) processRows(buf []uint32, base, row int) error {
 	row = min(row, d.needRows)
+	if d.async != nil {
+		return d.sendRows(buf, base, row, false)
+	}
 	// A resumed decode (AlphaDecoder) may have more than numCacheRows
 	// decoded rows pending: emit them in batches that fit d.rows.
 	for row-d.lastRow > numCacheRows {
@@ -340,9 +360,19 @@ func (d *decoder) processBatch(buf []uint32, base, row int) error {
 		return nil
 	}
 	w := d.xsize
-	fw := d.width
 	argb := buf[y0*w-base : row*w-base]
 	d.lastRow = row
+	return d.emitRows(argb, y0, row)
+}
+
+// emitRows runs the inverse transforms over rows [y0, row) (at most
+// numCacheRows rows, the level-0 pixels argb) and emits them. Rows must
+// arrive in order. In a two-stage decode it runs on the helper goroutine,
+// so it must only use the decoder state reserved to it: d.rows, the fused
+// palette tables and the output.
+func (d *decoder) emitRows(argb []uint32, y0, row int) error {
+	n := row - y0
+	fw := d.width
 
 	// Pick the transform fused into the output step, if any.
 	var final *transform

@@ -100,6 +100,9 @@ type decoder struct {
 	ib      []byte   // 8-bit index buffer (whole image or sliding window)
 	inTail  bool     // the 8-bit path switched to the tail bit reader
 	tr      tailReader
+
+	useThreads bool       // Options.UseThreads
+	async      *asyncEmit // two-stage decode in progress (async.go)
 }
 
 // pixState is the position of a (resumable) pixel decoding loop. base is
@@ -129,6 +132,8 @@ func getDecoder() *decoder {
 	d.palReady = false
 	d.premulPal = false
 	d.bundleReady = false
+	d.useThreads = false
+	d.async = nil
 	return d
 }
 
@@ -188,6 +193,17 @@ func DecodeHeader(data []byte) (width, height int, hasAlpha bool, err error) {
 	return width, height, hasAlpha, nil
 }
 
+// Options configures DecodeWithOptions.
+type Options struct {
+	// UseThreads decodes big images (at least 256K needed pixels) in two
+	// stages when the process-wide helper budget allows (see package
+	// internal/workers): the calling goroutine decodes the entropy-coded
+	// pixels while a helper goroutine applies the inverse transforms and
+	// writes the rows into the sink. The output is the same either way.
+	// libwebp ignores use_threads for lossless images.
+	UseThreads bool
+}
+
 // Decode decodes a VP8L chunk payload and writes non-premultiplied RGBA rows
 // into sink, top to bottom (respecting sink.NeedRows() to stop early).
 //
@@ -198,6 +214,13 @@ func DecodeHeader(data []byte) (width, height int, hasAlpha bool, err error) {
 // slice reproduces that behavior exactly. Bits beyond len(data) read as
 // zero.
 func Decode(data []byte, sink pipeline.Sink) error {
+	return DecodeWithOptions(data, sink, nil)
+}
+
+// DecodeWithOptions is Decode with options (nil for the defaults). With
+// UseThreads the sink may be called from a helper goroutine, never
+// concurrently and always before DecodeWithOptions returns.
+func DecodeWithOptions(data []byte, sink pipeline.Sink, opts *Options) error {
 	w, h, _, err := DecodeHeader(data)
 	if err != nil {
 		return err
@@ -216,6 +239,7 @@ func Decode(data []byte, sink pipeline.Sink) error {
 	d.out = outRGBA
 	d.sink = sink
 	d.needRows = max(need, 0)
+	d.useThreads = opts != nil && opts.UseThreads
 	err = d.decodeLevel0(w, h)
 	if status.CodeOf(err) == utils.Vp8StatusNotEnoughData {
 		// The whole file is available (no incremental decoding): like
@@ -433,6 +457,13 @@ func (d *decoder) decodeLevel0(w, h int) error {
 		}
 	}
 	d.initBuffer32()
+	if d.startAsync() {
+		// Stop the helper on every path; after a normal return finishAsync
+		// already did, and this is a no-op.
+		defer d.abortAsync()
+		err := d.decodePixels(&d.md0, d.buf, d.xsize, h, true, d.sliding, d.window, &d.px)
+		return d.finishAsync(d.buf, d.px.base, err)
+	}
 	return d.decodePixels(&d.md0, d.buf, d.xsize, h, true, d.sliding, d.window, &d.px)
 }
 
