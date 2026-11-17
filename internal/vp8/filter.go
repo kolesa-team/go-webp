@@ -237,9 +237,19 @@ func loop24H(buf []byte, o, stride, n, thresh2, ithresh, hevT int) {
 	}
 }
 
-// filterMB applies the in-loop filter to the macroblock at column mbX of the
-// current cache row (libwebp's DoFilter).
-func (d *decoder) filterMB(mbX, mbY int, f fInfo) {
+// Edge selection flags of a macroblock (the NEON filters take them as
+// one argument).
+const (
+	edgeLeft  = 1 // left macroblock edge (mbX > 0)
+	edgeTop   = 2 // top macroblock edge (mbY > 0)
+	edgeInner = 4 // the inner 4x4 block edges
+)
+
+// filterMBGo applies the in-loop filter to the macroblock at column mbX of
+// the current cache row (libwebp's DoFilter). This is the portable
+// reference; filterMB (filter_arm64.go, filter_generic.go) is the entry
+// point used by the decoder.
+func (d *decoder) filterMBGo(mbX, mbY int, f fInfo) {
 	limit := int(f.limit)
 	if limit == 0 {
 		return
