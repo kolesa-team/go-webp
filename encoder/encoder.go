@@ -133,7 +133,7 @@ func validDimensions(r image.Rectangle) bool {
 
 // Encode picture and flush to io.Writer
 func (e *Encoder) Encode(w io.Writer) error {
-	out, err := e.encode()
+	out, err := e.encode(nil)
 	if err != nil {
 		return err
 	}
@@ -167,8 +167,9 @@ func (e *Encoder) Release() {
 	e.img, e.pic = nil, nil
 }
 
-// encode returns the WebP file.
-func (e *Encoder) encode() ([]byte, error) {
+// encode returns the WebP file. interrupt, if not nil, is polled by the
+// encoders, which give up when it returns true.
+func (e *Encoder) encode(interrupt func() bool) ([]byte, error) {
 	// Holding the read lock until the snapshot is no longer used also keeps
 	// e reachable meanwhile, so that its cleanup cannot recycle the storage
 	// under the encoders.
@@ -186,14 +187,21 @@ func (e *Encoder) encode() ([]byte, error) {
 		err error
 	)
 	if e.config.Lossless {
-		out, err = e.encodeLossless()
+		out, err = e.encodeLossless(interrupt)
 	} else {
-		out, err = e.encodeLossy()
+		out, err = e.encodeLossy(interrupt)
 	}
 	if err != nil {
 		return nil, &encodeError{err}
 	}
 	return out, nil
+}
+
+// interrupted reports whether err comes from an encoder that stopped
+// because its interrupt hook asked it to.
+func interrupted(err error) bool {
+	return errors.Is(err, vp8enc.ErrInterrupted) || errors.Is(err, vp8lenc.ErrInterrupted) ||
+		errors.Is(err, errAlphaInterrupted)
 }
 
 // encodeError reports an encoding failure with exactly v1's message,
@@ -214,7 +222,7 @@ func (s *sliceWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (e *Encoder) encodeLossless() ([]byte, error) {
+func (e *Encoder) encodeLossless(interrupt func() bool) ([]byte, error) {
 	c := e.config
 	buf, err := vp8lenc.EncodeWithHeadroom(e.img, &vp8lenc.Config{
 		Quality:         c.Quality,
@@ -225,6 +233,7 @@ func (e *Encoder) encodeLossless() ([]byte, error) {
 		LowMemory:       c.LowMemory,
 		ThreadLevel:     c.ThreadLevel,
 		ImageHint:       int(c.ImageHint),
+		Interrupt:       interrupt,
 	}, container.LosslessHeaderSize)
 	if err != nil {
 		return nil, err
@@ -234,7 +243,7 @@ func (e *Encoder) encodeLossless() ([]byte, error) {
 	return container.FrameLossless(buf)
 }
 
-func (e *Encoder) encodeLossy() ([]byte, error) {
+func (e *Encoder) encodeLossy(interrupt func() bool) ([]byte, error) {
 	c := e.config
 	cfg := vp8enc.Config{
 		Quality:         c.Quality,
@@ -255,6 +264,7 @@ func (e *Encoder) encodeLossy() ([]byte, error) {
 		EmulateJPEGSize: c.EmulateJPEGSize,
 		ThreadLevel:     c.ThreadLevel,
 		LowMemory:       c.LowMemory,
+		Interrupt:       interrupt,
 	}
 
 	var (
@@ -263,17 +273,37 @@ func (e *Encoder) encodeLossy() ([]byte, error) {
 		err     error
 	)
 	if e.pic != nil {
-		payload, err = vp8enc.Encode(e.pic, &cfg)
+		payload, err = vp8Encode(e.pic, &cfg)
 	} else {
+		var at *alphaTask
 		if hasTransparency(e.img) {
-			if alph, err = encodeAlpha(e.img, c); err != nil {
+			if c.ThreadLevel {
+				// Like libwebp's alpha worker (thread_level > 0), code the
+				// alpha plane concurrently with the VP8 frame when a helper
+				// goroutine is available.
+				at = startAlpha(e.img, c, interrupt)
+			}
+			if at != nil {
+				// Joins the helper on every return path, panics included.
+				defer at.cancel()
+			} else if alph, err = alphaEncode(e.img, c, interrupt); err != nil {
 				return nil, err
 			}
 		}
 		dithering := vp8enc.DitheringFor(&vp8enc.Config{Quality: c.Quality, Preprocessing: c.Preprocessing})
 		pic := vp8enc.FromNRGBADithered(e.img, c.UseSharpYUV || c.Preprocessing&4 != 0, c.Exact, dithering)
-		payload, err = vp8enc.Encode(pic, &cfg)
+		payload, err = vp8Encode(pic, &cfg)
 		pic.Release()
+		if at != nil {
+			// The sequential order codes the alpha plane first, so its
+			// errors take precedence, except an interruption caused by the
+			// failure of the VP8 frame.
+			var aerr error
+			alph, aerr = at.wait(err != nil)
+			if aerr != nil && (err == nil || !interrupted(aerr)) {
+				return nil, aerr
+			}
+		}
 	}
 	if err != nil {
 		return nil, err
