@@ -1,6 +1,7 @@
 package vp8l
 
 import (
+	"fmt"
 	"math/rand"
 	"slices"
 	"testing"
@@ -126,6 +127,124 @@ func BenchmarkEmit(b *testing.B) {
 			b.SetBytes(4 * w)
 			for i := 0; i < b.N; i++ {
 				c.f(src, dst)
+			}
+		})
+	}
+}
+
+// predictorRef is libwebp's predictor of the given mode for one pixel, from
+// its left, top, top-left and top-right neighbors, channel by channel.
+func predictorRef(mode uint32, l, t, tl, tr uint32) uint32 {
+	ch := func(c uint32, k uint) int32 { return int32(c >> k & 0xff) }
+	avg := func(a, b uint32) uint32 {
+		var r uint32
+		for k := uint(0); k < 32; k += 8 {
+			r |= uint32((ch(a, k)+ch(b, k))>>1) << k
+		}
+		return r
+	}
+	clip := func(v int32) uint32 { return uint32(min(max(v, 0), 255)) }
+	abs := func(v int32) int32 { return max(v, -v) }
+	var r uint32
+	switch mode {
+	case 1:
+		return l
+	case 2:
+		return t
+	case 3:
+		return tr
+	case 4:
+		return tl
+	case 5:
+		return avg(avg(l, tr), t)
+	case 6:
+		return avg(l, tl)
+	case 7:
+		return avg(l, t)
+	case 8:
+		return avg(tl, t)
+	case 9:
+		return avg(t, tr)
+	case 10:
+		return avg(avg(l, tl), avg(t, tr))
+	case 11:
+		s := int32(0)
+		for k := uint(0); k < 32; k += 8 {
+			s += abs(ch(l, k)-ch(tl, k)) - abs(ch(t, k)-ch(tl, k))
+		}
+		if s <= 0 {
+			return t
+		}
+		return l
+	case 12:
+		for k := uint(0); k < 32; k += 8 {
+			r |= clip(ch(l, k)+ch(t, k)-ch(tl, k)) << k
+		}
+		return r
+	case 13:
+		a := avg(l, t)
+		for k := uint(0); k < 32; k += 8 {
+			r |= clip(ch(a, k)+(ch(a, k)-ch(tl, k))/2) << k
+		}
+		return r
+	}
+	return 0xff000000
+}
+
+// TestPredictRun checks every predictor mode against predictorRef, for
+// runs at any position of rows of any width, in place or not.
+func TestPredictRun(t *testing.T) {
+	rng := rand.New(rand.NewSource(3))
+	for iter := 0; iter < 3000; iter++ {
+		mode := uint32(rng.Intn(16))
+		n := 2 + rng.Intn(70)
+		x0 := 1 + rng.Intn(n-1)
+		x1 := x0 + rng.Intn(n-x0+1)
+		in := make([]uint32, n)
+		up := make([]uint32, n+1)
+		for i := range in {
+			in[i] = rng.Uint32()
+		}
+		for i := range up {
+			up[i] = rng.Uint32()
+			if rng.Intn(3) == 0 {
+				up[i] = in[min(i, n-1)] // close values exercise the clamps
+			}
+		}
+		want := make([]uint32, n)
+		want[x0-1] = rng.Uint32()
+		got := slices.Clone(want)
+		for x := x0; x < x1; x++ {
+			want[x] = addPixels(in[x], predictorRef(mode, want[x-1], up[x], up[x-1], up[x+1]))
+		}
+		predictRun(mode, in, got, up, x0, x1)
+		if !slices.Equal(want, got) {
+			t.Fatalf("mode %d, n %d [%d, %d): output differs", mode, n, x0, x1)
+		}
+		inPlace := slices.Clone(in)
+		inPlace[x0-1] = want[x0-1]
+		predictRun(mode, inPlace, inPlace, up, x0, x1)
+		if !slices.Equal(want[x0-1:x1], inPlace[x0-1:x1]) {
+			t.Fatalf("mode %d, n %d [%d, %d): in-place output differs", mode, n, x0, x1)
+		}
+	}
+}
+
+func BenchmarkPredictRun(b *testing.B) {
+	const w = 3000
+	rng := rand.New(rand.NewSource(1))
+	in, out, up := make([]uint32, w), make([]uint32, w), make([]uint32, w+1)
+	for i := range in {
+		in[i] = rng.Uint32() & 0x0f0f0f0f // small residuals
+		up[i] = rng.Uint32()
+	}
+	for mode := uint32(0); mode < 14; mode++ {
+		b.Run(fmt.Sprintf("mode%d", mode), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				// Tiles of 32 pixels, as in a photo.
+				for x := 1; x < w; x += 32 {
+					predictRun(mode, in, out, up, x, min(x+32, w))
+				}
 			}
 		})
 	}
