@@ -1,7 +1,10 @@
+//go:build !arm64 || purego
+
 package resample
 
-// archState holds no kernel state without assembly.
-type archState struct{}
+// archState holds no kernel state without assembly; kind is always 0 (the
+// Go kernels).
+type archState struct{ kind uint8 }
 
 func archTableSize(dstWidth, numChannels int) int { return 0 }
 
