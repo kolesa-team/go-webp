@@ -38,20 +38,44 @@ func initRefsCap(argb []uint32, w, h int) int {
 	if n <= 4096 {
 		return n
 	}
-	argb = argb[:n]
-	est := 1
-	for i := 1; i < w; i++ {
-		if argb[i] != argb[i-1] {
-			est++
-		}
+	est := 1 + newPixels(argb[1:w], nil, argb[0])
+	for y := 1; y < h; y++ {
+		est += newPixels(argb[y*w:(y+1)*w], argb[(y-1)*w:y*w], argb[y*w-1])
 	}
-	for i := w; i < n; i++ {
-		p := argb[i]
-		if p != argb[i-1] && p != argb[i-w] {
-			est++
-		}
+	return refsCapFromEstimate(n, est)
+}
+
+// refsCapFromEstimate is initRefsCap for an image of n pixels of which est
+// differ from their left and top neighbors.
+func refsCapFromEstimate(n, est int) int {
+	if n <= 4096 {
+		return n
 	}
 	return min(n, est+est/2+4096)
+}
+
+// newPixels returns the number of pixels of row that differ from their left
+// neighbor (left for the first one) and, if up is not nil, from their top
+// neighbor in up.
+func newPixels(row, up []uint32, left uint32) int {
+	n := 0
+	if up == nil {
+		for _, p := range row {
+			if p != left {
+				n++
+			}
+			left = p
+		}
+		return n
+	}
+	up = up[:len(row)]
+	for x, p := range row {
+		if p != left && p != up[x] {
+			n++
+		}
+		left = p
+	}
+	return n
 }
 
 // growRefs returns refs with room for at least one more entry, doubling its

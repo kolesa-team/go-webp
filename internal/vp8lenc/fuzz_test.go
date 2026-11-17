@@ -1,17 +1,26 @@
 package vp8lenc
 
 import (
+	"bytes"
 	"encoding/binary"
 	"image"
 	"testing"
+
+	"github.com/kolesa-team/go-webp/v2/internal/vp8l"
 )
 
 // FuzzEncode checks that arbitrary small images and configurations never
-// panic and always produce a well-formed header.
+// panic, always produce a well-formed header and, when lossless, decode to
+// the source pixels (the RGB of fully transparent pixels may change without
+// Exact). Flag bit 6 runs every ThreadLevel stage in parallel, even for
+// these small images.
 func FuzzEncode(f *testing.F) {
 	f.Add([]byte{3, 7, 4, 75, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9})
 	f.Add([]byte{0, 0, 0, 0, 255, 255, 255, 255})
 	f.Add([]byte{16, 2, 6, 100, 9, 9, 9, 9, 0, 0, 0, 0})
+	f.Add([]byte{39, 38, 4, 75, 64, 0, 0, 0, 0, 200, 10, 30, 255, 7, 99, 3, 128, 1, 2, 3, 255})
+	f.Add([]byte{30, 0, 3, 40, 65, 0, 0, 0, 0, 5, 6, 7, 255, 8, 9, 10, 255, 11})
+	f.Add([]byte{17, 25, 5, 90, 66, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12})
 	f.Fuzz(func(t *testing.T, data []byte) {
 		if len(data) < 4 {
 			return
@@ -40,6 +49,10 @@ func FuzzEncode(f *testing.F) {
 			LowMemory:    flags&16 != 0,
 			ThreadLevel:  flags&32 != 0,
 		}
+		if flags&64 != 0 {
+			cfg.ThreadLevel = true
+			defer forceParallel()()
+		}
 		out, err := Encode(img, cfg)
 		if err != nil {
 			t.Fatal(err)
@@ -48,12 +61,29 @@ func FuzzEncode(f *testing.F) {
 		if out[0] != vp8lSignature || int(v&0x3fff)+1 != w || int((v>>14)&0x3fff)+1 != h {
 			t.Fatal("bad header")
 		}
+		if cfg.NearLossless == 100 {
+			got := decodeVP8L(t, out, w, h)
+			for i := 0; i < len(got); i += 4 {
+				src := img.Pix[i : i+4]
+				if got[i+3] != src[3] || (src[3] != 0 || cfg.Exact) && !bytes.Equal(got[i:i+3], src[:3]) {
+					t.Fatalf("%+v: pixel %d decodes to %v, want %v", *cfg, i/4, got[i:i+4], src)
+				}
+			}
+		}
 		plane := make([]byte, w*h)
 		for i := range plane {
 			plane[i] = img.Pix[4*i+3]
 		}
-		if _, err := EncodeAlpha(plane, w, h, w, method, quality); err != nil {
+		stream, err := EncodeAlpha(plane, w, h, w, method, quality)
+		if err != nil {
 			t.Fatal(err)
+		}
+		got := make([]byte, w*h)
+		if err := vp8l.DecodeAlpha(stream, w, h, got); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, plane) {
+			t.Fatal("alpha plane does not decode to the source")
 		}
 	})
 }

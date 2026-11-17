@@ -137,9 +137,13 @@ func colorCacheHash(argb uint32, shift uint) uint32 {
 var u32Pools [32]sync.Pool
 
 // getU32 returns a []uint32 of length n (contents unspecified). Large
-// buffers are allocated with their exact size and never pooled.
+// buffers come from the free list (one at most twice as large as needed),
+// or are allocated with their exact size.
 func getU32(n int) []uint32 {
 	if n > maxPooledPixels {
+		if b, ok := argbFree.get(func(b []uint32) bool { return cap(b) >= n && cap(b)/2 <= n }); ok {
+			return b[:n]
+		}
 		return make([]uint32, n)
 	}
 	c := bits.Len(uint(n - 1))
@@ -152,10 +156,15 @@ func getU32(n int) []uint32 {
 	return make([]uint32, n, 1<<uint(c))
 }
 
-// putU32 returns b (obtained from getU32) to the pool.
+// putU32 returns b (obtained from getU32) to the pool, or to the free list
+// if it is large.
 func putU32(b []uint32) {
+	if cap(b) > maxPooledPixels {
+		argbFree.put(b[:0], sliceBytes(b))
+		return
+	}
 	c := bits.Len(uint(cap(b) - 1))
-	if cap(b) == 0 || cap(b) > maxPooledPixels || 1<<uint(c) != cap(b) {
+	if cap(b) == 0 || 1<<uint(c) != cap(b) {
 		return
 	}
 	b = b[:0]

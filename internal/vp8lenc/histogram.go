@@ -21,6 +21,10 @@ type histo struct {
 	isUsed  [5]bool
 	binID   int
 	used    bool // the histogram is not empty
+	// shared marks a tile histogram of the clusterer (clusterer.orig) used
+	// as is in the working set: its populations and costs must not change
+	// (the working set copies it on write, see clusterer.mergeInto).
+	shared bool
 }
 
 // nonTrivialSym marks a code with zero or several symbols.
@@ -326,29 +330,84 @@ func combineCostFactor(histoSize, quality int) float64 {
 }
 
 type clusterer struct {
-	orig      histoSet // per-tile histograms
-	symbols   []uint16
-	mapping   []int
-	queue     pairQueue
-	set       []*histo // working set; set[:size] are the live histograms
+	orig    histoSet // per-tile histograms
+	symbols []uint16
+	mapping []int
+	queue   pairQueue
+	// set[:size] is the working set: the live histograms. It starts with
+	// the (shared) non-empty tile histograms themselves; a merge writes its
+	// result into a histogram of owned (copy on write), so that only the
+	// merged histograms take memory besides the tile histograms.
+	set       []*histo
 	size      int
 	combo     *histo // scratch histogram of the entropy-bin combination
 	cacheBits int
 	binFirst  [binSize]int
 	binFail   [binSize]int
+
+	owned     []*histo // working histograms (kept for later calls)
+	numOwned  int      // owned[:numOwned] are in use or in free
+	freeOwned []*histo
+}
+
+// newHisto returns an unused working histogram (contents unspecified).
+func (c *clusterer) newHisto() *histo {
+	var h *histo
+	if k := len(c.freeOwned); k > 0 {
+		h = c.freeOwned[k-1]
+		c.freeOwned = c.freeOwned[:k-1]
+		return h
+	}
+	if c.numOwned == len(c.owned) {
+		c.owned = append(c.owned, new(histo))
+	}
+	h = c.owned[c.numOwned]
+	c.numOwned++
+	stride := c.orig.stride
+	if cap(h.d) < stride {
+		h.d = make([]uint32, stride)
+	}
+	h.d = h.d[:stride:stride]
+	return h
+}
+
+// release hands h (no longer in the working set) back to newHisto if it is
+// a working histogram.
+func (c *clusterer) release(h *histo) {
+	if !h.shared {
+		c.freeOwned = append(c.freeOwned, h)
+	}
+}
+
+// mergeInto sets set[i] to set[j] + set[i] (libwebp HistogramAdd(set[j],
+// set[i], set[i])), in place unless set[i] is a shared tile histogram.
+func (c *clusterer) mergeInto(i, j int) *histo {
+	dst := c.set[i]
+	if dst.shared {
+		dst = c.newHisto()
+	}
+	addHisto(c.set[j], c.set[i], dst)
+	c.set[i] = dst
+	return dst
 }
 
 // remove removes set[i], replacing it by the last histogram (libwebp
 // HistogramSetRemoveHistogram).
 func (c *clusterer) remove(i int) {
+	c.release(c.set[i])
 	c.set[i] = c.set[c.size-1]
 	c.size--
 }
 
+// minParallelRemap is the smallest remap (tiles times clusters) spread over
+// helper goroutines (a variable for the tests).
+var minParallelRemap = 1 << 12
+
 // buildHistoImage computes the clustered histograms for refs. It returns the
 // final histograms (in out) and fills c.symbols with the tile->histogram map.
+// helpers > 0 allows a parallel remap.
 func (c *clusterer) buildHistoImage(xsize, ysize int, refs []pixOrCopy, quality int,
-	lowEffort bool, histoBits, cacheBits int, out *histoSet) int {
+	lowEffort bool, histoBits, cacheBits int, out *histoSet, helpers int) int {
 	hx := subSampleSize(xsize, histoBits)
 	hy := subSampleSize(ysize, histoBits)
 	nt := hx * hy
@@ -370,13 +429,13 @@ func (c *clusterer) buildHistoImage(xsize, ysize int, refs []pixOrCopy, quality 
 	}
 	c.symbols = c.symbols[:nt]
 
-	// Analyze the tile histograms and copy the non-empty ones into the
-	// working set (plus one scratch histogram).
+	// Analyze the tile histograms; the non-empty ones form the working set.
 	numUsed := 0
 	for i := range c.orig.h {
 		h := &c.orig.h[i]
 		c.orig.computeCost(h)
 		h.used = h.isUsed[0] || h.isUsed[1] || h.isUsed[2] || h.isUsed[3] || h.isUsed[4]
+		h.shared = true
 		if h.used {
 			numUsed++
 		}
@@ -387,27 +446,24 @@ func (c *clusterer) buildHistoImage(xsize, ysize int, refs []pixOrCopy, quality 
 		clear(c.symbols)
 		return 1
 	}
-	out.init(numUsed+1, cacheBits)
 	if cap(c.set) < numUsed {
 		c.set = make([]*histo, numUsed)
 	}
 	c.set = c.set[:numUsed]
 	k := 0
 	for i := range c.orig.h {
-		o := &c.orig.h[i]
-		if !o.used {
-			continue
+		if o := &c.orig.h[i]; o.used {
+			c.set[k] = o
+			k++
 		}
-		h := &out.h[k]
-		copy(h.d, o.d)
-		d := h.d
-		*h = *o
-		h.d = d
-		c.set[k] = h
-		k++
 	}
 	c.size = numUsed
-	c.combo = &out.h[numUsed]
+	c.numOwned = 0
+	c.freeOwned = c.freeOwned[:0]
+	c.combo = c.newHisto()
+	// The working histograms have the layout of the tile histograms: the
+	// combination steps use c.orig for it.
+	s := &c.orig
 
 	entropyBins := binSize
 	if lowEffort {
@@ -415,15 +471,15 @@ func (c *clusterer) buildHistoImage(xsize, ysize int, refs []pixOrCopy, quality 
 	}
 	entropyCombine := numUsed > 2*entropyBins && quality < 100
 	if entropyCombine {
-		c.entropyBinCombine(out, entropyBins, lowEffort, combineCostFactor(nt, quality))
+		c.entropyBinCombine(s, entropyBins, lowEffort, combineCostFactor(nt, quality))
 	}
 	if !lowEffort || !entropyCombine {
 		thresholdSize := 1 + (quality*quality*quality*(maxHistoGreedy-1)+(100*100*100)/2)/(100*100*100)
-		if c.stochasticCombine(out, thresholdSize) {
-			c.greedyCombine(out)
+		if c.stochasticCombine(s, thresholdSize) {
+			c.greedyCombine(s)
 		}
 	}
-	c.remap(out)
+	c.remap(out, helpers)
 	return len(out.h)
 }
 
@@ -442,6 +498,7 @@ func (c *clusterer) entropyBinCombine(s *histoSet, numBins int, lowEffort bool, 
 		blueMin = math.Min(blueMin, h.costs[2])
 		blueMax = math.Max(blueMax, h.costs[2])
 	}
+	// (binID is scratch state: it is also set on shared histograms.)
 	for _, h := range set[:c.size] {
 		b := binID(litMin, litMax, h.costs[0])
 		if !lowEffort {
@@ -466,7 +523,7 @@ func (c *clusterer) entropyBinCombine(s *histoSet, numBins int, lowEffort bool, 
 		}
 		f := set[first]
 		if lowEffort {
-			addHisto(h, f, f)
+			c.mergeInto(first, idx)
 			c.remove(idx)
 			continue
 		}
@@ -489,7 +546,12 @@ func (c *clusterer) entropyBinCombine(s *histoSet, numBins int, lowEffort bool, 
 				(f.trivial[1] == nonTrivialSym || f.trivial[2] == nonTrivialSym || f.trivial[3] == nonTrivialSym)
 		}
 		if try || c.binFail[b] >= maxCombineFailures {
+			// combo replaces f, which becomes the scratch histogram (unless
+			// it is shared).
 			set[first], c.combo = combo, f
+			if f.shared {
+				c.combo = c.newHisto()
+			}
 			c.remove(idx)
 		} else {
 			c.binFail[b]++
@@ -497,8 +559,11 @@ func (c *clusterer) entropyBinCombine(s *histoSet, numBins int, lowEffort bool, 
 		}
 	}
 	if lowEffort {
+		// (The costs of the unmerged, shared histograms are up to date.)
 		for _, h := range set[:c.size] {
-			s.computeCost(h)
+			if !h.shared {
+				s.computeCost(h)
+			}
 		}
 	}
 }
@@ -554,9 +619,9 @@ func (c *clusterer) stochasticCombine(s *histoSet, minClusterSize int) bool {
 			continue
 		}
 		b1, b2 := pq.q[0].i1, pq.q[0].i2
-		addHisto(set[b2], set[b1], set[b1])
-		set[b1].bitCost = pq.q[0].costCmb
-		set[b1].costs = pq.q[0].costs
+		m := c.mergeInto(b1, b2)
+		m.bitCost = pq.q[0].costCmb
+		m.costs = pq.q[0].costs
 		c.remove(b2)
 		for j := 0; j < len(pq.q); {
 			p := &pq.q[j]
@@ -596,9 +661,9 @@ func (c *clusterer) greedyCombine(s *histoSet) {
 	}
 	for len(pq.q) > 0 {
 		i1, i2 := pq.q[0].i1, pq.q[0].i2
-		addHisto(set[i2], set[i1], set[i1])
-		set[i1].bitCost = pq.q[0].costCmb
-		set[i1].costs = pq.q[0].costs
+		m := c.mergeInto(i1, i2)
+		m.bitCost = pq.q[0].costCmb
+		m.costs = pq.q[0].costs
 		c.remove(i2)
 		for k := 0; k < len(pq.q); {
 			p := &pq.q[k]
@@ -619,15 +684,51 @@ func (c *clusterer) greedyCombine(s *histoSet) {
 	}
 }
 
+// remapChunk is the number of tiles per work item of a parallel remap.
+const remapChunk = 32
+
 // remap assigns each tile histogram to the best final cluster (libwebp
 // HistogramRemap), renumbers the clusters by first use (dropping the
-// unused ones) and recomputes the final histograms into out.
-func (c *clusterer) remap(out *histoSet) {
+// unused ones) and recomputes the final histograms into out. With helpers
+// > 0 and enough work, the assignments (independent per tile) are spread
+// over helper goroutines.
+func (c *clusterer) remap(out *histoSet, helpers int) {
 	set := c.set[:c.size]
 	syms := c.symbols
 	orig := c.orig.h
 	if len(set) > 1 {
-		var costs [5]float64
+		assign := func(lo, hi int) {
+			var costs [5]float64
+			for i := lo; i < hi; i++ {
+				if !orig[i].used {
+					continue
+				}
+				best := 0
+				bestBits := math.MaxFloat64
+				for k, h := range set {
+					cmb, ok := c.orig.combinedCost(h, &orig[i], h.bitCost+bestBits, &costs)
+					if ok {
+						bestBits = cmb - h.bitCost
+						best = k
+					}
+				}
+				syms[i] = uint16(best)
+			}
+		}
+		if chunks := (len(orig) + remapChunk - 1) / remapChunk; helpers > 0 && chunks > 1 && len(orig)*len(set) >= minParallelRemap {
+			parallel(chunks, helpers, func(_ int, claim func() (int, bool)) {
+				for {
+					k, ok := claim()
+					if !ok {
+						return
+					}
+					assign(k*remapChunk, min((k+1)*remapChunk, len(orig)))
+				}
+			})
+		} else {
+			assign(0, len(orig))
+		}
+		// Unused tiles take the cluster of the previous tile.
 		for i := range orig {
 			if !orig[i].used {
 				if i > 0 {
@@ -635,18 +736,7 @@ func (c *clusterer) remap(out *histoSet) {
 				} else {
 					syms[i] = 0
 				}
-				continue
 			}
-			best := 0
-			bestBits := math.MaxFloat64
-			for k, h := range set {
-				cmb, ok := out.combinedCost(h, &orig[i], h.bitCost+bestBits, &costs)
-				if ok {
-					bestBits = cmb - h.bitCost
-					best = k
-				}
-			}
-			syms[i] = uint16(best)
 		}
 	} else {
 		clear(syms)

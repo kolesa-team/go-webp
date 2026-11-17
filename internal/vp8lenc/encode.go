@@ -7,7 +7,6 @@ import (
 	"errors"
 	"image"
 	"math"
-	"sync"
 )
 
 // Config controls the lossless encoder. Field semantics follow libwebp's
@@ -31,7 +30,11 @@ type Config struct {
 	// LowMemory reduces peak memory (smaller LZ77 window, fewer candidate
 	// encodings kept in memory) at some cost in size.
 	LowMemory bool
-	// ThreadLevel allows evaluating candidate encodings concurrently.
+	// ThreadLevel allows helper goroutines from the process-wide budget of
+	// internal/workers (see parallel.go): candidate encodings are evaluated
+	// two at a time (up to 8 MP), and the match search, the predictor mode
+	// search and the histogram remap of large images are split among
+	// helpers. The output does not depend on it. Ignored with LowMemory.
 	ThreadLevel bool
 	// ImageHint is libwebp's WebPImageHint (0 default, 1 picture, 2 photo,
 	// 3 graph). With 3 (graph), palette images additionally try the
@@ -84,8 +87,10 @@ type params struct {
 	// RGB residual of a fully transparent pixel is zeroed and the pixel
 	// replaced by its prediction (only set when such pixels exist).
 	cleanTransparent bool
-	parallel         bool
-	paletteSorts     [2][]uint32
+	// opaque: every pixel has alpha 0xff (see predictorImage).
+	opaque       bool
+	parallel     bool
+	paletteSorts [2][]uint32
 }
 
 func clampInt(v, lo, hi int) int {
@@ -145,7 +150,10 @@ func EncodeWithHeadroom(img *image.NRGBA, cfg *Config, headroom int) ([]byte, er
 	n := w * h
 	argb := getU32(n)
 	defer putU32(argb)
-	hasAlpha := false
+	// The conversion also finds what encodeARGB would otherwise scan the
+	// image for: fully transparent pixels and the palette.
+	hasAlpha, transparent := false, false
+	var colors colorSet
 	for y := 0; y < h; y++ {
 		src := img.Pix[y*img.Stride : y*img.Stride+4*w]
 		dst := argb[y*w : (y+1)*w]
@@ -154,15 +162,21 @@ func EncodeWithHeadroom(img *image.NRGBA, cfg *Config, headroom int) ([]byte, er
 			a := uint32(s[3])
 			if a != 0xff {
 				hasAlpha = true
-			}
-			if a == 0 && !cfg.Exact {
-				dst[x] = 0
-				continue
+				if a == 0 {
+					transparent = true
+					if !cfg.Exact {
+						dst[x] = 0
+						continue
+					}
+				}
 			}
 			dst[x] = a<<24 | uint32(s[0])<<16 | uint32(s[1])<<8 | uint32(s[2])
 		}
+		colors.add(dst) // (a no-op past 256 colors)
 	}
-	out, _ := encodeARGB(argb, w, h, cfg, true, headroom+5, nil, nil)
+	var palBuf [maxPaletteSize]uint32
+	info := imageInfo{known: true, transparent: transparent, opaque: !hasAlpha, palette: colors.palette(palBuf[:0])}
+	out, _ := encodeARGB(argb, w, h, cfg, true, headroom+5, nil, nil, &info)
 	hdr := out[headroom : headroom+5]
 	hdr[0] = vp8lSignature
 	v := uint32(w-1) | uint32(h-1)<<14
@@ -219,19 +233,29 @@ func (a *AlphaEncoder) Encode(plane []byte, width, height, stride int, method in
 	}
 	argb := a.argb[:n]
 	// Like libwebp's WebPDispatchAlphaToGreen, the alpha, red and blue
-	// channels are left to 0 (the alpha channel is not transmitted).
+	// channels are left to 0 (the alpha channel is not transmitted). The
+	// plane has at most 256 values: its palette is collected on the way.
+	var seen [256]bool
 	for y := 0; y < height; y++ {
 		row := plane[y*stride : y*stride+width]
 		dst := argb[y*width : (y+1)*width]
 		for x, a := range row {
 			dst[x] = uint32(a) << 8
+			seen[a] = true
+		}
+	}
+	var palBuf [maxPaletteSize]uint32
+	info := imageInfo{known: true, palette: palBuf[:0]}
+	for v, ok := range seen {
+		if ok {
+			info.palette = append(info.palette, uint32(v)<<8)
 		}
 	}
 	if a.sc == nil {
 		a.sc = getScratch()
 	}
 	cfg := &Config{Quality: q, Method: method, Exact: true, NearLossless: 100}
-	out, spare := encodeARGB(argb, width, height, cfg, true, 0, a.sc, a.spare)
+	out, spare := encodeARGB(argb, width, height, cfg, true, 0, a.sc, a.spare, &info)
 	a.spare = spare
 	return out, nil
 }
@@ -301,6 +325,15 @@ func getTransformBits(method, histoBits int) int {
 	return histoBits
 }
 
+// imageInfo is what the caller of encodeARGB found out about the image
+// while converting it, saving encodeARGB a scan of its own.
+type imageInfo struct {
+	known       bool     // the fields below are set
+	transparent bool     // some pixel is fully transparent (alpha 0)
+	opaque      bool     // every pixel has alpha 0xff
+	palette     []uint32 // the sorted distinct colors, nil if more than 256
+}
+
 // encodeARGB encodes argb (which may be modified: the caller must not use
 // it afterwards) and
 // returns a freshly allocated slice holding prefix zero bytes followed by the
@@ -311,7 +344,7 @@ func getTransformBits(method, histoBits int) int {
 // encodeStream). Besides the smallest stream, encodeARGB returns a buffer of
 // a losing candidate (or spare itself if unused), which the caller may pass
 // as spare to a later call.
-func encodeARGB(argb []uint32, w, h int, cfg *Config, useCache bool, prefix int, sc *scratch, spare []byte) (best, spareOut []byte) {
+func encodeARGB(argb []uint32, w, h int, cfg *Config, useCache bool, prefix int, sc *scratch, spare []byte, info *imageInfo) (best, spareOut []byte) {
 	quality, method := normalize(cfg)
 	p := params{
 		quality:   quality,
@@ -320,20 +353,29 @@ func encodeARGB(argb []uint32, w, h int, cfg *Config, useCache bool, prefix int,
 		useCache:  useCache,
 		parallel:  cfg.ThreadLevel && !cfg.LowMemory,
 	}
-	if !cfg.Exact {
-		for _, c := range argb[:w*h] {
-			if c < 0x01000000 {
-				p.cleanTransparent = true
-				break
+	n := w * h
+	var palette []uint32
+	if info != nil && info.known {
+		p.cleanTransparent = !cfg.Exact && info.transparent
+		p.opaque = info.opaque
+		palette = info.palette
+	} else {
+		p.opaque = true
+		for _, c := range argb[:n] {
+			if c < 0xff000000 {
+				p.opaque = false
+				if c < 0x01000000 && !cfg.Exact {
+					p.cleanTransparent = true
+					break
+				}
 			}
 		}
+		var palBuf [maxPaletteSize]uint32
+		palette = collectPalette(argb[:n], palBuf[:0])
 	}
 	if cfg.LowMemory {
 		p.windowCap = 1 << 16
 	}
-	n := w * h
-	var palBuf [maxPaletteSize]uint32
-	palette := collectPalette(argb[:n], palBuf[:0])
 	usePalette := palette != nil
 	p.nearLossless = clampInt(cfg.NearLossless, 0, 100)
 	p.histoBits = getHistoBits(method, usePalette, w, h)
@@ -396,51 +438,7 @@ func encodeARGB(argb []uint32, w, h int, cfg *Config, useCache bool, prefix int,
 		// argb in place).
 		return encodeStream(argb[:n], true, w, h, &p, configs[0], prefix, sc, spare), nil
 	}
-	results := make([][]byte, len(configs))
-	if p.parallel {
-		var wg sync.WaitGroup
-		for i := range configs {
-			wg.Add(1)
-			go func(i int) {
-				defer wg.Done()
-				s := sc
-				if i > 0 {
-					s = getScratch()
-					defer putScratch(s)
-				}
-				var buf []byte
-				if i == 0 {
-					buf = spare
-				}
-				results[i] = encodeStream(argb[:n], false, w, h, &p, configs[i], prefix, s, buf)
-			}(i)
-		}
-		wg.Wait()
-	} else {
-		// Keep only the best stream and one spare buffer: each trial
-		// writes into the buffer of the previous loser.
-		for i := range configs {
-			r := encodeStream(argb[:n], false, w, h, &p, configs[i], prefix, sc, spare)
-			if best == nil || len(r) < len(best) {
-				best, spare = r, best
-			} else {
-				spare = r
-			}
-		}
-		return best, spare
-	}
-	bi := 0
-	for i, r := range results {
-		if len(r) < len(results[bi]) {
-			bi = i
-		}
-	}
-	for i, r := range results {
-		if i != bi && cap(r) > cap(spareOut) {
-			spareOut = r
-		}
-	}
-	return results[bi], spareOut
+	return encodeConfigs(argb[:n], w, h, &p, configs, prefix, sc, spare, p.configHelpersFor(n))
 }
 
 // hashPix approximates palette entropy with a multiplicative hash.
@@ -552,16 +550,23 @@ func analyzeEntropy(argb []uint32, w, h int, usePalette bool, paletteSize, trans
 	return best, rb
 }
 
+// streamHeadroom is the initial output capacity of a stream (beyond the
+// prefix): room for the transforms and their sub-images.
+const streamHeadroom = 16 << 10
+
 // encodeStream encodes src with one crunch configuration and returns a
 // byte slice with prefix zero bytes followed by the image stream (with one
 // spare byte of capacity for a RIFF padding byte). The stream is written
-// into buf if its capacity is at least the initial estimate, else into a
-// new buffer. src is modified only if mutable is set.
+// into buf if its capacity is at least prefix+streamHeadroom (growing it
+// when needed), else into a new buffer. src is modified only if mutable is
+// set.
 func encodeStream(src []uint32, mutable bool, w, h int, p *params, cc crunchConfig, prefix int, sc *scratch, buf []byte) []byte {
 	sc.noteSize(w * h)
 	// The output is written straight into the returned buffer (no final
-	// copy), presized from a rough estimate of 1.5 bytes per pixel.
-	if need := prefix + w*h*3/2 + 4096; cap(buf) >= need {
+	// copy). It is first sized for the transforms (small sub-images), then
+	// grown once to the size estimate of the main image before writing it
+	// (encodeImageInternal).
+	if need := prefix + streamHeadroom; cap(buf) >= need {
 		buf = buf[:prefix]
 		clear(buf)
 	} else {
@@ -575,6 +580,7 @@ func encodeStream(src []uint32, mutable bool, w, h int, p *params, cc crunchConf
 	quality := p.quality
 	width := w
 	var cur []uint32
+	refsCap := -1 // initRefsCap of the main image, when known
 	cacheBitsMax := 0
 	if p.useCache {
 		cacheBitsMax = maxColorCacheBits
@@ -583,8 +589,15 @@ func encodeStream(src []uint32, mutable bool, w, h int, p *params, cc crunchConf
 		pal := p.paletteSorts[cc.paletteSort]
 		xbits := paletteXBits(len(pal))
 		width = subSampleSize(w, xbits)
-		cur = sc.curBuf(width * h)
-		applyPalette(src, w, h, pal, cur, sc.idx(w))
+		if mutable {
+			// In place: row y is read entirely before the (at most as wide)
+			// bundled row y is written at y*width <= y*w, so no row is
+			// overwritten before it has been read.
+			cur = src[:width*h]
+		} else {
+			cur = sc.curBuf(width * h)
+		}
+		refsCap = applyPalette(src, w, h, pal, cur, sc.idx(w))
 		// Write the palette transform.
 		bw.putBits(1, 1)
 		bw.putBits(colorIndexingTransform, 2)
@@ -626,7 +639,10 @@ func encodeStream(src []uint32, mutable bool, w, h int, p *params, cc crunchConf
 		if !usePalette && p.nearLossless < 100 {
 			maxQuant = 1 << uint(nearLosslessBits(p.nearLossless))
 		}
-		bits := predictorImage(width, h, minBits, maxBits, p.lowEffort, maxQuant, useSubGreen, p.cleanTransparent, cur, modes, sc)
+		// (Palette indices are opaque.)
+		opaque := p.opaque || usePalette
+		bits := predictorImage(width, h, minBits, maxBits, p.lowEffort, maxQuant, useSubGreen, p.cleanTransparent, opaque, cur, modes, sc,
+			p.stageHelpers(width*h))
 		tw, th := subSampleSize(width, bits), subSampleSize(h, bits)
 		bw.putBits(1, 1)
 		bw.putBits(predictorTransform, 2)
@@ -644,7 +660,10 @@ func encodeStream(src []uint32, mutable bool, w, h int, p *params, cc crunchConf
 		encodeImageNoHuffman(bw, img[:tw*th], tw, th, quality, p.lowEffort, sc.child())
 	}
 	bw.putBits(0, 1) // no more transforms
-	encodeImageInternal(bw, cur, width, h, p, cacheBitsMax, sc)
+	if usePredict {
+		refsCap = -1 // cur is now the residual image
+	}
+	encodeImageInternal(bw, cur, width, h, p, cacheBitsMax, refsCap, sc)
 	out := bw.finish()
 	if len(out) == cap(out) {
 		out = append(out, 0)[:len(out)] // room for a RIFF padding byte
@@ -656,6 +675,10 @@ func encodeStream(src []uint32, mutable bool, w, h int, p *params, cc crunchConf
 type refsCandidate struct {
 	refs      []pixOrCopy
 	cacheBits int
+	// bits estimates the coded size of the parse with a single histogram
+	// (see histoCost); the clustered meta-Huffman coding is usually
+	// smaller.
+	bits float64
 }
 
 // histoCost estimates the size of a parse. With raw set, distances are
@@ -689,9 +712,11 @@ const (
 // cache size and, when tryNoCache is set and that cache size is not 0, the
 // best parse without color cache (searched separately).
 func getBackwardRefs(argb []uint32, w, h int, quality int, lowEffort, box bool, cacheBitsMax int,
-	tryNoCache bool, sc *scratch, cands []refsCandidate) []refsCandidate {
+	tryNoCache bool, refsCap int, sc *scratch, cands []refsCandidate) []refsCandidate {
 	n := w * h
-	refsCap := initRefsCap(argb, w, h)
+	if refsCap < 0 {
+		refsCap = initRefsCap(argb, w, h)
+	}
 	types := []int{lz77Standard, lz77RLE}
 	if box {
 		types = []int{lz77Box}
@@ -772,9 +797,11 @@ func getBackwardRefs(argb []uint32, w, h int, quality int, lowEffort, box bool, 
 			break
 		}
 	}
-	cands = append(cands[:0], refsCandidate{sc.refs[best[0]], bestCB})
+	// (A cost-based parse only replaces a candidate when cheaper, so
+	// bestCost bounds the estimate of the returned parses.)
+	cands = append(cands[:0], refsCandidate{sc.refs[best[0]], bestCB, bestCost[0]})
 	if tryNoCache && bestCB > 0 {
-		cands = append(cands, refsCandidate{sc.refs[best[1]], 0})
+		cands = append(cands, refsCandidate{sc.refs[best[1]], 0, bestCost[1]})
 	}
 	return cands
 }
@@ -850,11 +877,15 @@ func buildCodes(s *histoSet, sc *scratch) []huffCode {
 // and meta Huffman codes, choosing the smallest of the candidate parses.
 // Like libwebp, images with at most 16 colors also try the "box" LZ77
 // parse.
-func encodeImageInternal(bw *bitWriter, argb []uint32, w, h int, p *params, cacheBitsMax int, sc *scratch) {
-	sc.hc.fill(argb, w, h, p.quality, p.lowEffort, p.windowCap)
+func encodeImageInternal(bw *bitWriter, argb []uint32, w, h int, p *params, cacheBitsMax, refsCap int, sc *scratch) {
+	if refsCap < 0 {
+		refsCap = initRefsCap(argb, w, h)
+	}
+	sc.hc.fillPar(argb, w, h, p.quality, p.lowEffort, p.windowCap, p.stageHelpers(w*h), sc)
 	var candBuf [2]refsCandidate
-	cands := getBackwardRefs(argb, w, h, p.quality, p.lowEffort, false, cacheBitsMax, p.tryNoCache, sc, candBuf[:0])
+	cands := getBackwardRefs(argb, w, h, p.quality, p.lowEffort, false, cacheBitsMax, p.tryNoCache, refsCap, sc, candBuf[:0])
 	if len(cands) == 1 && !p.tryBox {
+		bw.reserve(mainImageReserve(cands[0].bits))
 		writeMainImage(bw, w, h, p, cands[0], sc)
 		return
 	}
@@ -876,12 +907,28 @@ func encodeImageInternal(bw *bitWriter, argb []uint32, w, h int, p *params, cach
 		try(c)
 	}
 	if p.tryBox {
-		cands = getBackwardRefs(argb, w, h, p.quality, p.lowEffort, true, cacheBitsMax, p.tryNoCache, sc, candBuf[:0])
+		cands = getBackwardRefs(argb, w, h, p.quality, p.lowEffort, true, cacheBitsMax, p.tryNoCache, refsCap, sc, candBuf[:0])
 		for _, c := range cands {
 			try(c)
 		}
 	}
+	// Exact size (plus a RIFF padding byte).
+	bw.reserve(len(sc.bwTmp[bestIdx].buf) + 9)
 	bw.appendWriter(&sc.bwTmp[bestIdx])
+}
+
+// mainImageReserve returns the number of bytes to reserve in the output for
+// the main image of a parse whose single-histogram size estimate is bits:
+// the estimate plus a 1/8 margin. The clustered stream is usually 0-30%
+// smaller than the estimate, up to 8% larger for low-effort encodes of
+// images with transparency; when it does not fit, the writer grows by
+// append.
+func mainImageReserve(bits float64) int {
+	b := bits / 8
+	if !(b < 1<<30) { // also NaN
+		b = 1 << 30
+	}
+	return int(b+b/8) + 4096
 }
 
 func writeMainImage(bw *bitWriter, w, h int, p *params, c refsCandidate, sc *scratch) {
@@ -892,7 +939,7 @@ func writeMainImage(bw *bitWriter, w, h int, p *params, c refsCandidate, sc *scr
 		bw.putBits(0, 1)
 	}
 	hb := p.histoBits
-	ng := sc.clus.buildHistoImage(w, h, c.refs, p.quality, p.lowEffort, hb, c.cacheBits, &sc.out)
+	ng := sc.clus.buildHistoImage(w, h, c.refs, p.quality, p.lowEffort, hb, c.cacheBits, &sc.out, p.remapHelpers())
 	var symbols []uint16
 	if ng > 1 {
 		// Reduce the sampling of the entropy image if it is made of uniform

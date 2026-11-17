@@ -75,6 +75,13 @@ func findMatchLength(a, b []uint32, bestLen, max int) int {
 
 // fill computes the best match (distance, length) for every pixel.
 func (hc *hashChain) fill(argb []uint32, xsize, ysize, quality int, lowEffort bool, windowCap int) {
+	hc.fillPar(argb, xsize, ysize, quality, lowEffort, windowCap, 0, nil)
+}
+
+// fillPar is fill, with the match search spread over the caller and up to
+// helpers helper goroutines when helpers > 0 (see fillStripes); sc then
+// provides the extra buffers.
+func (hc *hashChain) fillPar(argb []uint32, xsize, ysize, quality int, lowEffort bool, windowCap int, helpers int, sc *scratch) {
 	size := xsize * ysize
 	if cap(hc.ol) < size {
 		hc.ol = make([]uint32, size)
@@ -87,18 +94,41 @@ func (hc *hashChain) fill(argb []uint32, xsize, ysize, quality int, lowEffort bo
 		return
 	}
 	argb = argb[:size]
-	iterMax := maxItersForQuality(quality)
 	window := windowSizeForHashChain(quality, xsize)
 	if windowCap > 0 && window > windowCap {
 		window = windowCap
 	}
+	s := hcSearcher{argb: argb, ol: ol, xsize: xsize, size: size,
+		iterMax: maxItersForQuality(quality), window: window, lowEffort: lowEffort}
+	if helpers > 0 {
+		// The chain must stay intact while the stripes write ol.
+		s.chain = sc.hcChainBuf(size)
+		buildChain(argb, s.chain)
+		ol[0] = 0
+		ol[size-1] = 0
+		s.fillStripes(helpers, sc)
+		return
+	}
+	s.chain = ol // reused as int32 chain storage
+	buildChain(argb, s.chain)
+	ol[0] = 0
+	ol[size-1] = 0
+	// The searches go from the end to the start; each one writes the
+	// results of the positions it covers (at and below it), so the chain
+	// entries it reads (below it) are still intact.
+	s.run(size-2, 0, 1, nil)
+}
 
+// buildChain links every position of argb (but the last) to the previous
+// position with the same hash of its pixel pair (or of the color and run
+// length in runs), as int32 (-1: none) in chain.
+func buildChain(argb []uint32, chain []uint32) {
+	size := len(argb)
 	tp := hashTablePool.Get().(*[]int32)
 	first := *tp
 	for i := range first {
 		first[i] = -1
 	}
-	chain := ol // reused as int32 chain storage
 	argbComp := argb[0] == argb[1]
 	pos := 0
 	for pos < size-2 {
@@ -135,71 +165,100 @@ func (hc *hashChain) fill(argb []uint32, xsize, ysize, quality int, lowEffort bo
 	}
 	chain[pos] = uint32(first[pixPairHash(argb[pos], argb[pos+1])])
 	hashTablePool.Put(tp)
+}
 
-	ol[0] = 0
-	ol[size-1] = 0
-	for base := size - 2; base > 0; {
-		maxLen := size - 1 - base
-		if maxLen > maxLength {
-			maxLen = maxLength
-		}
-		start := argb[base:]
-		iter := iterMax
-		bestLen := 0
-		bestDist := 0
-		minPos := 0
-		if base > window {
-			minPos = base - window
-		}
-		lengthMax := maxLen
-		if lengthMax > 256 {
-			lengthMax = 256
-		}
-		p := int(int32(chain[base]))
-		if !lowEffort {
-			if base >= xsize {
-				l := findMatchLength(argb[base-xsize:], start, bestLen, maxLen)
+// hcSearcher holds the state of the match search of hashChain.fill.
+type hcSearcher struct {
+	argb            []uint32
+	chain           []uint32 // int32 links (buildChain)
+	ol              []uint32
+	xsize, size     int
+	iterMax, window int
+	lowEffort       bool
+}
+
+// run is the search loop of fill: it searches the best match at hi, writes
+// it, extended to the left as far as possible, into ol, and repeats from the
+// next position while it is at least stop. Positions below lo are never
+// written: an extension stops there. When marks is not nil, every searched
+// position is marked in it. run returns the last position searched and the
+// next position (below stop).
+//
+// The position following a search only depends on the searched position,
+// so the searches form a chain from size-2 down to 0 (see fillStripes).
+// (One loop for all uses: a call per search costs the sequential path
+// 7-19%.)
+func (s *hcSearcher) run(hi, lo, stop int, marks []uint64) (last, next int) {
+	argb, chain, ol := s.argb, s.chain, s.ol
+	xsize, size, window, iterMax, lowEffort := s.xsize, s.size, s.window, s.iterMax, s.lowEffort
+	base := hi
+	for base >= stop {
+		var bestLen, bestDist int
+		{
+			maxLen := size - 1 - base
+			if maxLen > maxLength {
+				maxLen = maxLength
+			}
+			start := argb[base:]
+			iter := iterMax
+			minPos := 0
+			if base > window {
+				minPos = base - window
+			}
+			lengthMax := maxLen
+			if lengthMax > 256 {
+				lengthMax = 256
+			}
+			p := int(int32(chain[base]))
+			if !lowEffort {
+				if base >= xsize {
+					l := findMatchLength(argb[base-xsize:], start, bestLen, maxLen)
+					if l > bestLen {
+						bestLen = l
+						bestDist = xsize
+					}
+					iter--
+				}
+				l := findMatchLength(argb[base-1:], start, bestLen, maxLen)
 				if l > bestLen {
 					bestLen = l
-					bestDist = xsize
+					bestDist = 1
 				}
 				iter--
-			}
-			l := findMatchLength(argb[base-1:], start, bestLen, maxLen)
-			if l > bestLen {
-				bestLen = l
-				bestDist = 1
-			}
-			iter--
-			if bestLen == maxLength {
-				p = minPos - 1
-			}
-		}
-		bestArgb := start[bestLen]
-		for ; p >= minPos; p = int(int32(chain[p])) {
-			iter--
-			if iter <= 0 {
-				break
-			}
-			if argb[p+bestLen] != bestArgb {
-				continue
-			}
-			l := vectorMismatch(argb[p:], start, maxLen)
-			if bestLen < l {
-				bestLen = l
-				bestDist = base - p
-				bestArgb = start[bestLen]
-				if bestLen >= lengthMax {
-					break
+				if bestLen == maxLength {
+					p = minPos - 1
 				}
 			}
+			bestArgb := start[bestLen]
+			for ; p >= minPos; p = int(int32(chain[p])) {
+				iter--
+				if iter <= 0 {
+					break
+				}
+				if argb[p+bestLen] != bestArgb {
+					continue
+				}
+				l := vectorMismatch(argb[p:], start, maxLen)
+				if bestLen < l {
+					bestLen = l
+					bestDist = base - p
+					bestArgb = start[bestLen]
+					if bestLen >= lengthMax {
+						break
+					}
+				}
+			}
+			if marks != nil {
+				marks[base>>6] |= 1 << uint(base&63)
+			}
 		}
+		last = base
 		// Extend the match to the left as far as possible.
 		maxBase := base
 		for {
 			ol[base] = uint32(bestDist)<<maxLengthBits | uint32(bestLen)
 			base--
-			if bestDist == 0 || base == 0 {
+			if bestDist == 0 || base == 0 || base < lo {
 				break
 			}
 			if base < bestDist || argb[base-bestDist] != argb[base] {
@@ -213,6 +272,62 @@ func (hc *hashChain) fill(argb []uint32, xsize, ysize, quality int, lowEffort bo
 				maxBase = base
 			}
 		}
+	}
+	return last, base
+}
+
+// minHCStripe is the smallest stripe of fillStripes, in positions (a
+// multiple of 64; a variable for the tests).
+var minHCStripe = 1 << 16
+
+// fillStripes is the search loop of fill, run speculatively in stripes.
+//
+// The sequential search visits a chain of positions, from size-2 down: each
+// search at base writes the positions from base down to the next search
+// position, which only depends on base. Each stripe of positions starts
+// such a chain at its top, writing only within the stripe and recording
+// the positions it searched. The chain of a stripe does not start where
+// the true chain enters it, but as soon as the true chain hits a position
+// the stripe searched, both coincide below it (and the positions at or
+// below a position are only written by searches at or below it). So a
+// sequential fix-up follows the true chain from the top: it searches
+// positions itself until it hits a position its stripe searched, then
+// jumps to that stripe's exit search, whose extension (into the stripes
+// below) it replays. In practice the chains meet within a few searches, so
+// the fix-up is short, and the result is identical to fill's.
+func (s *hcSearcher) fillStripes(helpers int, sc *scratch) {
+	size := s.size
+	workers := helpers + 1
+	// Stripes of a multiple of 64 positions (the searched-position bitmap
+	// words are not shared), at least minHCStripe, a few per worker for
+	// balance.
+	per := (size + 4*workers - 1) / (4 * workers)
+	per = max((per+63)&^63, minHCStripe)
+	stripes := (size-2)/per + 1 // stripe k covers [k*per, (k+1)*per) within [1, size-2]
+	marks := sc.hcMarkBuf((size + 63) / 64)
+	exits := sc.hcExitBuf(stripes)
+	parallel(stripes, helpers, func(worker int, claim func() (int, bool)) {
+		for {
+			k, ok := claim()
+			if !ok {
+				return
+			}
+			k = stripes - 1 - k // top stripes first: the fix-up starts there
+			lo := max(k*per, 1)
+			exits[k], _ = s.run(min((k+1)*per-1, size-2), lo, lo, marks)
+		}
+	})
+	// Fix-up, from the top: every position above t is final.
+	for t := size - 2; t > 0; {
+		if marks[t>>6]&(1<<uint(t&63)) != 0 {
+			// The stripe's chain from t is the true one: its results are
+			// final down to its exit, whose search is redone, with its
+			// extension in full.
+			e := exits[t/per]
+			_, t = s.run(e, 0, e, nil)
+			continue
+		}
+		_, t = s.run(t, 0, t, nil)
 	}
 }
 
