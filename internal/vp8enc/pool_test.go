@@ -3,6 +3,7 @@ package vp8enc
 import (
 	"bytes"
 	"image"
+	"math/bits"
 	"runtime"
 	"testing"
 
@@ -77,6 +78,127 @@ func TestPoolBudgetDoesNotChangeOutput(t *testing.T) {
 		}
 		if r := bufpool.Retained(); r > limit {
 			t.Errorf("limit %d: %d bytes retained", limit, r)
+		}
+	}
+}
+
+// poisonPool fills p with copies buffers of garbage for every size class up
+// to maxN elements, each at the largest capacity of its class, so that any
+// Get(n) with n <= maxN is served a buffer that was never cleared.
+func poisonPool[T any](p *bufpool.Pool[T], maxN, copies int, garbage T) {
+	for n := 1; n <= maxN; {
+		next := n + 1
+		if n >= 8 {
+			step := 1 << (bits.Len(uint(n)) - 3) // a quarter of the power of two
+			next = (n/step + 1) * step
+		}
+		for range copies {
+			b := make([]T, next-1) // the largest size of n's class
+			for i := range b {
+				b[i] = garbage
+			}
+			p.Put(b)
+		}
+		n = next
+	}
+}
+
+// TestPoisonedPoolsDoNotChangeOutput serves every pooled buffer filled with
+// garbage and checks that the output matches the one obtained with pooling
+// disabled (fresh, zeroed buffers): every buffer the encoder takes without
+// clearing it must be fully written before it is read.
+func TestPoisonedPoolsDoNotChangeOutput(t *testing.T) {
+	type tc struct {
+		img       *image.NRGBA
+		sharp     bool
+		dithering float32
+		cfg       Config
+	}
+	sizes := [][2]int{{1, 1}, {1, 37}, {37, 1}, {17, 33}, {133, 71}}
+	var cases []tc
+	for i, sz := range sizes {
+		img := synthImage(sz[0], sz[1], 3, int64(i)) // with transparent blocks
+		for m := 0; m <= 6; m += 2 {
+			cfg := DefaultConfig()
+			cfg.Method = m
+			cfg.Preprocessing = 1 // segment-map smoothing
+			cfg.ThreadLevel = m == 0
+			cfg.Partitions = 3
+			cfg.LowMemory = true
+			cases = append(cases,
+				tc{img, false, 0, cfg},
+				tc{img, true, 0, cfg},
+				tc{img, false, 0.75, cfg})
+		}
+		cfg := DefaultConfig()
+		cfg.Pass, cfg.TargetSize = 3, 400
+		cases = append(cases, tc{img, false, 0, cfg})
+	}
+	encode := func(c tc) []byte {
+		pic := FromNRGBADithered(c.img, c.sharp, false, c.dithering)
+		defer pic.Release()
+		out, err := Encode(pic, &c.cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	defer bufpool.SetLimit(bufpool.SetLimit(0)) // pooling off: fresh buffers
+	var want [][]byte
+	for _, c := range cases {
+		want = append(want, encode(c))
+	}
+	bufpool.SetLimit(bufpool.DefaultLimit)
+	defer bufpool.Trim()
+	poison := func() {
+		bufpool.Trim()
+		const maxN = 64 << 10 // above the largest request of the cases
+		poisonPool(&bytePool, maxN, 3, 0xa5)
+		poisonPool(&int32Pool, maxN, 3, -0x5a5a5a5b)
+		poisonPool(&uint16Pool, maxN, 3, 0xa5a5)
+		poisonPool(&int16Pool, maxN, 3, -0x5a5b)
+		poisonPool(&mbInfoPool, 2048, 3, mbInfo{typ: 1, uvMode: 3, segment: 3, alpha: 0xa5, skip: true})
+		for range 16 {
+			pg := make([]uint16, tokenPageSize)
+			for k := range pg {
+				pg[k] = 0xa5a5
+			}
+			tokenPagePool.Put(pg)
+		}
+	}
+	for i, c := range cases {
+		poison()
+		if got := encode(c); !bytes.Equal(got, want[i]) {
+			w, h := c.img.Rect.Dx(), c.img.Rect.Dy()
+			t.Errorf("%dx%d m%d sharp=%v dithering=%v pass=%d: output with poisoned pools differs",
+				w, h, c.cfg.Method, c.sharp, c.dithering, c.cfg.Pass)
+		}
+	}
+
+	// Pooled YCbCr pictures (odd sizes and origins, 4:2:0 and generic
+	// chroma paths) against never-pooled snapshots.
+	for _, r := range []image.Rectangle{image.Rect(0, 0, 1, 1), image.Rect(0, 0, 37, 1),
+		image.Rect(0, 0, 1, 37), image.Rect(1, 3, 34, 24)} {
+		for _, ratio := range []image.YCbCrSubsampleRatio{image.YCbCrSubsampleRatio420, image.YCbCrSubsampleRatio444} {
+			ycc := image.NewYCbCr(image.Rect(0, 0, 40, 40), ratio)
+			for i := range ycc.Y {
+				ycc.Y[i] = uint8(i * 7)
+			}
+			for i := range ycc.Cb {
+				ycc.Cb[i], ycc.Cr[i] = uint8(i*3), uint8(255-i*5)
+			}
+			sub := ycc.SubImage(r).(*image.YCbCr)
+			want, err := Encode(SnapshotYCbCr(sub), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			poison()
+			pic := FromYCbCr(sub)
+			got, err := Encode(pic, nil)
+			pic.Release()
+			if err != nil || !bytes.Equal(got, want) {
+				t.Errorf("YCbCr %v %v: output with poisoned pools differs (err %v)", r, ratio, err)
+			}
 		}
 	}
 }
