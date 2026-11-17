@@ -58,9 +58,11 @@ func jobPixels(total, dataLen int) int {
 // acknowledged.
 const maxAsyncJobs = 4
 
-// rowJob is rows [y0, y1) of level-0 pixels, starting at argb[0].
+// rowJob is rows [y0, y1) of level-0 pixels, starting at argb[0], or at
+// idx[0] for index bytes (idx8.go).
 type rowJob struct {
 	argb   []uint32
+	idx    []byte
 	y0, y1 int
 }
 
@@ -123,7 +125,13 @@ func (d *decoder) consume(a *asyncEmit) error {
 		}
 		for y := j.y0; y < j.y1; y += numCacheRows {
 			y1 := min(y+numCacheRows, j.y1)
-			if err := d.emitRows(j.argb[(y-j.y0)*w:(y1-j.y0)*w], y, y1); err != nil {
+			var err error
+			if j.idx != nil {
+				err = d.emitIdx8(j.idx[(y-j.y0)*w:(y1-j.y0)*w], y, y1)
+			} else {
+				err = d.emitRows(j.argb[(y-j.y0)*w:(y1-j.y0)*w], y, y1)
+			}
+			if err != nil {
 				return err
 			}
 		}
@@ -133,9 +141,11 @@ func (d *decoder) consume(a *asyncEmit) error {
 	return nil
 }
 
-// sendRows hands rows [d.lastRow, row) over to the helper once they make a
-// big enough job (or always with flush, or at the last needed row).
-func (d *decoder) sendRows(buf []uint32, base, row int, flush bool) error {
+// sendRows hands rows [d.lastRow, row) of the level-0 buffer (d.buf, or
+// d.ib with d.idx8), which starts at pixel base, over to the helper once
+// they make a big enough job (or always with flush, or at the last needed
+// row).
+func (d *decoder) sendRows(base, row int, flush bool) error {
 	a := d.async
 	y0 := d.lastRow
 	if row <= y0 {
@@ -155,8 +165,14 @@ func (d *decoder) sendRows(buf []uint32, base, row int, flush bool) error {
 		asyncTestHook(y0, row)
 	}
 	start := y0*w - base
+	j := rowJob{y0: y0, y1: row}
+	if d.idx8 {
+		j.idx = d.ib[start : row*w-base]
+	} else {
+		j.argb = d.buf[start : row*w-base]
+	}
 	// Never blocks: there is room for maxAsyncJobs jobs.
-	a.jobs <- rowJob{argb: buf[start : row*w-base], y0: y0, y1: row}
+	a.jobs <- j
 	a.starts[(a.head+a.inFlight)%maxAsyncJobs] = start
 	a.inFlight++
 	a.pendingRow = row
@@ -247,11 +263,11 @@ func (a *asyncEmit) beforeSlide(destEnd int) error {
 // the rows the sequential decoder would have emitted are handed over first;
 // then the helper is stopped and waited for. A helper error comes first in
 // the sequential order, so it takes precedence over err.
-func (d *decoder) finishAsync(buf []uint32, base int, err error) error {
+func (d *decoder) finishAsync(err error) error {
 	a := d.async
 	if err != nil && a.pendingRow > d.lastRow {
 		// The rows up to the last batch boundary the producer passed.
-		if e := d.sendRows(buf, base, a.pendingRow, true); e != nil {
+		if e := d.sendRows(d.px.base, a.pendingRow, true); e != nil {
 			err = e
 		}
 	}

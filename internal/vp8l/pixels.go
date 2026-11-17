@@ -340,7 +340,7 @@ outer:
 func (d *decoder) processRows(buf []uint32, base, row int) error {
 	row = min(row, d.needRows)
 	if d.async != nil {
-		return d.sendRows(buf, base, row, false)
+		return d.sendRows(base, row, false)
 	}
 	// A resumed decode (AlphaDecoder) may have more than numCacheRows
 	// decoded rows pending: emit them in batches that fit d.rows.
