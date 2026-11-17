@@ -59,12 +59,13 @@ func TestYUVToRGBARowMatchesGo(t *testing.T) {
 	widths = append(widths, 100, 255, 256, 257, 1023, 1024, 4097)
 	for _, w := range widths {
 		for i := 0; i < 8; i++ {
-			mk := func() []byte {
-				b := make([]byte, w)
+			mk := func() []byte { // at a random offset: unaligned rows
+				off := r.IntN(16)
+				b := make([]byte, off+w+r.IntN(16))
 				for k := range b {
 					b[k] = byte(r.IntN(256))
 				}
-				return b
+				return b[off : off+w]
 			}
 			ys, us, vs := mk(), mk(), mk()
 			var as []byte
@@ -73,13 +74,14 @@ func TestYUVToRGBARowMatchesGo(t *testing.T) {
 			}
 			want := make([]byte, 4*w)
 			yuvToRGBARowGo(ys, us, vs, as, want)
-			buf := bytes.Repeat([]byte{0xa5}, 4*w+128)
-			got := buf[64 : 64+4*w]
+			off := 64 + r.IntN(16)
+			buf := bytes.Repeat([]byte{0xa5}, 4*w+off+64)
+			got := buf[off : off+4*w]
 			yuvToRGBARow(ys, us, vs, as, got)
 			if !bytes.Equal(got, want) {
 				t.Fatalf("w=%d alpha=%v: rows differ", w, as != nil)
 			}
-			for k, b := range append(buf[:64:64], buf[64+4*w:]...) {
+			for k, b := range append(buf[:off:off], buf[off+4*w:]...) {
 				if b != 0xa5 {
 					t.Fatalf("w=%d: write outside the row (guard byte %d)", w, k)
 				}
