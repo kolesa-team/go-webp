@@ -114,9 +114,10 @@ func transformDC(in *[16]int16, b []byte, o int) {
 	}
 }
 
-// transformWHT computes the inverse Walsh-Hadamard transform of the luma DC
-// coefficients and scatters them into the 16 luma blocks of out.
-func transformWHT(in *[16]int16, out *[384]int16) {
+// transformWHTRef computes the inverse Walsh-Hadamard transform of the luma
+// DC coefficients and scatters them into the 16 luma blocks of out (the
+// reference of the transformWHT entry point).
+func transformWHTRef(in *[16]int16, out *[384]int16) {
 	var tmp [16]int
 	for i := 0; i < 4; i++ {
 		a0 := int(in[0+i]) + int(in[12+i])
@@ -181,6 +182,110 @@ func doUVTransform(bits uint32, in *[384]int16, first int, b []byte, o int) {
 	}
 	if b3[0] != 0 {
 		transformDC(b3, b, o+4*bps+4)
+	}
+}
+
+// --- per-macroblock reconstruction -------------------------------------------
+//
+// These are the reference implementations of the macroblock-level entry
+// points reconI4, reconI16 and reconUV. Architectures with an assembly
+// kernel (recon_arm64.s) bind the entry points to it; the others, and the
+// purego build, bind them to these functions (recon_generic.go). The
+// assembly must stay bit-exact with them for every input, which the
+// differential tests in recon_test.go check.
+
+// reconI4Ref predicts and reconstructs the 16 luma sub-blocks of an
+// intra-4x4 macroblock in raster order. The top-right samples of the
+// macroblock must already be in place (and replicated below, see
+// reconstructMB). bits holds the 2-bit transform code of each sub-block,
+// sub-block 0 in the top bits.
+func reconI4Ref(b *[yuvSize]byte, coeffs *[384]int16, bits uint32, modes *[16]uint8) {
+	for n := 0; n < 16; n++ {
+		o := yOff + kScan[n]
+		predLuma4(modes[n], b[:], o)
+		doTransform(bits>>30, (*[16]int16)(coeffs[n*16:]), b[:], o)
+		bits <<= 2
+	}
+}
+
+// reconI16Ref runs the 16x16 luma predictor mode (after checkMode) and adds
+// the residuals of the 16 luma blocks.
+func reconI16Ref(b *[yuvSize]byte, coeffs *[384]int16, bits uint32, mode int) {
+	predLuma16(mode, b[:])
+	if bits != 0 {
+		for n := 0; n < 16; n++ {
+			doTransform(bits>>30, (*[16]int16)(coeffs[n*16:]), b[:], yOff+kScan[n])
+			bits <<= 2
+		}
+	}
+}
+
+// reconUVRef runs the 8x8 chroma predictor mode (after checkMode) on both
+// chroma planes and adds their residuals; bits is mbBlock.nonZeroUV.
+func reconUVRef(b *[yuvSize]byte, coeffs *[384]int16, bits uint32, mode int) {
+	predChroma8(mode, b[:], uOff)
+	predChroma8(mode, b[:], vOff)
+	doUVTransform(bits>>0, coeffs, 16*16, b[:], uOff)
+	doUVTransform(bits>>8, coeffs, 20*16, b[:], vOff)
+}
+
+// loadEdges flags.
+const (
+	edgeRotate   = 1 << iota // copy the right samples of the previous macroblock to the left
+	edgeTop                  // load the top samples
+	edgeTopRight             // store tr as the top-right samples (intra 4x4)
+	edgeI4                   // replicate the top-right samples below (intra 4x4)
+)
+
+// loadEdgesRef sets up the context samples of the next macroblock in the
+// work buffer (the first half of libwebp's ReconstructRow loop body): the
+// left column from the previous macroblock, the top row from top and the
+// four top-right samples tr (little endian), replicated on the rows above
+// sub-block rows 1-3 for intra 4x4.
+func loadEdgesRef(b *[yuvSize]byte, top *topSamples, tr, flags uint32) {
+	if flags&edgeRotate != 0 {
+		for j := -1; j < 16; j++ {
+			o := yOff + j*bps
+			*(*[4]byte)(b[o-4:]) = *(*[4]byte)(b[o+12:])
+		}
+		for j := -1; j < 8; j++ {
+			o := uOff + j*bps
+			*(*[4]byte)(b[o-4:]) = *(*[4]byte)(b[o+4:])
+			o = vOff + j*bps
+			*(*[4]byte)(b[o-4:]) = *(*[4]byte)(b[o+4:])
+		}
+	}
+	if flags&edgeTop != 0 {
+		*(*[16]byte)(b[yOff-bps:]) = top.y
+		*(*[8]byte)(b[uOff-bps:]) = top.u
+		*(*[8]byte)(b[vOff-bps:]) = top.v
+	}
+	if flags&edgeI4 != 0 {
+		const tro = yOff - bps + 16
+		if flags&edgeTopRight != 0 {
+			binary.LittleEndian.PutUint32(b[tro:], tr)
+		}
+		for k := 1; k <= 3; k++ {
+			*(*[4]byte)(b[tro+4*k*bps:]) = *(*[4]byte)(b[tro:])
+		}
+	}
+}
+
+// storeMBRowsRef saves the bottom samples of the reconstructed macroblock
+// in top (unless it is nil) and copies the macroblock into the row cache:
+// luma row j to cy[j*ys:], chroma row j to cu[j*uvs:] and cv[j*uvs:].
+func storeMBRowsRef(b *[yuvSize]byte, top *topSamples, cy, cu, cv []byte, ys, uvs int) {
+	if top != nil {
+		top.y = *(*[16]byte)(b[yOff+15*bps:])
+		top.u = *(*[8]byte)(b[uOff+7*bps:])
+		top.v = *(*[8]byte)(b[vOff+7*bps:])
+	}
+	for j := 0; j < 16; j++ {
+		*(*[16]byte)(cy[j*ys:]) = *(*[16]byte)(b[yOff+j*bps:])
+	}
+	for j := 0; j < 8; j++ {
+		*(*[8]byte)(cu[j*uvs:]) = *(*[8]byte)(b[uOff+j*bps:])
+		*(*[8]byte)(cv[j*uvs:]) = *(*[8]byte)(b[vOff+j*bps:])
 	}
 }
 
