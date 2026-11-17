@@ -618,7 +618,7 @@ func (d *decoder) extractAlpha8(row int) {
 		return
 	}
 	w, fw, base := d.xsize, d.width, d.px.base
-	inverseColorIndexAlpha(&d.transforms[0], row-y0, d.ib[y0*w-base:row*w-base], d.alpha[y0*fw:row*fw])
+	inverseColorIndexAlpha(&d.transforms[0], d.alphaTab, row-y0, d.ib[y0*w-base:row*w-base], d.alpha[y0*fw:row*fw])
 	d.lastRow = row
 }
 
