@@ -353,58 +353,74 @@ cc1:
 ccdone:
 	RET
 
-// SELECT(k) is one pixel of predictor mode 11 (libwebp Select): with
-// R15 = L (the left output pixel), R19 = TL, R14 = the residual,
-// R7 = pt = sum over the channels of |T - TL| and R8 = withT = residual + T
-// (both from the vector code), it sets L = withT if sum |L - TL| <= pt,
-// else L + residual, and stores it at k*4(R11). The serial dependency
-// through L is LSR, SUBS, CNEG, ADD, ADD, CMP, CSEL: the channels of TL,
-// the residual masks and pt are computed off that path. R20-R26 are
-// temporaries. Pixel addition modulo 256 per channel is
-// ((a & 0x7f..) + (b & 0x7f..)) ^ ((a ^ b) & 0x80..).
+// Predictor mode 11 (libwebp Select): out = withT = residual + T if
+// pl = sum over the channels of |L - TL| is at most pt = sum |T - TL|,
+// else withL = residual + L, with L the left output pixel.
+//
+// pt, withT and q = sum |withT - T| come from vector code (SELECTV). The
+// serial part runs in scalar registers, and computes the pl of the next
+// pixel (whose TL is this T) for both outcomes before the decision: q if
+// this pixel takes withT, sum |withL - T| (SADT) otherwise, picked by the
+// same flags as the output. The work on withL starts as soon as L is
+// known, so that the dependency from one decision to the next is two
+// instructions (CSEL pl, CMP), and from L to the decision after next
+// eleven: about 5.5 cycles per pixel instead of 7.
+//
+// Registers: R15 = L, R26 = pl of the current pixel, R14 residual,
+// R8 withT, R7 pt, R25 q, R19 T, R24 withL; R16, R17, R20-R23 temporaries.
+
+// SADT(p) sets R20 = sum over the channels of |p - T|, T in R19 (R16, R17,
+// R21-R23 are clobbered).
+#define SADT(p) \
+	ANDW  $0xff, R19, R20    \
+	UBFX  $8, R19, $8, R21   \
+	UBFX  $16, R19, $8, R22  \
+	LSRW  $24, R19, R23      \
+	LSRW  $8, p, R16         \
+	LSRW  $16, p, R17        \
+	SUBS  p.UXTB, R20, R20   \
+	CNEG  MI, R20, R20       \
+	SUBS  R16.UXTB, R21, R21 \
+	CNEG  MI, R21, R21       \
+	SUBS  R17.UXTB, R22, R22 \
+	CNEG  MI, R22, R22       \
+	SUBS  p>>24, R23, R23    \
+	CNEG  MI, R23, R23       \
+	ADD   R21, R20, R20      \
+	ADD   R23, R22, R22      \
+	ADD   R22, R20, R20
+
+// SELECT(k) does the pixel in lane k of the vectors of SELECTV, T at
+// k*4(R12), and stores it at k*4(R11). Pixel addition modulo 256 per
+// channel is ((a & 0x7f..) + (b & 0x7f..)) ^ ((a ^ b) & 0x80..).
 #define SELECT(k) \
-	ANDW  $0xff, R19, R20          \
-	UBFX  $8, R19, $8, R21         \
-	UBFX  $16, R19, $8, R22        \
-	LSRW  $24, R19, R23            \
-	LSRW  $8, R15, R24             \
-	LSRW  $16, R15, R25            \
-	SUBS  R15.UXTB, R20, R20       \
-	CNEG  MI, R20, R20             \
-	SUBS  R24.UXTB, R21, R21       \
-	CNEG  MI, R21, R21             \
-	SUBS  R25.UXTB, R22, R22       \
-	CNEG  MI, R22, R22             \
-	SUBS  R15>>24, R23, R23        \
-	CNEG  MI, R23, R23             \
-	ADD   R21, R20, R20            \
-	ADD   R23, R22, R22            \
-	ANDW  $0x7f7f7f7f, R15, R24    \
-	ANDW  $0x7f7f7f7f, R14, R25    \
-	ADDW  R25, R24, R24            \
-	EORW  R14, R15, R26            \
-	ANDW  $0x80808080, R26, R26    \
-	EORW  R26, R24, R24            \
-	ADD   R22, R20, R20            \
-	CMP   R7, R20                  \
-	CSEL  LS, R8, R24, R15         \
+	VMOV  V3.S[k], R14          \
+	VMOV  V5.S[k], R8           \
+	VMOV  V4.S[k], R7           \
+	VMOV  V6.S[k], R25          \
+	MOVWU (k*4)(R12), R19       \
+	ANDW  $0x7f7f7f7f, R15, R24 \
+	ANDW  $0x7f7f7f7f, R14, R16 \
+	ADDW  R16, R24, R24         \
+	EORW  R14, R15, R16         \
+	ANDW  $0x80808080, R16, R16 \
+	EORW  R16, R24, R24         \
+	SADT(R24)                   \
+	CMP   R7, R26               \
+	CSEL  LS, R8, R24, R15      \
+	CSEL  LS, R25, R20, R26     \
 	MOVW  R15, (k*4)(R11)
 
 // SELECTV computes, for the pixels in V1 (T), V2 (TL) and V3 (residuals),
-// V4 = pt per pixel and V5 = withT per pixel.
+// V4 = pt, V5 = withT and V6 = q per pixel.
 #define SELECTV \
 	UABD_16B(4, 1, 2) /* UABD V4.16B, V1.16B, V2.16B */ \
 	UADDLP_8H(4, 4)   /* UADDLP V4.8H, V4.16B */        \
 	UADDLP_4S(4, 4)   /* UADDLP V4.4S, V4.8H */         \
-	VADD  V1.B16, V3.B16, V5.B16
-
-// SELECTLANE(k) loads the inputs of SELECT(k) from lane k of V3-V5 and
-// TL from memory.
-#define SELECTLANE(k) \
-	VMOV  V4.S[k], R7         \
-	VMOV  V5.S[k], R8         \
-	VMOV  V3.S[k], R14        \
-	MOVWU (k*4)(R13), R19
+	VADD  V1.B16, V3.B16, V5.B16                        \
+	UABD_16B(6, 5, 1) /* UABD V6.16B, V5.16B, V1.16B */ \
+	UADDLP_8H(6, 6)   /* UADDLP V6.8H, V6.16B */        \
+	UADDLP_4S(6, 6)   /* UADDLP V6.4S, V6.8H */
 
 // func predictRowAsm(in, out, up, modes *uint32, x, width, bits int) int
 //
@@ -427,7 +443,7 @@ ccdone:
 // R0 in, R1 out, R2 up, R3 modes, R4 x (start of the next tile), R5 width,
 // R6 bits, R9 pixels left in the tile, R10 &in[x], R11 &out[x],
 // R12 &up[x], R13 &up[x-1] or &up[x+1], R14 &up[x+1]; V30 0xff000000,
-// V29 zero. Mode 11 uses R7, R8, R14, R15, R19-R26.
+// V29 zero. Mode 11 uses R7, R8, R14-R17, R19-R26.
 TEXT ·predictRowAsm(SB), NOSPLIT, $0-64
 	MOVD in+0(FP), R0
 	MOVD out+8(FP), R1
@@ -687,10 +703,14 @@ pr10l:
 	BNE     pr10l
 	B       prtile
 
-	// Mode 11, Select: 4 pixels at a time, then one at a time.
+	// Mode 11, Select: 4 pixels at a time, then one at a time. First
+	// pl of the first pixel, from L and TL in memory.
 pr11:
 	MOVWU -4(R11), R15
 	SUB   $4, R12, R13
+	MOVWU (R13), R19
+	SADT(R15)
+	MOVD  R20, R26
 
 pr11v:
 	CMP  $4, R9
@@ -699,13 +719,9 @@ pr11v:
 	VLD1 (R13), [V2.B16]
 	VLD1 (R10), [V3.B16]
 	SELECTV
-	SELECTLANE(0)
 	SELECT(0)
-	SELECTLANE(1)
 	SELECT(1)
-	SELECTLANE(2)
 	SELECT(2)
-	SELECTLANE(3)
 	SELECT(3)
 	ADD  $16, R10, R10
 	ADD  $16, R11, R11
@@ -720,7 +736,6 @@ pr11s:
 	FMOVS (R13), F2
 	FMOVS (R10), F3
 	SELECTV
-	SELECTLANE(0)
 	SELECT(0)
 	ADD   $4, R10, R10
 	ADD   $4, R11, R11
