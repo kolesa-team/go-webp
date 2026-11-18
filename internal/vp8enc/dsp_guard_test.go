@@ -66,177 +66,181 @@ func guardTables() []*pairTable {
 }
 
 func TestVecGuardPages(t *testing.T) {
-	rng := rand.New(rand.NewSource(21))
-	for _, atEnd := range []bool{true, false} {
-		for ti, tab := range guardTables() {
-			n0, n1, nb := tab.need[0], tab.need[1], 2*tab.n
-			a := guarded(t, n0, 0, atEnd)
-			b := guarded(t, n1, 0, atEnd)
-			fillPixels(rng, a)
-			fillPixels(rng, b)
-			ra, rb := append([]byte(nil), a...), append([]byte(nil), b...)
+	forEachLevel(t, func(t *testing.T) {
+		rng := rand.New(rand.NewSource(21))
+		for _, atEnd := range []bool{true, false} {
+			for ti, tab := range guardTables() {
+				n0, n1, nb := tab.need[0], tab.need[1], 2*tab.n
+				a := guarded(t, n0, 0, atEnd)
+				b := guarded(t, n1, 0, atEnd)
+				fillPixels(rng, a)
+				fillPixels(rng, b)
+				ra, rb := append([]byte(nil), a...), append([]byte(nil), b...)
 
-			blocks := guardedBlocks(t, nb, atEnd)
-			want := make([][16]int16, nb)
-			fTransformPairs(a, b, tab, blocks)
-			fTransformPairsRef(ra, rb, tab, want)
-			for i := range want {
-				if blocks[i] != want[i] {
-					t.Fatalf("table %d atEnd=%v: fTransform block %d: %v, want %v", ti, atEnd, i, blocks[i], want[i])
-				}
-			}
-
-			res := guardedInt32(t, nb, atEnd)
-			wres := make([]int32, nb)
-			tTransformPairs(a, tab, res)
-			tTransformPairsRef(ra, tab, wres)
-			for i := range wres {
-				if res[i] != wres[i] {
-					t.Fatalf("table %d atEnd=%v: tTransform %v, want %v", ti, atEnd, res, wres)
-				}
-			}
-			sse4x4Pairs(a, b, tab, res)
-			sse4x4PairsRef(ra, rb, tab, wres)
-			for i := range wres {
-				if res[i] != wres[i] {
-					t.Fatalf("table %d atEnd=%v: sse4x4 %v, want %v", ti, atEnd, res, wres)
-				}
-			}
-
-			// inverse transform: small coefficients (16-bit path) and
-			// large ones (int32 path)
-			for _, scale := range []int{2047, 32768} {
-				in := guardedBlocks(t, nb, atEnd)
-				for i := range in {
-					for j := range in[i] {
-						in[i][j] = int16(rng.Intn(2*scale) - scale)
+				blocks := guardedBlocks(t, nb, atEnd)
+				want := make([][16]int16, nb)
+				fTransformPairs(a, b, tab, blocks)
+				fTransformPairsRef(ra, rb, tab, want)
+				for i := range want {
+					if blocks[i] != want[i] {
+						t.Fatalf("table %d atEnd=%v: fTransform block %d: %v, want %v", ti, atEnd, i, blocks[i], want[i])
 					}
 				}
-				win := append([][16]int16(nil), in...)
-				dst := guarded(t, n1, 0, atEnd)
-				fillPixels(rng, dst)
-				wdst := append([]byte(nil), dst...)
-				iTransformPairs(a, in, dst, tab)
-				iTransformPairsRef(ra, win, wdst, tab)
-				if string(dst) != string(wdst) {
-					t.Fatalf("table %d atEnd=%v scale %d: iTransform differs", ti, atEnd, scale)
-				}
-			}
-		}
 
-		// quantizer: in, out and info all against guard pages
-		var m matrix
-		m.q[0], m.q[1] = uint32(kDcTable[30]), uint32(kAcTable[30])
-		expandMatrix(&m, 0)
-		for _, n := range []int{1, 2, 8, 10, 16, 32} {
-			in := guardedBlocks(t, n, atEnd)
-			out := guardedBlocks(t, n, atEnd)
-			info := guardedUint16(t, n, atEnd)
-			for i := range in {
-				fillCoeffs(rng, in[i][:])
-			}
-			win := append([][16]int16(nil), in...)
-			wout := make([][16]int16, n)
-			winfo := make([]uint16, n)
-			nz := quantizeBlocks(in, out, &m, info)
-			wnz := quantizeBlocksRef(win, wout, &m, winfo)
-			if nz != wnz {
-				t.Fatalf("quantize n=%d atEnd=%v: nz %#x, want %#x", n, atEnd, nz, wnz)
-			}
-			for i := 0; i < n; i++ {
-				if in[i] != win[i] || out[i] != wout[i] || info[i] != winfo[i] {
-					t.Fatalf("quantize n=%d atEnd=%v: block %d differs", n, atEnd, i)
+				res := guardedInt32(t, nb, atEnd)
+				wres := make([]int32, nb)
+				tTransformPairs(a, tab, res)
+				tTransformPairsRef(ra, tab, wres)
+				for i := range wres {
+					if res[i] != wres[i] {
+						t.Fatalf("table %d atEnd=%v: tTransform %v, want %v", ti, atEnd, res, wres)
+					}
+				}
+				sse4x4Pairs(a, b, tab, res)
+				sse4x4PairsRef(ra, rb, tab, wres)
+				for i := range wres {
+					if res[i] != wres[i] {
+						t.Fatalf("table %d atEnd=%v: sse4x4 %v, want %v", ti, atEnd, res, wres)
+					}
+				}
+
+				// inverse transform: small coefficients (16-bit path) and
+				// large ones (int32 path)
+				for _, scale := range []int{2047, 32768} {
+					in := guardedBlocks(t, nb, atEnd)
+					for i := range in {
+						for j := range in[i] {
+							in[i][j] = int16(rng.Intn(2*scale) - scale)
+						}
+					}
+					win := append([][16]int16(nil), in...)
+					dst := guarded(t, n1, 0, atEnd)
+					fillPixels(rng, dst)
+					wdst := append([]byte(nil), dst...)
+					iTransformPairs(a, in, dst, tab)
+					iTransformPairsRef(ra, win, wdst, tab)
+					if string(dst) != string(wdst) {
+						t.Fatalf("table %d atEnd=%v scale %d: iTransform differs", ti, atEnd, scale)
+					}
 				}
 			}
-			if n <= 16 {
-				c0, mb := zeroBinStats(in)
-				c0r, mbr := zeroBinStatsRef(win)
-				if c0 != c0r || mb != mbr {
-					t.Fatalf("zeroBinStats n=%d atEnd=%v: (%d, %d), want (%d, %d)", n, atEnd, c0, mb, c0r, mbr)
+
+			// quantizer: in, out and info all against guard pages
+			var m matrix
+			m.q[0], m.q[1] = uint32(kDcTable[30]), uint32(kAcTable[30])
+			expandMatrix(&m, 0)
+			for _, n := range []int{1, 2, 8, 10, 16, 32} {
+				in := guardedBlocks(t, n, atEnd)
+				out := guardedBlocks(t, n, atEnd)
+				info := guardedUint16(t, n, atEnd)
+				for i := range in {
+					fillCoeffs(rng, in[i][:])
+				}
+				win := append([][16]int16(nil), in...)
+				wout := make([][16]int16, n)
+				winfo := make([]uint16, n)
+				nz := quantizeBlocks(in, out, &m, info)
+				wnz := quantizeBlocksRef(win, wout, &m, winfo)
+				if nz != wnz {
+					t.Fatalf("quantize n=%d atEnd=%v: nz %#x, want %#x", n, atEnd, nz, wnz)
+				}
+				for i := 0; i < n; i++ {
+					if in[i] != win[i] || out[i] != wout[i] || info[i] != winfo[i] {
+						t.Fatalf("quantize n=%d atEnd=%v: block %d differs", n, atEnd, i)
+					}
+				}
+				if n <= 16 {
+					c0, mb := zeroBinStats(in)
+					c0r, mbr := zeroBinStatsRef(win)
+					if c0 != c0r || mb != mbr {
+						t.Fatalf("zeroBinStats n=%d atEnd=%v: (%d, %d), want (%d, %d)", n, atEnd, c0, mb, c0r, mbr)
+					}
 				}
 			}
 		}
-	}
+	})
 }
 
 // TestVecGuardPagesSkewed runs the kernels that take plain pointers on
 // buffers of exactly the size the wrappers require, ending at a guard page
 // and starting 0..15 bytes after one (unaligned starts).
 func TestVecGuardPagesSkewed(t *testing.T) {
-	rng := rand.New(rand.NewSource(22))
-	for skew := 0; skew < 16; skew++ {
-		for _, atEnd := range []bool{true, false} {
-			if atEnd && skew > 0 {
-				continue
-			}
-			s := skew
-			// sse16x16 / sse16x8
-			for _, rows := range []int{16, 8} {
-				n := (rows-1)*bps + 16
-				a := guarded(t, n, s, atEnd)
-				b := guarded(t, n, (s+5)&15, atEnd)
-				fillPixels(rng, a)
-				fillPixels(rng, b)
-				var got, want int
-				if rows == 16 {
-					got, want = sse16x16(a, b), sse16x16Ref(a, b)
-				} else {
-					got, want = sse16x8(a, b), sse16x8Ref(a, b)
+	forEachLevel(t, func(t *testing.T) {
+		rng := rand.New(rand.NewSource(22))
+		for skew := 0; skew < 16; skew++ {
+			for _, atEnd := range []bool{true, false} {
+				if atEnd && skew > 0 {
+					continue
 				}
-				if got != want {
-					t.Fatalf("sse16x%d skew %d atEnd=%v: %d, want %d", rows, s, atEnd, got, want)
+				s := skew
+				// sse16x16 / sse16x8
+				for _, rows := range []int{16, 8} {
+					n := (rows-1)*bps + 16
+					a := guarded(t, n, s, atEnd)
+					b := guarded(t, n, (s+5)&15, atEnd)
+					fillPixels(rng, a)
+					fillPixels(rng, b)
+					var got, want int
+					if rows == 16 {
+						got, want = sse16x16(a, b), sse16x16Ref(a, b)
+					} else {
+						got, want = sse16x8(a, b), sse16x8Ref(a, b)
+					}
+					if got != want {
+						t.Fatalf("sse16x%d skew %d atEnd=%v: %d, want %d", rows, s, atEnd, got, want)
+					}
 				}
-			}
 
-			// intra16 and chroma predictors
-			yLeft := guarded(t, 17, s, atEnd)
-			yTop := guarded(t, 16, (s+3)&15, atEnd)
-			uLeft := guarded(t, 9, (s+7)&15, atEnd)
-			vLeft := guarded(t, 9, (s+11)&15, atEnd)
-			uvTop := guarded(t, 16, (s+13)&15, atEnd)
-			for _, e := range [][]byte{yLeft, yTop, uLeft, vLeft, uvTop} {
-				fillPixels(rng, e)
-			}
-			p16 := guarded(t, i16HE16+15*bps+16, s, atEnd)
-			w16 := make([]byte, len(p16))
-			for i := range p16 {
-				p16[i] = byte(i * 3)
-				w16[i] = p16[i]
-			}
-			predLuma16(p16, yLeft, yTop)
-			predLuma16Ref(w16, yLeft, yTop)
-			if string(p16) != string(w16) {
-				t.Fatalf("predLuma16 skew %d atEnd=%v differs", s, atEnd)
-			}
-			p8 := guarded(t, c8HE8+7*bps+16, s, atEnd)
-			w8 := make([]byte, len(p8))
-			for i := range p8 {
-				p8[i] = byte(i * 5)
-				w8[i] = p8[i]
-			}
-			predChroma8(p8, uLeft, vLeft, uvTop)
-			predChroma8Ref(w8, uLeft, vLeft, uvTop)
-			if string(p8) != string(w8) {
-				t.Fatalf("predChroma8 skew %d atEnd=%v differs", s, atEnd)
-			}
-
-			// intra4: the boundary slice ends 11 bytes after the top sample
-			// (the 16-byte load) or starts 5 bytes before it
-			for _, top := range []int{5, 17, 29} {
-				bnd := guarded(t, top+11, s, atEnd)
-				fillPixels(rng, bnd)
-				p4 := guarded(t, i4DC4+7*bps+8, s, atEnd)
-				w4 := make([]byte, len(p4))
-				for i := range p4 {
-					p4[i] = byte(i * 7)
-					w4[i] = p4[i]
+				// intra16 and chroma predictors
+				yLeft := guarded(t, 17, s, atEnd)
+				yTop := guarded(t, 16, (s+3)&15, atEnd)
+				uLeft := guarded(t, 9, (s+7)&15, atEnd)
+				vLeft := guarded(t, 9, (s+11)&15, atEnd)
+				uvTop := guarded(t, 16, (s+13)&15, atEnd)
+				for _, e := range [][]byte{yLeft, yTop, uLeft, vLeft, uvTop} {
+					fillPixels(rng, e)
 				}
-				predLuma4(p4, bnd, top)
-				predLuma4Ref(w4, bnd, top)
-				if string(p4) != string(w4) {
-					t.Fatalf("predLuma4 top %d skew %d atEnd=%v differs", top, s, atEnd)
+				p16 := guarded(t, i16HE16+15*bps+16, s, atEnd)
+				w16 := make([]byte, len(p16))
+				for i := range p16 {
+					p16[i] = byte(i * 3)
+					w16[i] = p16[i]
+				}
+				predLuma16(p16, yLeft, yTop)
+				predLuma16Ref(w16, yLeft, yTop)
+				if string(p16) != string(w16) {
+					t.Fatalf("predLuma16 skew %d atEnd=%v differs", s, atEnd)
+				}
+				p8 := guarded(t, c8HE8+7*bps+16, s, atEnd)
+				w8 := make([]byte, len(p8))
+				for i := range p8 {
+					p8[i] = byte(i * 5)
+					w8[i] = p8[i]
+				}
+				predChroma8(p8, uLeft, vLeft, uvTop)
+				predChroma8Ref(w8, uLeft, vLeft, uvTop)
+				if string(p8) != string(w8) {
+					t.Fatalf("predChroma8 skew %d atEnd=%v differs", s, atEnd)
+				}
+
+				// intra4: the boundary slice ends 11 bytes after the top sample
+				// (the 16-byte load) or starts 5 bytes before it
+				for _, top := range []int{5, 17, 29} {
+					bnd := guarded(t, top+11, s, atEnd)
+					fillPixels(rng, bnd)
+					p4 := guarded(t, i4DC4+7*bps+8, s, atEnd)
+					w4 := make([]byte, len(p4))
+					for i := range p4 {
+						p4[i] = byte(i * 7)
+						w4[i] = p4[i]
+					}
+					predLuma4(p4, bnd, top)
+					predLuma4Ref(w4, bnd, top)
+					if string(p4) != string(w4) {
+						t.Fatalf("predLuma4 top %d skew %d atEnd=%v differs", top, s, atEnd)
+					}
 				}
 			}
 		}
-	}
+	})
 }
