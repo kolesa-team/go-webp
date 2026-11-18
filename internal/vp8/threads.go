@@ -38,7 +38,8 @@ import (
 // conversion stays on the reconstruction helper).
 //
 // Every wait is a blocking channel receive. A stage that wakes a blocked
-// one hands it the processor (see parked.handOff).
+// one hands it the processor while the process has idle ones (see
+// parked.handOff).
 
 // mtSlots is the number of macroblock row batches in the UseThreads ring:
 // the parser fills one batch while the helper reconstructs the other. It is
@@ -123,6 +124,8 @@ type mtState struct {
 	modeRows  int
 	modes     []mbModes
 	eof       []bool
+
+	procs int // GOMAXPROCS when the decode started (see parked.handOff)
 }
 
 // parked is set while a pipeline stage is blocked waiting for another
@@ -148,9 +151,12 @@ func (p *parked) wait(f func()) {
 }
 
 // handOff is called after a send that may have woken the stage that p
-// belongs to.
-func (p *parked) handOff() {
-	if p.Load() {
+// belongs to. procs is the decode's GOMAXPROCS: when about as many
+// pipelines run as there are processors, none is idle to take the waker
+// over, and the yield would only add a context switch (see
+// workers.SpareProcs).
+func (p *parked) handOff(procs int) {
+	if p.Load() && workers.SpareProcs(procs) {
 		runtime.Gosched()
 	}
 }
@@ -172,6 +178,9 @@ func (d *decoder) decodeFrameThreaded() error {
 	}
 	m := d.mt
 	m.init(d.mbW, k)
+	m.procs = runtime.GOMAXPROCS(0)
+	workers.BeginHandOffs()
+	defer workers.EndHandOffs()
 	t := workers.Spawn(d.reconBatches)
 	if t == nil {
 		return d.decodeFrame()
@@ -256,7 +265,7 @@ parse:
 		select {
 		case m.jobs <- j:
 			sendEmit = false
-			m.reconParked.handOff()
+			m.reconParked.handOff(m.procs)
 		case <-t.Done():
 			break parse
 		}
@@ -436,7 +445,7 @@ func (d *decoder) reconBatches() error {
 				}
 			}
 			m.free <- struct{}{} // never blocks: at most mtSlots batches are in flight
-			m.parserParked.handOff()
+			m.parserParked.handOff(m.procs)
 			continue
 		}
 		s := -1
@@ -464,10 +473,10 @@ func (d *decoder) reconBatches() error {
 			d.reconRow(j.y+i, j.blocks[i*d.mbW:][:d.mbW])
 		}
 		m.free <- struct{}{}
-		m.parserParked.handOff()
+		m.parserParked.handOff(m.procs)
 		carry = mtCache{c.y[16*j.n*d.cacheYStride:], c.u[8*j.n*d.cacheUVStride:], c.v[8*j.n*d.cacheUVStride:]}
 		e.jobs <- mtEmitJob{y: j.y, n: j.n, slot: s} // never blocks: the slot was free
-		e.parked.handOff()
+		e.parked.handOff(m.procs)
 	}
 }
 
@@ -515,7 +524,7 @@ func (d *decoder) emitBatches(e *mtEmitter) error {
 			}
 		}
 		e.free <- j.slot // never blocks
-		m.reconParked.handOff()
+		m.reconParked.handOff(m.procs)
 	}
 }
 

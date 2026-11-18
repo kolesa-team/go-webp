@@ -70,6 +70,7 @@ type alphaHelper struct {
 	band  int // rows of work the sleeping helper waits for
 	ahead int // rows the helper may decode past the last request
 	limit int // the helper never decodes this row and the following ones (the last row of the plane, or the crop bottom)
+	procs int // GOMAXPROCS when the helper started (see handOff)
 
 	mu   sync.Mutex
 	cond sync.Cond
@@ -94,8 +95,14 @@ type alphaHelper struct {
 // from which other threads only take it after a back-off (tens of
 // microseconds on darwin, hundreds on Linux VMs; see the vp8 package's
 // parked.handOff). It is no wait: Gosched returns at once when nothing
-// else is runnable.
-func handOff() { runtime.Gosched() }
+// else is runnable. When the UseThreads pipelines in progress (the VP8
+// decode of a lossy+alpha picture is one) occupy the processors, no idle
+// one would take the waker over, and it does not yield.
+func (hp *alphaHelper) handOff() {
+	if workers.SpareProcs(hp.procs) {
+		runtime.Gosched()
+	}
+}
 
 // errHelperPanic aborts a decode whose alpha helper panicked; the panic
 // itself is re-raised on the decoding goroutine by release.
@@ -126,6 +133,7 @@ func (a *lazyAlpha) startHelper() bool {
 	// helper stops there instead of working ahead on rows nobody needs.
 	limit := min(a.h-1, a.crop.Max.Y)
 	hp := &alphaHelper{step: step, band: band, ahead: 2 * band, limit: limit,
+		procs: runtime.GOMAXPROCS(0),
 		// The VP8 decoder requests rows once per macroblock row.
 		reqs: make([]int, 0, a.h/16+4)}
 	hp.cond.L = &hp.mu
@@ -184,7 +192,7 @@ func (a *lazyAlpha) runHelper(hp *alphaHelper) error {
 		}
 		hp.mu.Unlock()
 		if wake {
-			handOff()
+			hp.handOff()
 		}
 	}
 }
@@ -218,7 +226,7 @@ func (a *lazyAlpha) getAsync(rowStart, rowEnd int) ([]byte, int, error) {
 		p := hp.pub
 		hp.mu.Unlock()
 		if wake {
-			handOff()
+			hp.handOff()
 		}
 		// The helper only writes rows from published on, below rowStart
 		// plus the ring size: not the rows of the window.

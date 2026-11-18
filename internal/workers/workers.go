@@ -49,6 +49,31 @@ func SetLimitForTest(n int) int {
 // InUse returns the number of helper goroutines currently running.
 func InUse() int { return int(inUse.Load()) }
 
+// handing counts the calls in progress whose goroutines wake each other up
+// while they keep working (see SpareProcs).
+var handing atomic.Int64
+
+// BeginHandOffs registers a call whose goroutines hand work to each other
+// (a pipeline of stages), until EndHandOffs.
+func BeginHandOffs() { handing.Add(1) }
+
+// EndHandOffs ends a call registered by BeginHandOffs.
+func EndHandOffs() { handing.Add(-1) }
+
+// SpareProcs reports whether the process probably has idle processors:
+// calls registered by BeginHandOffs occupy at most half of procs (the
+// GOMAXPROCS the caller read when it started). A goroutine that wakes up
+// another one and keeps working may then yield its processor
+// (runtime.Gosched), so that the woken goroutine starts at once instead of
+// after the scheduler's back-off while the waker moves to an idle
+// processor; on a busy process that yield would only add a context switch
+// to every hand-off.
+func SpareProcs(procs int) bool { return 2*handing.Load() <= int64(procs) }
+
+// HandOffs returns the number of calls registered by BeginHandOffs that
+// are in progress (tests).
+func HandOffs() int { return int(handing.Load()) }
+
 // TryAcquire reserves one helper slot if the budget allows. A successful call
 // must be paired with Release. Prefer Spawn, which pairs them and recovers
 // panics.
