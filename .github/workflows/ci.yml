@@ -38,6 +38,13 @@ jobs:
         run: |
           go run ./_examples/decode
           go run ./_examples/encode
+      # benchmarks/ is a separate module (v1 vs v2, see README); its v1
+      # side needs libwebp, so only the shared suite and the v2 side are
+      # checked here, to keep the benchmarks building.
+      - name: Vet the benchmark suite
+        if: runner.os == 'Linux' && matrix.go == 'stable'
+        working-directory: benchmarks
+        run: go vet ./suite ./v2/...
       - name: Test
         run: go test ./...
       # The arm64 assembly kernels are compared with the pure Go code they

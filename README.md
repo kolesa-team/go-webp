@@ -291,36 +291,39 @@ decoder stage that wakes a parked one yields its processor once
 (`runtime.Gosched`), so that the woken stage runs at once instead of after
 the scheduler's wake-up delay (hundreds of microseconds on Linux).
 
-The flags trade CPU for latency. On the benchmark machine (see
-[Benchmarks](#benchmarks); CPU time is the user and system time of the
-whole process per call, garbage collection included; the percentages
-compare the call with the flag to the same call on one goroutine):
+The flags trade CPU for latency. Measured on an Apple M5 Pro (15 cores;
+see [Benchmarks](#benchmarks) for the method; CPU time is the user and
+system time of the whole process per call, garbage collection included;
+the percentages compare the call with the flag to the same call on one
+goroutine):
 
 | Call (wall / CPU time) | NEON, one goroutine | NEON, with the flag | pure Go, one goroutine | pure Go, with the flag |
 |---|---|---|---|---|
-| Decode lossy 675x900 | 3.08 ms / 3.20 ms | 2.00 ms / 3.47 ms (−35% / +8%) | 6.61 ms / 6.73 ms | 4.40 ms / 7.05 ms (−33% / +5%) |
-| Decode lossy+alpha 3000x2000 | 8.75 ms / 8.91 ms | 4.35 ms / 10.6 ms (−50% / +19%) | 22.5 ms / 22.7 ms | 13.1 ms / 24.2 ms (−42% / +7%) |
-| Decode lossless 3000x2000 | 2.68 ms / 2.86 ms | 2.00 ms / 3.15 ms (−25% / +10%) | 2.68 ms / 2.85 ms | 1.96 ms / 3.08 ms (−27% / +8%) |
-| Encode lossy q75 method 0, 1.2 MP | 17.2 ms / 17.2 ms | 16.5 ms / 17.6 ms (−4% / +2%) | 27.1 ms / 27.1 ms | 24.8 ms / 27.8 ms (−9% / +3%) |
-| Encode lossy q75 method 4, 1.2 MP | 47.1 ms / 47.1 ms | 21.2 ms / 51.6 ms (−55% / +10%) | 121 ms / 121 ms | 39.4 ms / 132 ms (−67% / +9%) |
-| Encode lossy q75 method 6, 1.2 MP | 121 ms / 121 ms | 40.2 ms / 129 ms (−67% / +7%) | 174 ms / 174 ms | 52.4 ms / 187 ms (−70% / +7%) |
-| Encode lossy+alpha q75, 3000x2000 | 245 ms / 245 ms | 156 ms / 261 ms (−37% / +6%) | 460 ms / 459 ms | 159 ms / 524 ms (−65% / +14%) |
-| Encode lossless level 6, 1.2 MP | 306 ms / 306 ms | 157 ms / 342 ms (−49% / +11%) | 308 ms / 308 ms | 158 ms / 345 ms (−49% / +12%) |
-| Encode lossless level 0, 1.2 MP | 45.4 ms / 45.4 ms | 36.2 ms / 47.0 ms (−20% / +3%) | 45.5 ms / 45.5 ms | 36.1 ms / 46.8 ms (−21% / +3%) |
+| Decode lossy 675x900 | 3.02 ms / 3.14 ms | 2.01 ms / 3.47 ms (−34% / +11%) | 6.63 ms / 6.76 ms | 4.40 ms / 7.04 ms (−34% / +4%) |
+| Decode lossy+alpha 3000x2000 | 8.72 ms / 8.89 ms | 4.30 ms / 10.5 ms (−51% / +18%) | 22.4 ms / 22.6 ms | 13.1 ms / 24.2 ms (−42% / +7%) |
+| Decode lossless 3000x2000 | 2.67 ms / 2.86 ms | 1.97 ms / 3.09 ms (−26% / +8%) | 2.67 ms / 2.85 ms | 1.95 ms / 3.06 ms (−27% / +7%) |
+| Encode lossy q75 method 0, 1.2 MP | 17.3 ms / 17.3 ms | 16.5 ms / 17.5 ms (−4% / +1%) | 27.1 ms / 27.1 ms | 24.8 ms / 27.8 ms (−8% / +3%) |
+| Encode lossy q75 method 4, 1.2 MP | 47.2 ms / 47.2 ms | 21.3 ms / 51.8 ms (−55% / +10%) | 120 ms / 120 ms | 39.1 ms / 131 ms (−67% / +9%) |
+| Encode lossy q75 method 6, 1.2 MP | 120 ms / 120 ms | 40.2 ms / 129 ms (−67% / +7%) | 174 ms / 174 ms | 52.1 ms / 186 ms (−70% / +7%) |
+| Encode lossy+alpha q75, 3000x2000 | 245 ms / 245 ms | 155 ms / 260 ms (−37% / +6%) | 458 ms / 458 ms | 158 ms / 522 ms (−65% / +14%) |
+| Encode lossless level 6, 1.2 MP | 307 ms / 307 ms | 157 ms / 342 ms (−49% / +11%) | 306 ms / 306 ms | 157 ms / 341 ms (−49% / +11%) |
+| Encode lossless level 0, 1.2 MP | 45.1 ms / 45.2 ms | 36.2 ms / 46.8 ms (−20% / +4%) | 45.1 ms / 45.1 ms | 36.1 ms / 46.8 ms (−20% / +4%) |
 
 With the flags, a call takes free helper slots only. Under saturation (15
-calls at a time on 15 cores) a call rarely finds one: `ThreadLevel` then
-changed encode throughput by less than the run-to-run noise (about ±5%),
-while `UseThreads` lowered the throughput of lossy decodes by about 5-15%
-(the pipeline's hand-offs cost CPU). The flags therefore help most an
-application that decodes or encodes one large picture at a time, or a
-server with spare cores; a server that already runs about one call per
-core may leave them off, which remains the default.
+calls at a time on 15 cores, see [Throughput under
+load](#throughput-under-load)) a call rarely finds one: `ThreadLevel` then
+changed encode throughput by less than the run-to-run noise (about ±10%
+there), while `UseThreads` lowered the throughput of lossy+alpha and
+lossless decodes by about 10% (the pipeline's hand-offs cost CPU). The
+flags therefore help most an application that decodes or encodes one large
+picture at a time, or a server with spare cores; a server that already
+runs about one call per core may leave them off, which remains the
+default.
 
 On Linux VMs with coarse timers (for example Docker Desktop's linux/arm64
 VM) every hand-off between goroutines costs about a millisecond, so there
-the flags pay off on large or slow pictures only. Measured there with 4
-CPUs: `UseThreads` decodes the 3000x2000 lossy+alpha logo in 7.1 ms
+the flags pay off on large or slow pictures only. Measured there (Docker
+Desktop on the same M5 Pro, 4 CPUs; not part of `benchmarks/run.sh`): `UseThreads` decodes the 3000x2000 lossy+alpha logo in 7.1 ms
 instead of 9.5 ms and the 675x900 lossy picture in 2.95 ms instead of
 3.26 ms, but the lossless logo in 3.2 ms instead of 2.8 ms; `ThreadLevel`
 encodes the 1.2 MP photo at method 6 in 88 ms (about 123 ms on one
@@ -465,13 +468,14 @@ Other differences worth knowing:
 
 ## Benchmarks
 
-Apple M5 Pro (15 cores), Go 1.27.1, darwin/arm64, otherwise idle. All
-columns were measured in one session with prebuilt benchmark binaries run
-alternately, 10 rounds each (`-benchmem`; 1 s per decode benchmark, 2 s
-per encode benchmark); the table shows medians, and the percentages are
-the time difference from v1 (benchstat, p < 0.05; "~" means no
-significant difference). The CPU time that `UseThreads` and `ThreadLevel`
-cost is in [Threads](#threads).
+All measurements in this README were taken on one machine: **Apple M5 Pro**
+(15 CPU cores, 24 GB RAM), macOS 27.2, Go 1.27.1, darwin/arm64. The tables
+of this section (and the one in [Threads](#threads)) were measured on
+2026-11-18 with [`benchmarks/run.sh`](benchmarks/run.sh), see
+[Reproducing the measurements](#reproducing-the-measurements). Absolute
+times differ on other hardware; compare the columns with each other. On
+amd64 v2 currently runs the code of the "pure Go" column (amd64 assembly
+is planned); it was not measured on amd64 hardware.
 
 - **v1**: v1.0.5 with Homebrew libwebp 1.6.0 (cgo; libwebp uses its own
   NEON code). Its memory counts only Go allocations: libwebp's C heap is
@@ -481,36 +485,44 @@ cost is in [Threads](#threads).
   the same arm64 machine).
 - **v2 (NEON)**: this version as built by default on arm64.
 
-MB = 10^6 bytes allocated per operation.
+Method: every benchmark binary is built once and run in 10 rounds; within a
+round the three builds run one after another in a rotating order (1 s per
+decode benchmark, 2 s per encode benchmark, `-benchmem`), so that changes of
+the machine's state affect all of them alike. The table shows medians; the
+percentages are the time difference from v1 (benchstat, p < 0.05; "~"
+means no significant difference). The 95% confidence interval of nearly
+every time is within ±2% of the median. MB = 10^6 bytes allocated per
+operation. The CPU time that `UseThreads` and `ThreadLevel` cost is in
+[Threads](#threads).
 
 | Benchmark | v1 (libwebp) | v2, pure Go (`-tags purego`) | v2 (NEON) |
 |---|---|---|---|
-| Decode lossy 675x900 (`m4_q75.webp`) | 3.06 ms, 2.57 MB, 21 allocs | 6.61 ms (+116%), 2.50 MB, 10 allocs | 3.08 ms (~), 2.50 MB, 10 allocs |
-| ↳ with `UseThreads` | 2.39 ms, 2.57 MB, 21 allocs | 4.40 ms (+84%), 2.51 MB, 24 allocs | 2.00 ms (−16%), 2.50 MB, 17 allocs |
-| ↳ scaled to 320x240 | 3.43 ms, 0.45 MB, 21 allocs | 4.33 ms (+27%), 0.38 MB, 12 allocs | 2.94 ms (−14%), 0.38 MB, 12 allocs |
-| ↳ `DecodeInto` (reused buffer) |  | 6.52 ms, 0.08 MB, 8 allocs | 2.97 ms, 0.07 MB, 8 allocs |
-| ↳ `DecodeYCbCr` |  | 5.32 ms, 0.98 MB, 9 allocs | 2.87 ms, 0.98 MB, 9 allocs |
-| Decode lossy+alpha 3000x2000 (`webp-logo-lossy.webp`) | 10.7 ms, 24.2 MB, 22 allocs | 22.5 ms (+111%), 24.1 MB, 15 allocs | 8.75 ms (−18%), 24.1 MB, 15 allocs |
-| ↳ with `UseThreads` | 8.61 ms, 24.2 MB, 22 allocs | 13.1 ms (+52%), 24.1 MB, 36 allocs | 4.35 ms (−50%), 24.1 MB, 36 allocs |
-| ↳ scaled to 320x240 | 13.3 ms, 0.50 MB, 22 allocs | 14.0 ms (+6%), 0.46 MB, 16 allocs | 6.81 ms (−49%), 0.41 MB, 16 allocs |
-| ↳ `DecodeInto` (reused buffer) |  | 22.2 ms, 0.57 MB, 11 allocs | 8.53 ms, 0.26 MB, 11 allocs |
-| ↳ `DecodeNYCbCrA` |  | 11.0 ms, 15.1 MB, 14 allocs | 7.56 ms, 15.1 MB, 14 allocs |
-| Decode lossless 3000x2000 (`webp-logo-lossless.webp`) | 5.66 ms, 24.2 MB, 22 allocs | 2.68 ms (−53%), 24.1 MB, 10 allocs | 2.68 ms (−53%), 24.1 MB, 10 allocs |
-| ↳ with `UseThreads` | 5.64 ms, 24.2 MB, 22 allocs | 1.96 ms (−65%), 24.1 MB, 18 allocs | 2.00 ms (−65%), 24.1 MB, 18 allocs |
-| ↳ scaled to 320x240 | 16.9 ms, 0.52 MB, 22 allocs | 5.73 ms (−66%), 0.42 MB, 10 allocs | 3.12 ms (−82%), 0.41 MB, 9 allocs |
-| ↳ `DecodeInto` (reused buffer) |  | 2.30 ms, 0.14 MB, 8 allocs | 2.28 ms, 0.14 MB, 8 allocs |
-| Encode lossy q75, 960x1280 JPEG source | 64.8 ms, 117 858 bytes, 4.92 MB, 7 allocs | 121 ms (+86%), 117 918 bytes, 0.13 MB, 10 allocs | 47.1 ms (−27%), 117 918 bytes, 0.13 MB, 10 allocs |
-| ↳ with `ThreadLevel` | 61.9 ms, 117 858 bytes, 4.92 MB, 7 allocs | 39.4 ms (−36%), 117 918 bytes, 0.13 MB, 69 allocs | 21.2 ms (−66%), 117 918 bytes, 0.13 MB, 68 allocs |
-| ↳ method 0 | 23.1 ms, 150 802 bytes, 4.92 MB, 7 allocs | 27.1 ms (+17%), 149 144 bytes, 0.16 MB, 10 allocs | 17.2 ms (−26%), 149 144 bytes, 0.16 MB, 10 allocs |
-| ↳ method 0 with `ThreadLevel` | 21.8 ms, 150 802 bytes, 4.92 MB, 7 allocs | 24.8 ms (+14%), 149 144 bytes, 0.16 MB, 41 allocs | 16.5 ms (−24%), 149 144 bytes, 0.16 MB, 40 allocs |
-| ↳ method 6 | 122 ms, 108 840 bytes, 4.92 MB, 7 allocs | 174 ms (+43%), 108 710 bytes, 0.12 MB, 11 allocs | 121 ms (−1%), 108 710 bytes, 0.12 MB, 10 allocs |
-| ↳ method 6 with `ThreadLevel` | 119 ms, 108 840 bytes, 4.92 MB, 7 allocs | 52.4 ms (−56%), 108 710 bytes, 0.12 MB, 69 allocs | 40.2 ms (−66%), 108 710 bytes, 0.12 MB, 67 allocs |
-| Encode lossy+alpha q75, 3000x2000 logo | 262 ms, 57 584 bytes, 360 B, 5 allocs | 460 ms (+75%), 57 538 bytes, 0.55 MB, 46 allocs | 245 ms (−6%), 57 538 bytes, 0.62 MB, 44 allocs |
-| ↳ with `ThreadLevel` | 160 ms, 57 584 bytes, 360 B, 5 allocs | 159 ms (~), 57 538 bytes, 0.98 MB, 121 allocs | 156 ms (−3%), 57 538 bytes, 0.94 MB, 122 allocs |
-| Encode lossless level 6, same JPEG source | 389 ms, 1 098 384 bytes, 4.92 MB, 7 allocs | 308 ms (−21%), 1 098 360 bytes, 1.63 MB, 24 allocs | 306 ms (−21%), 1 098 360 bytes, 1.63 MB, 23 allocs |
-| ↳ with `ThreadLevel` | 389 ms, 1 098 384 bytes, 4.92 MB, 7 allocs | 158 ms (−59%), 1 098 360 bytes, 1.93 MB, 117 allocs | 157 ms (−60%), 1 098 360 bytes, 2.01 MB, 116 allocs |
-| Encode lossless level 0, same JPEG source | 39.2 ms, 1 201 738 bytes, 4.92 MB, 7 allocs | 45.5 ms (+16%), 1 216 356 bytes, 1.41 MB, 19 allocs | 45.4 ms (+16%), 1 216 356 bytes, 1.39 MB, 19 allocs |
-| ↳ with `ThreadLevel` | 39.3 ms, 1 201 738 bytes, 4.92 MB, 7 allocs | 36.1 ms (−8%), 1 216 356 bytes, 1.49 MB, 48 allocs | 36.2 ms (−8%), 1 216 356 bytes, 1.48 MB, 49 allocs |
+| Decode lossy 675x900 (`m4_q75.webp`) | 3.03 ms, 2.57 MB, 21 allocs | 6.63 ms (+118%), 2.50 MB, 10 allocs | 3.02 ms (~), 2.50 MB, 10 allocs |
+| ↳ with `UseThreads` | 2.39 ms, 2.57 MB, 21 allocs | 4.40 ms (+84%), 2.51 MB, 24 allocs | 2.01 ms (−16%), 2.50 MB, 17 allocs |
+| ↳ scaled to 320x240 (`Scale`) | 3.39 ms, 0.45 MB, 21 allocs | 4.34 ms (+28%), 0.38 MB, 12 allocs | 2.89 ms (−15%), 0.38 MB, 12 allocs |
+| ↳ `DecodeInto` (reused buffer) |  | 6.47 ms, 0.08 MB, 8 allocs | 2.97 ms, 0.07 MB, 8 allocs |
+| ↳ `DecodeYCbCr` |  | 5.31 ms, 0.98 MB, 9 allocs | 2.85 ms, 0.98 MB, 9 allocs |
+| Decode lossy+alpha 3000x2000 (`webp-logo-lossy.webp`) | 10.7 ms, 24.2 MB, 22 allocs | 22.4 ms (+109%), 24.1 MB, 15 allocs | 8.72 ms (−19%), 24.1 MB, 15 allocs |
+| ↳ with `UseThreads` | 8.57 ms, 24.2 MB, 22 allocs | 13.1 ms (+52%), 24.1 MB, 37 allocs | 4.30 ms (−50%), 24.1 MB, 36 allocs |
+| ↳ scaled to 320x240 (`Scale`) | 13.3 ms, 0.50 MB, 22 allocs | 14.1 ms (+6%), 0.44 MB, 16 allocs | 6.81 ms (−49%), 0.43 MB, 16 allocs |
+| ↳ `DecodeInto` (reused buffer) |  | 22.2 ms, 0.59 MB, 11 allocs | 8.46 ms, 0.26 MB, 11 allocs |
+| ↳ `DecodeNYCbCrA` |  | 10.9 ms, 15.1 MB, 14 allocs | 7.46 ms, 15.1 MB, 14 allocs |
+| Decode lossless 3000x2000 (`webp-logo-lossless.webp`) | 5.62 ms, 24.2 MB, 22 allocs | 2.67 ms (−53%), 24.1 MB, 10 allocs | 2.67 ms (−52%), 24.1 MB, 10 allocs |
+| ↳ with `UseThreads` | 5.66 ms, 24.2 MB, 22 allocs | 1.95 ms (−66%), 24.1 MB, 18 allocs | 1.97 ms (−65%), 24.1 MB, 18 allocs |
+| ↳ scaled to 320x240 (`Scale`) | 16.9 ms, 0.52 MB, 22 allocs | 5.71 ms (−66%), 0.42 MB, 10 allocs | 3.09 ms (−82%), 0.41 MB, 9 allocs |
+| ↳ `DecodeInto` (reused buffer) |  | 2.24 ms, 0.14 MB, 8 allocs | 2.34 ms, 0.14 MB, 8 allocs |
+| Encode lossy q75 method 4, 960x1280 JPEG source (`source.jpg`) | 64.3 ms, 117 858 bytes, 4.92 MB, 7 allocs | 120 ms (+87%), 117 918 bytes, 0.13 MB, 10 allocs | 47.2 ms (−27%), 117 918 bytes, 0.13 MB, 10 allocs |
+| ↳ with `ThreadLevel` | 61.8 ms, 117 858 bytes, 4.92 MB, 7 allocs | 39.1 ms (−37%), 117 918 bytes, 0.13 MB, 68 allocs | 21.3 ms (−66%), 117 918 bytes, 0.13 MB, 67 allocs |
+| ↳ method 0 | 22.9 ms, 150 802 bytes, 4.92 MB, 7 allocs | 27.1 ms (+18%), 149 144 bytes, 0.16 MB, 10 allocs | 17.3 ms (−25%), 149 144 bytes, 0.16 MB, 10 allocs |
+| ↳ method 0 with `ThreadLevel` | 21.6 ms, 150 802 bytes, 4.92 MB, 7 allocs | 24.8 ms (+14%), 149 144 bytes, 0.16 MB, 41 allocs | 16.5 ms (−24%), 149 144 bytes, 0.16 MB, 40 allocs |
+| ↳ method 6 | 122 ms, 108 840 bytes, 4.92 MB, 7 allocs | 174 ms (+43%), 108 710 bytes, 0.12 MB, 11 allocs | 120 ms (−1%), 108 710 bytes, 0.12 MB, 10 allocs |
+| ↳ method 6 with `ThreadLevel` | 119 ms, 108 840 bytes, 4.92 MB, 7 allocs | 52.1 ms (−56%), 108 710 bytes, 0.12 MB, 68 allocs | 40.2 ms (−66%), 108 710 bytes, 0.12 MB, 67 allocs |
+| Encode lossy+alpha q75 method 4, 3000x2000 logo | 261 ms, 57 584 bytes, 360 B, 5 allocs | 458 ms (+75%), 57 538 bytes, 0.74 MB, 46 allocs | 245 ms (−6%), 57 538 bytes, 0.56 MB, 44 allocs |
+| ↳ with `ThreadLevel` | 160 ms, 57 584 bytes, 360 B, 5 allocs | 158 ms (~), 57 538 bytes, 0.95 MB, 122 allocs | 155 ms (−3%), 57 538 bytes, 0.95 MB, 120 allocs |
+| Encode lossless level 6, same JPEG source | 382 ms, 1 098 384 bytes, 4.92 MB, 7 allocs | 306 ms (−20%), 1 098 360 bytes, 1.48 MB, 23 allocs | 307 ms (−20%), 1 098 360 bytes, 1.63 MB, 24 allocs |
+| ↳ with `ThreadLevel` | 382 ms, 1 098 384 bytes, 4.92 MB, 7 allocs | 157 ms (−59%), 1 098 360 bytes, 1.93 MB, 117 allocs | 157 ms (−59%), 1 098 360 bytes, 2.01 MB, 116 allocs |
+| Encode lossless level 0, same JPEG source | 38.9 ms, 1 201 738 bytes, 4.92 MB, 7 allocs | 45.1 ms (+16%), 1 216 356 bytes, 1.41 MB, 19 allocs | 45.1 ms (+16%), 1 216 356 bytes, 1.40 MB, 19 allocs |
+| ↳ with `ThreadLevel` | 39.0 ms, 1 201 738 bytes, 4.92 MB, 7 allocs | 36.1 ms (−8%), 1 216 356 bytes, 1.48 MB, 48 allocs | 36.2 ms (−7%), 1 216 356 bytes, 1.49 MB, 49 allocs |
 
 Decoded pixels are identical in all columns (bit-exact with libwebp 1.6
 `dwebp`; when scaling, v2 matches libwebp's portable C rescaler, and
@@ -521,25 +533,58 @@ encode with `ThreadLevel` is then bound by its lossless alpha plane, coded
 alongside the VP8 frame, so the NEON build gains nothing over the pure Go
 one there. The lossless logo is a 256-colour palette picture, which the
 NEON kernels do not speed up; lossless photos and graphics decode 20-55%
-faster with them. Lossy pictures scaled to a thumbnail now decode faster
-than at full size.
+faster with them. Lossy pictures scaled to a thumbnail decode faster than
+at full size.
 
-Peak resident memory of a whole process (`getrusage`, median of 3 runs,
-same session, default `GOGC`, no `GOMEMLIMIT` unless stated; the pure Go
-build peaks within a few MB of the NEON one):
+### Throughput under load
 
-| Workload | v1 (libwebp) | v2 (NEON) |
-|---|---|---|
-| One 12 MP lossy encode (4000x3000 `*image.YCbCr`, q75; the source takes 46 MB) | 241 MB, 0.79 s | 78 MB, 0.43 s |
-| ↳ with `ThreadLevel` | 241 MB, 0.75 s | 80 MB, 0.17 s |
-| One 12 MP lossless level 6 encode (upscaled photo) | 336 MB, 4.3 s | 262 MB, 3.2 s |
-| Three 12 MP lossless level 6 encodes in a row | 434 MB | 272 MB |
-| ↳ with `GOMEMLIMIT=450MiB` | 428 MB | 421 MB |
-| One 12 MP lossless decode (output 48 MB) | 113 MB | 69 MB |
-| 15 goroutines x 4 decodes of the 6 MP lossless logo | 1115 MB | 760-1030 MB |
-| ↳ `DecodeInto`, one buffer per goroutine | | 401 MB |
-| 15 goroutines x 4 decodes of the 6 MP lossy+alpha logo | 921 MB | 770-910 MB |
-| ↳ `DecodeInto`, one buffer per goroutine | | 407 MB |
+The same calls, 15 at a time on the 15 cores (`b.RunParallel`, as on a
+busy server), in calls per second; the percentages compare the throughput
+with v1. Under full load the run-to-run spread is much larger (±10-30%);
+"~" marks differences that benchstat does not find significant.
+
+| Call (15 at a time) | v1 (libwebp) | v2, pure Go | v2 (NEON) |
+|---|---|---|---|
+| Decode lossy 675x900 | 4 197/s | 1 602/s (−62%) | 3 546/s (~) |
+| ↳ `UseThreads` | 3 179/s | 1 483/s (−53%) | 3 597/s (+13%) |
+| Decode lossy+alpha 3000x2000 | 645/s | 287/s (−55%) | 730/s (+13%) |
+| ↳ `UseThreads` | 512/s | 253/s (−51%) | 642/s (+26%) |
+| Decode lossless 3000x2000 | 852/s | 1 905/s (+124%) | 1 840/s (+116%) |
+| ↳ `UseThreads` | 844/s | 1 558/s (+85%) | 1 681/s (+99%) |
+| Encode lossy q75 method 0, 1.2 MP | 316/s | 229/s (−28%) | 427/s (+35%) |
+| ↳ `ThreadLevel` | 315/s | 273/s (−14%) | 471/s (+49%) |
+| Encode lossy q75 method 4, 1.2 MP | 116/s | 55/s (−53%) | 159/s (+37%) |
+| ↳ `ThreadLevel` | 113/s | 56/s (−51%) | 162/s (+43%) |
+| Encode lossy q75 method 6, 1.2 MP | 60/s | 41/s (−32%) | 65/s (+8%) |
+| ↳ `ThreadLevel` | 61/s | 40/s (−34%) | 66/s (~) |
+| Encode lossy+alpha q75, 3000x2000 | 20/s | 12/s (−40%) | 24/s (+18%) |
+| ↳ `ThreadLevel` | 23/s | 12/s (−46%) | 26/s (+13%) |
+| Encode lossless level 6, 1.2 MP | 18/s | 21/s (+19%) | 22/s (+23%) |
+| ↳ `ThreadLevel` | 18/s | 22/s (+22%) | 22/s (+26%) |
+| Encode lossless level 0, 1.2 MP | 177/s | 151/s (−15%) | 155/s (−12%) |
+| ↳ `ThreadLevel` | 173/s | 143/s (−18%) | 149/s (−14%) |
+
+### Peak memory
+
+Peak resident memory of a whole process (`getrusage` maxrss, one workload
+per process, median of 3 runs with the range when the runs differ by more
+than 10%; default `GOGC`, no `GOMEMLIMIT` unless stated; for the encodes
+also the wall time of the run). The 12 MP pictures are generated from
+`source.jpg`: tiled for the lossy encode, upscaled for the lossless one
+(tiling would make a lossless encode unrealistically cheap).
+
+| Workload | v1 (libwebp) | v2, pure Go | v2 (NEON) |
+|---|---|---|---|
+| One 12 MP lossy encode (4000x3000 `*image.YCbCr`, q75; the source takes 18 MB) | 164 MB, 0.62 s | 66 MB, 1.15 s | 66 MB, 0.42 s |
+| ↳ with `ThreadLevel` | 164 MB, 0.59 s | 69 MB, 0.29 s | 69 MB, 0.16 s |
+| One 12 MP lossless level 6 encode (upscaled photo) | 340 MB, 4.16 s | 261 MB, 3.13 s | 261 MB, 3.10 s |
+| Three 12 MP lossless level 6 encodes in a row | 434 MB, 12.59 s | 270 MB, 9.29 s | 270 MB, 9.21 s |
+| ↳ with `GOMEMLIMIT=450MiB` | 434 MB, 12.53 s | 418 MB, 9.38 s | 418 MB, 9.38 s |
+| One 12 MP lossless decode (output 48 MB) | 118 MB | 70 MB | 70 MB |
+| 15 goroutines x 4 decodes of the 6 MP lossless logo | 1147 MB | 906 MB (832-930) | 858 MB |
+| ↳ `DecodeInto`, one buffer per goroutine |  | 401 MB | 401 MB |
+| 15 goroutines x 4 decodes of the 6 MP lossy+alpha logo | 1017 MB (897-1114) | 767 MB (767-913) | 864 MB (863-1127) |
+| ↳ `DecodeInto`, one buffer per goroutine |  | 408 MB | 408 MB |
 
 The output image (24 MB for 3000x2000) dominates the decoder's memory
 (with `Decode`, how many outputs are still waiting for the garbage
@@ -555,9 +600,59 @@ the peak instead. Compared with `golang.org/x/image/webp` (decoder only),
 the first pure Go v2 already decoded lossy pictures 1.6-2.6x and lossless
 pictures 1.7-3.4x faster, with far fewer allocations.
 
+### Reproducing the measurements
+
+The benchmarks live in [`benchmarks/`](benchmarks), a separate Go module
+(so that the library itself depends neither on v1 nor on cgo): the
+workloads are defined once in [`benchmarks/suite`](benchmarks/suite/suite.go)
+and run through two thin adapters, `benchmarks/v1` (v1.0.5 + libwebp) and
+`benchmarks/v2` (this repository).
+
 ```bash
-make bench
+# v1 needs cgo and libwebp with its pkg-config file:
+brew install webp pkg-config                 # macOS
+# sudo apt install libwebp-dev pkg-config    # Debian/Ubuntu (check the libwebp version)
+go install golang.org/x/perf/cmd/benchstat@latest
+
+make bench-compare        # runs benchmarks/run.sh: every table above, about an hour
 ```
+
+The results go to `benchmarks/out/`:
+
+- `benchstat.txt`: the main table and the [Threads](#threads) table.
+  Columns `v1.txt`, `v2-purego.txt` and `v2.txt` are v1, v2 pure Go and
+  v2 (NEON); `sec/op` is the time, `cpu-sec/op` the CPU time, `B/op` and
+  `allocs/op` the allocations, `bytes` the size of the encoded file;
+  "vs base" is the difference from v1 with its p-value;
+- `benchstat-saturation.txt`: [Throughput under load](#throughput-under-load)
+  (sec/op there is the inverse of the throughput);
+- `rss.txt`: [Peak memory](#peak-memory);
+- `env.txt`: the machine, Go and libwebp versions and the load average;
+  `raw/`: the raw `go test -bench` outputs.
+
+Shorter runs and single benchmarks:
+
+```bash
+ROUNDS=3 RSS_ROUNDS=1 SAT=0 benchmarks/run.sh    # a quick look, about 10 minutes
+BUILDS="v2-purego v2" benchmarks/run.sh          # without libwebp (v2 only)
+
+cd benchmarks
+go test -run '^$' -bench 'Decode/lossy675x900' -benchmem -count 6 ./v1 ./v2
+go test -run '^$' -bench 'Encode/lossy-q75-m4' -benchmem -count 6 -tags purego ./v2
+```
+
+Expect other absolute numbers on other machines and a few percent of
+difference between runs on the same one: close other heavy programs
+during a run, and compare the columns of one run rather than numbers from
+different machines. The correctness statements above are checked by the
+tests: `go test -tags interop ./...` (libwebp tools in `PATH`) compares
+decoded pixels with libwebp's `dwebp`, decodes the files v2 encodes with
+`dwebp`, and compares their sizes and quality with `cwebp`'s; `go test
+./...` checks that the NEON and pure Go code paths produce the same
+output.
+
+For a quick check of v2 alone, `make bench` runs the `webp` package
+benchmarks.
 
 ## Tests
 
