@@ -8,7 +8,8 @@
 // The horizontal geometry is the same for every row, so Init computes it
 // once into a column table (see initCols) and the row kernels in
 // kernels.go only walk that table. On arm64 the hot kernels are NEON
-// assembly (rescaler_arm64.s), bit-exact with the Go ones.
+// assembly (rescaler_arm64.s), on amd64 SSE4.1 or AVX2 assembly picked at
+// run time (rescaler_amd64.s); both are bit-exact with the Go ones.
 //
 // Algorithm adapted from libwebp (BSD-3-Clause).
 package resample

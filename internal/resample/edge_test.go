@@ -7,10 +7,10 @@ import (
 	"testing"
 )
 
-// Boundary cases for the row kernels the build selects (assembly on
-// arm64), against the Go reference kernels: every small geometry, spans at
-// the kernels' limits with maximal sums, unaligned rows and dirty work
-// buffers.
+// Boundary cases for the row kernels the build selects (assembly on arm64,
+// and on amd64 at every SIMD level), against the Go reference kernels:
+// every small geometry, spans at the kernels' limits with maximal sums,
+// unaligned rows and dirty work buffers.
 
 // TestImportKernelsSmall runs every horizontal shrink and expansion of a
 // source row up to 64 pixels wide.

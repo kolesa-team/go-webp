@@ -8,9 +8,10 @@ import (
 	"testing"
 )
 
-// The row kernels the build selects (assembly on arm64) against the Go
-// reference kernels, on identical rescaler state. Without assembly both
-// sides are the Go kernels and the tests are trivially true.
+// The row kernels the build selects (assembly on arm64, and on amd64 at
+// every SIMD level, see forEachLevel) against the Go reference kernels, on
+// identical rescaler state. Without assembly both sides are the Go kernels
+// and the tests are trivially true.
 
 // importRow runs the selected or the reference import kernel on src.
 func importRow(rs *Rescaler, src []byte, acc []uint32, ref bool) {
