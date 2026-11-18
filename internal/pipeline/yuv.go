@@ -243,7 +243,8 @@ func (s *scaleSink) exportYUV() {
 // yuvToRGBARowGo converts full resolution Y, U and V rows to RGBA
 // (libwebp's VP8YuvToRgba) into out[:4*len(yr)]. ar holds the alpha
 // values, or is nil for opaque output. This is the portable reference;
-// yuvToRGBARow (yuv_arm64.go, yuv_generic.go) is the entry point.
+// yuvToRGBARow (yuv_arm64.go, yuv_amd64.go, yuv_generic.go) is the entry
+// point.
 func yuvToRGBARowGo(yr, ur, vr, ar, out []byte) {
 	w := len(yr)
 	ur, vr = ur[:w], vr[:w]
