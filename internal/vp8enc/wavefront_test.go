@@ -324,6 +324,50 @@ func TestWavefrontInterrupt(t *testing.T) {
 	}
 }
 
+// TestWavefrontInterruptLate fires Config.Interrupt on a helper polling
+// for the last row after the calling goroutine has run out of rows: the
+// row is not coded, so Encode must still return ErrInterrupted.
+func TestWavefrontInterruptLate(t *testing.T) {
+	forceWavefrontForTest(t)
+	defer workers.SetLimitForTest(workers.SetLimitForTest(4))
+	img := synthImage(64, 32, 1, 3) // 4x2 macroblocks: two workers
+	onHelper := 0
+	for range 5 {
+		cfg := DefaultConfig()
+		cfg.ThreadLevel = true
+		caller := goroutineID()
+		var fired atomic.Bool
+		cfg.Interrupt = func() bool {
+			if fired.Load() {
+				return true
+			}
+			if goroutineID() == caller {
+				return false
+			}
+			// Let the calling goroutine finish its row first.
+			time.Sleep(20 * time.Millisecond)
+			fired.Store(true)
+			return true
+		}
+		pic := FromNRGBA(img, false, false)
+		_, err := Encode(pic, &cfg)
+		pic.Release()
+		if !fired.Load() {
+			continue
+		}
+		onHelper++
+		if !errors.Is(err, ErrInterrupted) {
+			t.Fatalf("Interrupt fired on a helper: got %v, want ErrInterrupted", err)
+		}
+		if h := workers.InUse(); h != 0 {
+			t.Fatalf("%d helpers running after Encode returned", h)
+		}
+	}
+	if onHelper == 0 {
+		t.Skip("no helper polled Interrupt")
+	}
+}
+
 // TestWavefrontConcurrent runs many ThreadLevel encodes at once: helpers
 // compete for the budget, some passes get none, and every output must be
 // the sequential one.

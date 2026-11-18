@@ -241,7 +241,7 @@ func (e *encoder) codePassWavefront(nw int, isLastPass bool, maxCount int) (size
 		its[n], tasks[n] = sit, t
 		n++
 	}
-	joined := false
+	joined, interrupted := false, false
 	join := func() {
 		// Wait for every helper before recycling anything, then re-raise
 		// a helper panic, if any.
@@ -249,6 +249,9 @@ func (e *encoder) codePassWavefront(nw int, isLastPass bool, maxCount int) (size
 			<-t.Done()
 		}
 		joined = true
+		// Read only now: a helper may still poll Interrupt for the last
+		// rows after the calling goroutine ran out of rows.
+		interrupted = wf.interrupted.Load()
 		for k := range wf.nw {
 			e.mergeMaxEdge(wf.workers[k].it)
 			sizeP0 += wf.workers[k].sizeP0
@@ -277,7 +280,6 @@ func (e *encoder) codePassWavefront(nw int, isLastPass bool, maxCount int) (size
 		return 0, 0, false, nil
 	}
 	wf.run(w0)
-	interrupted := wf.interrupted.Load()
 	join()
 	if interrupted {
 		return 0, 0, true, ErrInterrupted
