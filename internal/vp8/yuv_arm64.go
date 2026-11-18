@@ -66,18 +66,6 @@ func upsamplePair(topY, botY, topU, topV, curU, curV, topDst, botDst, topA, botA
 	}
 }
 
-// edgePixel converts pixel x of a fancy-upsampled row whose chroma is
-// (3*near + far + 2) >> 2 (upsampleUV's first and last pixels).
-func edgePixel(dst []byte, x int, ys, as []byte, nu, nv, fu, fv byte) {
-	u := (3*uint32(nu) + uint32(fu) + 2) >> 2
-	v := (3*uint32(nv) + uint32(fv) + 2) >> 2
-	a := uint32(0xff000000)
-	if as != nil {
-		a = uint32(as[x]) << 24
-	}
-	binary.LittleEndian.PutUint32(dst[4*x:], yuvPix(yuvTab, ys[x], uint8(u), uint8(v))|a)
-}
-
 // sampleRow converts one luma row with point-sampled chroma; see
 // sampleRowGo, which it matches bit for bit.
 func sampleRow(ys, us, vs, as, dst []byte, w int) {

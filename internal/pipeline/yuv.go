@@ -4,9 +4,14 @@ package pipeline
 // src/dsp/yuv.h (VP8YuvToRgba, VP8Clip8).
 
 import (
+	"github.com/kolesa-team/go-webp/v2/internal/cpuinfo"
 	"github.com/kolesa-team/go-webp/v2/internal/resample"
 	"github.com/kolesa-team/go-webp/v2/internal/status"
 )
+
+// yuvLevel selects the x86 SIMD level of yuvToRGBARow (yuv_amd64.go);
+// tests lower it to cover every level. Other builds ignore it.
+var yuvLevel = cpuinfo.Max
 
 // YUVSink is implemented by the scaling sinks returned by NewSink. A lossy
 // (VP8) decoder can hand its YUV 4:2:0 (+ alpha) output to CommitYUV instead

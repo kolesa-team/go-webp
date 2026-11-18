@@ -3,11 +3,18 @@ package vp8
 import (
 	"encoding/binary"
 	"math/bits"
+
+	"github.com/kolesa-team/go-webp/v2/internal/cpuinfo"
 )
 
 // Algorithm adapted from libwebp (BSD-3-Clause): dsp/yuv.h (14-bit fixed
 // point YUV->RGB), dsp/upsampling.c (fancy upsampler) and dsp/yuv.c
 // (point-sampling row converter).
+
+// yuvLevel selects the x86 SIMD level of the row converters
+// (yuv_amd64.go); tests lower it to cover every level. Other builds ignore
+// it.
+var yuvLevel = cpuinfo.Max
 
 // clipY is libwebp's VP8Clip8 for a 14-bit fixed point value v:
 // clamp(v >> 6, 0, 255). Out-of-range values are rare, so the branch is
@@ -158,6 +165,19 @@ func convertRow(ys []byte, uv []uint32, as, dst []byte, w int) {
 		}
 		binary.LittleEndian.PutUint32(dst[4*x:], yuvPix(t, ys[x], uint8(c), uint8(c>>16))|a)
 	}
+}
+
+// edgePixel converts pixel x of a fancy-upsampled row whose chroma is
+// (3*near + far + 2) >> 2 (upsampleUV's first and last pixels). The SIMD
+// wrappers use it for the pixels their kernels leave out.
+func edgePixel(dst []byte, x int, ys, as []byte, nu, nv, fu, fv byte) {
+	u := (3*uint32(nu) + uint32(fu) + 2) >> 2
+	v := (3*uint32(nv) + uint32(fv) + 2) >> 2
+	a := uint32(0xff000000)
+	if as != nil {
+		a = uint32(as[x]) << 24
+	}
+	binary.LittleEndian.PutUint32(dst[4*x:], yuvPix(yuvTab, ys[x], uint8(u), uint8(v))|a)
 }
 
 // sampleRowGo converts one luma row using nearest (point-sampled) chroma.

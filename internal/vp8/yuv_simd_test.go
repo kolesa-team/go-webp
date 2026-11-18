@@ -8,7 +8,8 @@ import (
 )
 
 // Differential tests of the row converters used by the decoder
-// (upsamplePair, sampleRow: NEON on arm64) against the portable reference
+// (upsamplePair, sampleRow: NEON on arm64, SSE4.1/AVX2 on amd64 at every
+// level the machine supports) against the portable reference
 // (upsamplePairGo, sampleRowGo). On other platforms both sides run the Go
 // code, which still checks the reference against yuvPix.
 
@@ -106,14 +107,14 @@ func (c pairCase) check(t testing.TB) {
 	}
 	upsamplePair(c.topY, c.botY, c.topU, c.topV, c.curU, c.curV, gotT, dstB, c.topA, c.botA, make([]uint32, w), make([]uint32, w), w)
 	if !okT() || !okB() {
-		t.Fatalf("w=%d: write outside the destination rows", w)
+		t.Fatalf("%v w=%d: write outside the destination rows", yuvLevel, w)
 	}
 	if i := firstByteDiff(gotT, wantT); i >= 0 {
-		t.Fatalf("w=%d alpha=%v: top row pixel %d = %x, want %x", w, c.topA != nil, i/4, gotT[i&^3:i&^3+4], wantT[i&^3:i&^3+4])
+		t.Fatalf("%v w=%d alpha=%v: top row pixel %d = %x, want %x", yuvLevel, w, c.topA != nil, i/4, gotT[i&^3:i&^3+4], wantT[i&^3:i&^3+4])
 	}
 	if c.botY != nil {
 		if i := firstByteDiff(gotB, wantB); i >= 0 {
-			t.Fatalf("w=%d alpha=%v: bottom row pixel %d = %x, want %x", w, c.botA != nil, i/4, gotB[i&^3:i&^3+4], wantB[i&^3:i&^3+4])
+			t.Fatalf("%v w=%d alpha=%v: bottom row pixel %d = %x, want %x", yuvLevel, w, c.botA != nil, i/4, gotB[i&^3:i&^3+4], wantB[i&^3:i&^3+4])
 		}
 	}
 }
@@ -139,16 +140,18 @@ func testWidths() []int {
 }
 
 func TestUpsamplePairMatchesGo(t *testing.T) {
-	r := rand.New(rand.NewPCG(1, 2))
-	trials := 24
-	if testing.Short() {
-		trials = 8
-	}
-	for _, w := range testWidths() {
-		for i := 0; i < trials; i++ {
-			newPairCase(r, w, i&1 != 0, i%3 == 0, (i/2)%4).check(t)
+	withLevels(t, &yuvLevel, func(t *testing.T) {
+		r := rand.New(rand.NewPCG(1, 2))
+		trials := 24
+		if testing.Short() {
+			trials = 8
 		}
-	}
+		for _, w := range testWidths() {
+			for i := 0; i < trials; i++ {
+				newPairCase(r, w, i&1 != 0, i%3 == 0, (i/2)%4).check(t)
+			}
+		}
+	})
 }
 
 type sampleCase struct {
@@ -176,28 +179,35 @@ func (c sampleCase) check(t testing.TB) {
 	got, ok := guarded(4 * c.w)
 	sampleRow(c.ys, c.us, c.vs, c.as, got, c.w)
 	if !ok() {
-		t.Fatalf("w=%d: write outside the destination row", c.w)
+		t.Fatalf("%v w=%d: write outside the destination row", yuvLevel, c.w)
 	}
 	if i := firstByteDiff(got, want); i >= 0 {
-		t.Fatalf("w=%d alpha=%v: pixel %d = %x, want %x", c.w, c.as != nil, i/4, got[i&^3:i&^3+4], want[i&^3:i&^3+4])
+		t.Fatalf("%v w=%d alpha=%v: pixel %d = %x, want %x", yuvLevel, c.w, c.as != nil, i/4, got[i&^3:i&^3+4], want[i&^3:i&^3+4])
 	}
 }
 
 func TestSampleRowMatchesGo(t *testing.T) {
-	r := rand.New(rand.NewPCG(3, 4))
-	for _, w := range testWidths() {
-		for i := 0; i < 16; i++ {
-			newSampleCase(r, w, i&1 != 0, (i/2)%4).check(t)
+	withLevels(t, &yuvLevel, func(t *testing.T) {
+		r := rand.New(rand.NewPCG(3, 4))
+		for _, w := range testWidths() {
+			for i := 0; i < 16; i++ {
+				newSampleCase(r, w, i&1 != 0, (i/2)%4).check(t)
+			}
 		}
-	}
+	})
 }
 
 // TestYUVToRGBExhaustive converts all 2^24 (y, u, v) triples with the
 // point-sampling converter and checks them against yuvPix (libwebp's
 // VP8YuvToRgb). Row u holds, for every v, all 256 luma values; the second
 // pass shifts the rows by 8 pixels so that every triple also lands in the
-// other half of a 16-pixel NEON block.
+// other half of a 16-pixel NEON block (and in both 16-pixel halves of a
+// 32-pixel AVX2 block).
 func TestYUVToRGBExhaustive(t *testing.T) {
+	withLevels(t, &yuvLevel, testYUVToRGBExhaustive)
+}
+
+func testYUVToRGBExhaustive(t *testing.T) {
 	const w = 256 * 256
 	ys := make([]byte, w+8)
 	us := make([]byte, (w+8)/2)
@@ -244,6 +254,10 @@ func offsetRow(r *rand.Rand, n int, fill bool) []byte {
 // destinations longer than the row (as the decoder passes them; the bytes
 // past the row must stay untouched) and extreme values.
 func TestConvertersUnaligned(t *testing.T) {
+	withLevels(t, &yuvLevel, testConvertersUnaligned)
+}
+
+func testConvertersUnaligned(t *testing.T) {
 	r := rand.New(rand.NewPCG(31, 32))
 	trials := 32
 	if testing.Short() {
@@ -300,6 +314,10 @@ func TestUpsampleConvertExhaustive(t *testing.T) {
 	if testing.Short() {
 		t.Skip("slow")
 	}
+	withLevels(t, &yuvLevel, testUpsampleConvertExhaustive)
+}
+
+func testUpsampleConvertExhaustive(t *testing.T) {
 	const w = 16*256 + 1 // odd, so only pixel 0 is converted outside the kernel
 	uvW := (w + 1) >> 1
 	ys, as := make([]byte, w), make([]byte, w)
@@ -334,8 +352,12 @@ func TestUpsampleConvertExhaustive(t *testing.T) {
 // TestYUVGuardPages runs the converters on rows that end right before (or
 // start right after) an inaccessible page: an out-of-bounds access faults.
 func TestYUVGuardPages(t *testing.T) {
+	withLevels(t, &yuvLevel, testYUVGuardPages)
+}
+
+func testYUVGuardPages(t *testing.T) {
 	r := rand.New(rand.NewPCG(5, 6))
-	for _, w := range []int{16, 17, 18, 31, 32, 33, 34, 47, 48, 100, 1023, 1024} {
+	for _, w := range []int{16, 17, 18, 31, 32, 33, 34, 35, 36, 47, 48, 63, 64, 65, 66, 100, 1023, 1024} {
 		for _, atEnd := range []bool{true, false} {
 			uvW := (w + 1) >> 1
 			g := func(src []byte) []byte {
@@ -397,7 +419,7 @@ func FuzzUpsamplePair(f *testing.F) {
 				c.botA = mk(w)
 			}
 		}
-		c.check(t)
+		forLevels(&yuvLevel, func(string) { c.check(t) })
 	})
 }
 
@@ -425,12 +447,12 @@ func FuzzSampleRow(f *testing.F) {
 		if flags&2 != 0 {
 			c.as = mk(w)
 		}
-		c.check(t)
+		forLevels(&yuvLevel, func(string) { c.check(t) })
 	})
 }
 
-// Kernel benchmarks: the dispatched converters (NEON on arm64) and the Go
-// reference on the same 1024-pixel rows.
+// Kernel benchmarks: the dispatched converters (NEON on arm64, every level
+// on amd64) and the Go reference on the same 1024-pixel rows.
 
 func benchPairCase() pairCase {
 	return newPairCase(rand.New(rand.NewPCG(7, 8)), 1024, false, false, 0)
@@ -440,10 +462,12 @@ func BenchmarkUpsamplePairKernel(b *testing.B) {
 	c := benchPairCase()
 	dt, db := make([]byte, 4*c.w), make([]byte, 4*c.w)
 	uvT, uvB := make([]uint32, c.w), make([]uint32, c.w)
-	b.SetBytes(2 * int64(c.w))
-	for b.Loop() {
-		upsamplePair(c.topY, c.botY, c.topU, c.topV, c.curU, c.curV, dt, db, nil, nil, uvT, uvB, c.w)
-	}
+	benchLevels(b, &yuvLevel, func(b *testing.B) {
+		b.SetBytes(2 * int64(c.w))
+		for b.Loop() {
+			upsamplePair(c.topY, c.botY, c.topU, c.topV, c.curU, c.curV, dt, db, nil, nil, uvT, uvB, c.w)
+		}
+	})
 }
 
 func BenchmarkUpsamplePairGo(b *testing.B) {
@@ -459,10 +483,12 @@ func BenchmarkUpsamplePairGo(b *testing.B) {
 func BenchmarkSampleRowKernel(b *testing.B) {
 	c := newSampleCase(rand.New(rand.NewPCG(7, 8)), 1024, true, 0)
 	dst := make([]byte, 4*c.w)
-	b.SetBytes(int64(c.w))
-	for b.Loop() {
-		sampleRow(c.ys, c.us, c.vs, c.as, dst, c.w)
-	}
+	benchLevels(b, &yuvLevel, func(b *testing.B) {
+		b.SetBytes(int64(c.w))
+		for b.Loop() {
+			sampleRow(c.ys, c.us, c.vs, c.as, dst, c.w)
+		}
+	})
 }
 
 func BenchmarkSampleRowGo(b *testing.B) {
