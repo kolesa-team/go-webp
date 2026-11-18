@@ -33,6 +33,7 @@ const (
 	kindShrink1
 	kindShrink1P
 	kindShrink1S
+	kindExpand1
 	kindExpand4
 )
 
@@ -53,6 +54,9 @@ const (
 	// bytes, per 8 destination pixels (see buildShrink1P/SRecords).
 	shrink1PRecordSize = 128
 	shrink1SRecordSize = 192
+	// expand1RecordSize is the record size, in bytes, of the 1-channel
+	// expansion per 8 destination pixels (see buildExpand1Records).
+	expand1RecordSize = 96
 )
 
 // archState records which assembly kernel a rescaler uses and how far:
@@ -63,7 +67,7 @@ type archState struct {
 	level   cpuinfo.Level
 	asmOuts int
 	asmSrc  int
-	records []byte // kindShrink1P/S: one record per 8 destination pixels
+	records []byte // kindShrink1P/S, kindExpand1: one record per 8 destination pixels
 }
 
 // archTableSize is the room for the record tables, in uint32 cells.
@@ -87,8 +91,11 @@ func (r *Rescaler) initArch(tab []uint32) {
 	if r.xExpand {
 		// The left pixels never decrease; the kernel loads each one with
 		// its right neighbour.
-		if r.numChannels == 4 && int(cols[2*r.dstWidth-2])+2 <= r.srcWidth {
+		switch {
+		case r.numChannels == 4 && int(cols[2*r.dstWidth-2])+2 <= r.srcWidth:
 			a.kind, a.asmOuts, a.asmSrc = kindExpand4, r.dstWidth, r.srcWidth
+		case r.numChannels == 1 && r.srcWidth >= 16 && r.dstWidth >= 8:
+			r.initExpand1Records(tab)
 		}
 		if a.kind == kindGo {
 			*a = archState{}
@@ -240,6 +247,48 @@ func buildShrink1SRecords(rec []byte, cols []uint32, srcWidth int) {
 			binary.LittleEndian.PutUint32(r[160+4*j:], uint32(w))
 			start += n
 		}
+	}
+}
+
+// initExpand1Records builds the records of the 1-channel expansion kernels
+// for every whole block of 8 destination pixels.
+func (r *Rescaler) initExpand1Records(tab []uint32) {
+	a := &r.arch
+	blocks := r.dstWidth / 8
+	n := blocks * expand1RecordSize
+	if 4*len(tab) < n {
+		panic("resample: short record table")
+	}
+	rec := unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(tab))), n)
+	buildExpand1Records(rec, r.cols[:16*blocks], r.srcWidth)
+	a.kind = kindExpand1
+	a.records = rec
+	a.asmOuts, a.asmSrc = 8*blocks, r.srcWidth
+}
+
+// buildExpand1Records fills one 96-byte record per 8 destination pixels of
+// cols (a 1-channel expansion of a source row of srcWidth >= 16 bytes):
+//
+//	[ 0:32) PSHUFB indices: pixel j's left source pixel, as word j
+//	[32:64) the 8 weights (w), as words
+//	[64:68) the offset of the 16-byte source window the indices refer to
+//	[68:96) zero
+//
+// The left pixels of 8 destination pixels span at most 8 source pixels
+// (they advance by at most one per destination pixel when expanding), so
+// they and their right neighbours fit one 16-byte window; the right
+// neighbours' indices are the left ones plus one.
+func buildExpand1Records(rec []byte, cols []uint32, srcWidth int) {
+	for b := 0; b < len(cols)/16; b++ {
+		r := rec[b*expand1RecordSize : (b+1)*expand1RecordSize]
+		clear(r)
+		w := min(int(cols[16*b]), srcWidth-16)
+		for j := 0; j < 8; j++ {
+			l := int(cols[2*(8*b+j)])
+			r[4*j], r[4*j+1], r[4*j+2], r[4*j+3] = byte(l-w), 0x80, 0x80, 0x80
+			binary.LittleEndian.PutUint32(r[32+4*j:], cols[2*(8*b+j)+1])
+		}
+		binary.LittleEndian.PutUint32(r[64:], uint32(w))
 	}
 }
 
@@ -411,16 +460,49 @@ func shrink1SAVX2(frow, acc *uint32, src *byte, rec *byte, blocks int, xSub, fx 
 //go:noescape
 func expandRow4SSE41(frow, acc *uint32, src *byte, cols *uint32, n int, xAdd uint32)
 
+// expand1SSE41 and expand1AVX2 import destination pixels [0, 8*blocks) of
+// a 1-channel horizontal expansion from the records at rec (see
+// buildExpand1Records). They read the 16-byte windows of src the records
+// name.
+//
+//go:noescape
+func expand1SSE41(frow, acc *uint32, src *byte, rec *byte, blocks int, xAdd uint32)
+
+//go:noescape
+func expand1AVX2(frow, acc *uint32, src *byte, rec *byte, blocks int, xAdd uint32)
+
 func (r *Rescaler) expandRow(src []byte, acc []uint32) {
-	if r.arch.kind != kindExpand4 {
+	a := &r.arch
+	switch a.kind {
+	case kindExpand4:
+		// initArch checked that the left pixels end before the last one,
+		// so every 8-byte load is inside src.
+		src, frow, _, ap := r.asmRows(src, acc)
+		cols := r.cols[:2*r.dstWidth]
+		expandRow4SSE41(&frow[0], ap, &src[0], &cols[0], r.dstWidth, uint32(r.xAdd))
+	case kindExpand1:
+		// The records only hold windows inside a source row of
+		// r.srcWidth >= 16 bytes (buildExpand1Records).
+		n := a.asmOuts
+		src, frow, acc, ap := r.asmRows(src, acc)
+		if n%8 != 0 || len(a.records) != n/8*expand1RecordSize || len(src) < 16 {
+			panic("resample: bad record table")
+		}
+		if a.level >= cpuinfo.AVX2 {
+			expand1AVX2(&frow[0], ap, &src[0], &a.records[0], n/8, uint32(r.xAdd))
+		} else {
+			expand1SSE41(&frow[0], ap, &src[0], &a.records[0], n/8, uint32(r.xAdd))
+		}
+		if n == r.dstWidth {
+			return
+		}
+		if acc != nil {
+			acc = acc[n:]
+		}
+		expandRow1Go(frow[n:], acc, src, r.cols[2*n:2*r.dstWidth], uint32(r.xAdd))
+	default:
 		r.expandRowRef(src, acc)
-		return
 	}
-	// initArch checked that the left pixels end before the last one, so
-	// every 8-byte load is inside src.
-	src, frow, acc, ap := r.asmRows(src, acc)
-	cols := r.cols[:2*r.dstWidth]
-	expandRow4SSE41(&frow[0], ap, &src[0], &cols[0], r.dstWidth, uint32(r.xAdd))
 }
 
 // The export kernels process n values, n > 0 and a multiple of 8; the

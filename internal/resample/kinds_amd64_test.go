@@ -71,7 +71,10 @@ func TestKernelSelection(t *testing.T) {
 			{3000, 320, 2, kindGo},
 			{300, 1000, 4, kindExpand4},
 			{1, 1000, 4, kindGo}, // one pixel wide
-			{300, 1000, 1, kindGo},
+			{300, 1000, 1, kindExpand1},
+			{250, 320, 1, kindExpand1},
+			{16, 17, 1, kindExpand1},
+			{15, 100, 1, kindGo}, // narrower than one 16-byte window
 		} {
 			rs, err := New(c.sw, 10, c.dw, 5, c.ch)
 			if err != nil {

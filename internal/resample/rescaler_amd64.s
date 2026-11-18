@@ -873,6 +873,121 @@ w16done:
 	VZEROUPPER
 	RET
 
+// The 1-channel expansion kernels: WebPRescalerImportRowExpand_C for 1
+// channel and a source at least 16 pixels wide, 8 destination pixels per
+// record (see buildExpand1Records):
+//
+//	frow = right*xAdd + (left - right)*w; acc += frow   (32-bit, wrapping)
+//
+// PSHUFB gathers the left pixels of the record's 16-byte source window
+// into 32-bit lanes, and the right ones with the indices plus one (inc1).
+//
+// DI frow, DX acc (nil: no accumulation), SI src, BX records, CX records
+// left, AX window offset. X0 window, X1 indices, X2 left then frow, X3
+// right, X4 weights, X5 acc, X11 inc1, X12 xAdd (Y for AVX2).
+
+// inc1<> holds 1 in the low byte of every 32-bit lane.
+DATA inc1<>+0x00(SB)/8, $0x0000000100000001
+DATA inc1<>+0x08(SB)/8, $0x0000000100000001
+DATA inc1<>+0x10(SB)/8, $0x0000000100000001
+DATA inc1<>+0x18(SB)/8, $0x0000000100000001
+GLOBL inc1<>(SB), RODATA|NOPTR, $32
+
+// EX1_GROUP_SSE does the 4 pixels of a record whose indices are at i(BX)
+// and weights at w(BX); skip is a fresh label.
+#define EX1_GROUP_SSE(i, w, skip) \
+	MOVOU  i(BX), X1   \
+	MOVO   X0, X2      \
+	PSHUFB X1, X2      \
+	PADDB  X11, X1     \
+	MOVO   X0, X3      \
+	PSHUFB X1, X3      \
+	PSUBL  X3, X2      \
+	MOVOU  w(BX), X4   \
+	PMULLD X4, X2      \
+	PMULLD X12, X3     \
+	PADDL  X3, X2      \
+	MOVOU  X2, (DI)    \
+	ADDQ   $16, DI     \
+	TESTQ  DX, DX      \
+	JZ     skip        \
+	MOVOU  (DX), X5    \
+	PADDL  X2, X5      \
+	MOVOU  X5, (DX)    \
+	ADDQ   $16, DX     \
+skip:
+
+// func expand1SSE41(frow, acc *uint32, src *byte, rec *byte, blocks int, xAdd uint32)
+TEXT ·expand1SSE41(SB), NOSPLIT, $0-44
+	MOVQ   frow+0(FP), DI
+	MOVQ   acc+8(FP), DX
+	MOVQ   src+16(FP), SI
+	MOVQ   rec+24(FP), BX
+	MOVQ   blocks+32(FP), CX
+	MOVL   xAdd+40(FP), AX
+	MOVQ   AX, X12
+	PSHUFD $0, X12, X12
+	MOVOU  inc1<>(SB), X11
+	TESTQ  CX, CX
+	JZ     x1done
+
+x1loop:
+	MOVL  64(BX), AX
+	MOVOU (SI)(AX*1), X0
+	EX1_GROUP_SSE(0, 32, x1skip0)
+	EX1_GROUP_SSE(16, 48, x1skip1)
+	ADDQ  $96, BX
+	DECQ  CX
+	JNZ   x1loop
+
+x1done:
+	RET
+
+// func expand1AVX2(frow, acc *uint32, src *byte, rec *byte, blocks int, xAdd uint32)
+//
+// The window is broadcast to both 128-bit lanes, so that VPSHUFB serves
+// pixels 0-3 in lane 0 and 4-7 in lane 1.
+TEXT ·expand1AVX2(SB), NOSPLIT, $0-44
+	MOVQ         frow+0(FP), DI
+	MOVQ         acc+8(FP), DX
+	MOVQ         src+16(FP), SI
+	MOVQ         rec+24(FP), BX
+	MOVQ         blocks+32(FP), CX
+	MOVL         xAdd+40(FP), AX
+	VMOVQ        AX, X12
+	VPBROADCASTD X12, Y12
+	VMOVDQU      inc1<>(SB), Y11
+	TESTQ        CX, CX
+	JZ           x2done
+
+x2loop:
+	MOVL           64(BX), AX
+	VBROADCASTI128 (SI)(AX*1), Y0
+	VMOVDQU        (BX), Y1
+	VPSHUFB        Y1, Y0, Y2
+	VPADDB         Y11, Y1, Y1
+	VPSHUFB        Y1, Y0, Y3
+	VPSUBD         Y3, Y2, Y2
+	VPMULLD        32(BX), Y2, Y2
+	VPMULLD        Y12, Y3, Y3
+	VPADDD         Y3, Y2, Y2
+	VMOVDQU        Y2, (DI)
+	ADDQ           $32, DI
+	TESTQ          DX, DX
+	JZ             x2next
+	VPADDD         (DX), Y2, Y2
+	VMOVDQU        Y2, (DX)
+	ADDQ           $32, DX
+
+x2next:
+	ADDQ $96, BX
+	DECQ CX
+	JNZ  x2loop
+
+x2done:
+	VZEROUPPER
+	RET
+
 // func expandRow4SSE41(frow, acc *uint32, src *byte, cols *uint32, n int, xAdd uint32)
 //
 // WebPRescalerImportRowExpand_C for 4 channels and a source at least two
