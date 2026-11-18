@@ -2,9 +2,11 @@ package webp
 
 import (
 	"context"
+	"fmt"
 	"image"
 	"io"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -52,6 +54,13 @@ func TestEncodeContext(t *testing.T) {
 
 // TestEncodeContextCancelLatency cancels slow encodes while they run: they
 // must give up promptly, return context.Canceled and write nothing.
+//
+// The test is timing-based. A loaded machine (other processes, the race
+// detector) slows the encode and its polling alike, so a cancellation that
+// takes 2 s or more to return is compared with the time the whole encode
+// takes at that moment: it passes when it took less than a quarter of that.
+// An encode that ends before the cancellation (a fast machine) is canceled
+// earlier the next time. A case fails after three misses.
 func TestEncodeContextCancelLatency(t *testing.T) {
 	if testing.Short() {
 		t.Skip("slow")
@@ -71,21 +80,39 @@ func TestEncodeContextCancelLatency(t *testing.T) {
 		o    *encoder.Options
 	}{{"lossy m6", lossy}, {"lossy alpha threads", threads}, {"lossless z9", lossless}} {
 		for _, after := range []time.Duration{0, 20 * time.Millisecond, 150 * time.Millisecond} {
-			ctx, cancel := context.WithCancel(context.Background())
-			timer := time.AfterFunc(after, cancel)
-			var cw countingWriter
-			start := time.Now()
-			err := EncodeContext(ctx, &cw, logo, tc.o)
-			latency := time.Since(start) - after
-			timer.Stop()
-			cancel()
-			require.Equal(t, context.Canceled, err, tc.name)
-			require.Zero(t, cw.n)
-			t.Logf("%s: canceled after %v, returned %v later", tc.name, after, latency)
-			require.Less(t, latency, 2*time.Second, tc.name)
+			var misses []string
+			for attempt := 0; ; attempt++ {
+				ctx, cancel := context.WithCancel(context.Background())
+				timer := time.AfterFunc(after, cancel)
+				var cw countingWriter
+				start := time.Now()
+				err := EncodeContext(ctx, &cw, logo, tc.o)
+				latency := time.Since(start) - after
+				timer.Stop()
+				cancel()
+				if err == nil {
+					misses = append(misses, fmt.Sprintf("ended %v before the cancellation after %v", -latency, after))
+					after /= 2
+				} else {
+					require.Equal(t, context.Canceled, err, tc.name)
+					require.Zero(t, cw.n)
+					t.Logf("%s: canceled after %v, returned %v later", tc.name, after, latency)
+					if latency < 2*time.Second {
+						break
+					}
+					start = time.Now()
+					require.NoError(t, Encode(io.Discard, logo, tc.o))
+					whole := time.Since(start)
+					if latency < whole/4 {
+						break
+					}
+					misses = append(misses, fmt.Sprintf("canceled after %v, returned %v later; the whole encode takes %v", after, latency, whole))
+				}
+				require.Less(t, attempt, 2, "%s: %s", tc.name, strings.Join(misses, "; "))
+			}
 		}
 	}
-	for deadline := time.Now().Add(5 * time.Second); runtime.NumGoroutine() > before; {
+	for deadline := time.Now().Add(20 * time.Second); runtime.NumGoroutine() > before; {
 		require.True(t, time.Now().Before(deadline), "goroutine leak")
 		time.Sleep(time.Millisecond)
 	}

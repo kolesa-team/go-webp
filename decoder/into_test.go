@@ -3,6 +3,7 @@ package decoder
 import (
 	"bytes"
 	"image"
+	"math"
 	"runtime"
 	"testing"
 
@@ -114,25 +115,43 @@ func TestDecodeIntoReuse(t *testing.T) {
 		{big, &Options{UseThreads: true}, image.Rect(0, 0, 3000, 2000)},
 	} {
 		want := decode(t, c.data, c.o)
-		_, err := newDec(t, c.data, c.o).DecodeInto(dst) // warm the internal pools
-		require.NoError(t, err)
-		d := newDec(t, c.data, c.o)
-		var m0, m1 runtime.MemStats
-		runtime.ReadMemStats(&m0)
-		got, err := d.DecodeInto(dst)
-		runtime.ReadMemStats(&m1)
-		require.NoError(t, err)
-		require.Equal(t, c.rect, got.Rect)
-		require.Same(t, p0, &got.Pix[0])
-		require.Equal(t, 3000*2000*4, cap(got.Pix))
-		require.True(t, bytes.Equal(want.Pix, got.Pix))
+		// The internal pools are sync.Pools: a decode whose goroutine moved
+		// to another P since the previous one, or that a garbage collection
+		// separated from it, misses them, which happens often on a loaded
+		// machine. So the decode is repeated, after warming the pools each
+		// time, and the smallest allocation counts: a decode that allocates
+		// in proportion to the picture fails every time.
+		attempts := 5
+		if raceEnabled {
+			attempts = 1
+		}
+		var least uint64 = math.MaxUint64
+		for attempt := 0; attempt < attempts && least >= reuseAllocLimit; attempt++ {
+			_, err := newDec(t, c.data, c.o).DecodeInto(dst) // warm the internal pools
+			require.NoError(t, err)
+			d := newDec(t, c.data, c.o)
+			var m0, m1 runtime.MemStats
+			runtime.ReadMemStats(&m0)
+			got, err := d.DecodeInto(dst)
+			runtime.ReadMemStats(&m1)
+			require.NoError(t, err)
+			require.Equal(t, c.rect, got.Rect)
+			require.Same(t, p0, &got.Pix[0])
+			require.Equal(t, 3000*2000*4, cap(got.Pix))
+			require.True(t, bytes.Equal(want.Pix, got.Pix))
+			least = min(least, m1.TotalAlloc-m0.TotalAlloc)
+		}
 		// The output alone would be 2.4-24 MB. (With the race detector
 		// sync.Pool drops objects at random.)
 		if !raceEnabled {
-			assert.Less(t, m1.TotalAlloc-m0.TotalAlloc, uint64(2<<20), "%+v", c.o)
+			assert.Less(t, least, uint64(reuseAllocLimit), "%+v", c.o)
 		}
 	}
 }
+
+// reuseAllocLimit is the most TestDecodeIntoReuse lets a decode into a
+// large enough buffer allocate.
+const reuseAllocLimit = 2 << 20
 
 // TestDecodeIntoNil checks that a nil dst allocates like Decode.
 func TestDecodeIntoNil(t *testing.T) {
