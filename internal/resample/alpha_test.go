@@ -7,9 +7,9 @@ import (
 	"testing"
 )
 
-// TestPremultiplyExhaustive runs the selected premultiply kernel on every
-// (channel value, alpha) pair, in every channel position, and compares it
-// with the Go one.
+// TestPremultiplyExhaustive runs the selected premultiply and
+// unpremultiply kernels on every (channel value, alpha) pair, in every
+// channel position, and compares them with the Go ones.
 func TestPremultiplyExhaustive(t *testing.T) {
 	forEachLevel(t, func(t *testing.T) {
 		row := make([]byte, 0, 4*65536)
@@ -18,15 +18,23 @@ func TestPremultiplyExhaustive(t *testing.T) {
 				row = append(row, byte(x), byte(255-x), byte(x^0x5a), byte(a))
 			}
 		}
-		got, want := slices.Clone(row), slices.Clone(row)
-		PremultiplyRGBA(got)
-		multRGBA(want, &premulScale)
-		if !bytes.Equal(got, want) {
-			i := 0
-			for got[i] == want[i] {
-				i++
+		for _, inverse := range []bool{false, true} {
+			got, want := slices.Clone(row), slices.Clone(row)
+			if inverse {
+				UnpremultiplyRGBA(got)
+				multRGBA(want, &unpremulScale)
+			} else {
+				PremultiplyRGBA(got)
+				multRGBA(want, &premulScale)
 			}
-			t.Fatalf("pixel %v: got %v, want %v", row[i&^3:i&^3+4], got[i&^3:i&^3+4], want[i&^3:i&^3+4])
+			if !bytes.Equal(got, want) {
+				i := 0
+				for got[i] == want[i] {
+					i++
+				}
+				t.Fatalf("inverse %v, pixel %v: got %v, want %v", inverse,
+					row[i&^3:i&^3+4], got[i&^3:i&^3+4], want[i&^3:i&^3+4])
+			}
 		}
 	})
 }
@@ -67,15 +75,23 @@ func FuzzMultRows(f *testing.F) {
 func BenchmarkPremultiplyRandom(b *testing.B) {
 	defer restoreLevel()
 	levels, setLevel := benchLevels()
-	row := benchImage(4096, 1)
+	random := benchImage(4096, 1)
+	opaque := benchImage(4096, 1)
+	for i := 3; i < len(opaque); i += 4 {
+		opaque[i] = 255
+	}
 	for li := 0; li <= len(levels); li++ {
 		name, ref := "go", li == len(levels)
 		if !ref {
 			name = levels[li]
 			setLevel(li)
 		}
-		for _, inverse := range []bool{false, true} {
+		for k, inverse := range []bool{false, true, true} {
 			op := map[bool]string{false: "premultiply", true: "unpremultiply"}[inverse]
+			row := random
+			if k == 2 {
+				op, row = "unpremultiply-opaque", opaque
+			}
 			b.Run(op+"/"+name, func(b *testing.B) {
 				b.SetBytes(int64(len(row)))
 				for i := 0; i < b.N; i++ {

@@ -1066,3 +1066,79 @@ pm2tail:
 pm2done:
 	VZEROUPPER
 	RET
+
+// func unpremultiplySSE41(row *byte, n int, table *[256]uint32)
+//
+// WebPMultARGBRow(..., inverse=1) on n bytes (n > 0, a multiple of 16),
+// four pixels per iteration: every color byte x of a pixel with alpha a
+// becomes ((x*s + 2^23) mod 2^32) >> 24 with s = table[a] = (255<<24)/a
+// (libwebp's Mult with GetScale, 32-bit wrapping arithmetic), and a is
+// kept. a = 255 (s = 2^24) and a = 0 (s = 0) need no special case. The
+// scales are looked up with scalar loads (gathers are slow on many CPUs).
+//
+// DI row, CX bytes left, R8 table, AX/BX/DX/R9 alphas then scales.
+// X0 pixels, X1 scales, X2-X5 one pixel's channels each, X6 scratch,
+// X13 2^23, X14 pmOne (the alpha bytes).
+TEXT ·unpremultiplySSE41(SB), NOSPLIT, $0-24
+	MOVQ   row+0(FP), DI
+	MOVQ   n+8(FP), CX
+	MOVQ   table+16(FP), R8
+	MOVOU  pmOne<>(SB), X14
+	MOVL   $0x800000, AX
+	MOVQ   AX, X13
+	PSHUFD $0, X13, X13
+
+um1loop:
+	// Four opaque pixels stay as they are: skip them when no alpha bit
+	// is clear (PANDN X14, X6 is X6 = ^X6 & X14).
+	MOVOU    (DI), X0
+	MOVO     X0, X6
+	PANDN    X14, X6
+	PTEST    X6, X6
+	JZ       um1next
+	MOVBLZX  3(DI), AX
+	MOVBLZX  7(DI), BX
+	MOVBLZX  11(DI), DX
+	MOVBLZX  15(DI), R9
+	MOVL     (R8)(AX*4), AX
+	MOVL     (R8)(BX*4), BX
+	MOVL     (R8)(DX*4), DX
+	MOVL     (R8)(R9*4), R9
+	MOVQ     AX, X1
+	PINSRD   $1, BX, X1
+	PINSRD   $2, DX, X1
+	PINSRD   $3, R9, X1
+	PMOVZXBD 0(DI), X2
+	PMOVZXBD 4(DI), X3
+	PMOVZXBD 8(DI), X4
+	PMOVZXBD 12(DI), X5
+	PSHUFD   $0x00, X1, X6
+	PMULLD   X6, X2
+	PSHUFD   $0x55, X1, X6
+	PMULLD   X6, X3
+	PSHUFD   $0xaa, X1, X6
+	PMULLD   X6, X4
+	PSHUFD   $0xff, X1, X6
+	PMULLD   X6, X5
+	PADDL    X13, X2
+	PADDL    X13, X3
+	PADDL    X13, X4
+	PADDL    X13, X5
+	PSRLL    $24, X2
+	PSRLL    $24, X3
+	PSRLL    $24, X4
+	PSRLL    $24, X5
+	PACKUSDW X3, X2
+	PACKUSDW X5, X4
+	PACKUSWB X4, X2
+	PAND     X14, X0
+	MOVO     X14, X6
+	PANDN    X2, X6
+	POR      X0, X6
+	MOVOU    X6, (DI)
+
+um1next:
+	ADDQ     $16, DI
+	SUBQ     $16, CX
+	JNZ      um1loop
+	RET

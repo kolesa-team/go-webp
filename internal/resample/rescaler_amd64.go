@@ -483,4 +483,16 @@ func premultiplyRow(row []byte) {
 	multRGBA(row, &premulScale)
 }
 
-func unpremultiplyRow(row []byte) { multRGBA(row, &unpremulScale) }
+// unpremultiplySSE41 is UnpremultiplyRGBA on n bytes, n > 0 and a
+// multiple of 16, with the scales of table (unpremulScale).
+//
+//go:noescape
+func unpremultiplySSE41(row *byte, n int, table *[256]uint32)
+
+func unpremultiplyRow(row []byte) {
+	if n := len(row) &^ 15; n > 0 && x86Level >= cpuinfo.SSE41 {
+		unpremultiplySSE41(&row[0], n, &unpremulScale)
+		row = row[n:]
+	}
+	multRGBA(row, &unpremulScale)
+}
