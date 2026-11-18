@@ -1088,3 +1088,264 @@ hc_extinc:
 hc_finish:
 	MOVQ BX, next+56(FP)
 	RET
+
+// ---------------------------------------------------------------------------
+// func cacheCountsSSE41(argb *uint32, npix int, refs *pixOrCopy, nrefs, maxBits int, h *cacheHistos) int
+//
+// The counting loop of bestCacheBitsGo (1 <= maxBits <= 10): for each
+// literal, its channels are counted for the cache size 0, then for each
+// cache size i from maxBits down to 1 (the key of size i is the key of
+// maxBits shifted right) either the cache hit (lit[i][280+key]) or, on a
+// miss, the channels, the cache taking the pixel; for each copy, its
+// length prefix is counted for every size and each pixel that differs from
+// the previous one goes into every cache. Returns the number of pixels
+// covered, or -1 when a reference does not fit argb (or has a length the Go
+// code would reject: 0 or above 4096) — the caller then runs the Go code.
+// SI = argb, BX = pos, DI = ref, R8 = end of refs, DX = h, R9 = maxBits,
+// CX = 32-maxBits, AX = pixel, R10 = key, R11 = cache size. (A branchless
+// count of the cache sizes, every channel counter getting 1-hit, was 11%
+// slower on the photo.)
+TEXT ·cacheCountsSSE41(SB), NOSPLIT, $0-56
+	MOVQ argb+0(FP), SI
+	MOVQ refs+16(FP), DI
+	MOVQ nrefs+24(FP), R8
+	SHLQ $3, R8
+	ADDQ DI, R8
+	MOVQ maxBits+32(FP), R9
+	MOVQ h+40(FP), DX
+	MOVL $32, CX
+	SUBL R9, CX
+	XORL BX, BX
+
+cc_ref:
+	CMPQ  DI, R8
+	JEQ   cc_ok
+	MOVL  4(DI), R12
+	TESTL $3, R12
+	JNZ   cc_copy
+	CMPQ  BX, npix+8(FP)
+	JCC   cc_bad
+	MOVL  (SI)(BX*4), AX
+	INCQ  BX
+	ADDQ  $8, DI
+	MOVL  AX, R12
+	SHRL  $24, R12
+	INCL  cacheHistos_alpha(DX)(R12*4)
+	MOVL  AX, R12
+	SHRL  $16, R12
+	ANDL  $0xff, R12
+	INCL  cacheHistos_red(DX)(R12*4)
+	MOVL  AX, R12
+	ANDL  $0xff, R12
+	INCL  cacheHistos_blue(DX)(R12*4)
+	MOVL  AX, R12
+	SHRL  $8, R12
+	ANDL  $0xff, R12
+	MOVQ  cacheHistos_lit(DX), R13
+	INCL  (R13)(R12*4)
+	MOVL  AX, R10
+	IMUL3L $0x1e35a7bd, R10, R10
+	SHRL  CX, R10
+	MOVQ  R9, R11
+
+cc_lvl:
+	MOVQ cacheHistos_cache(DX)(R11*8), R13
+	CMPL AX, (R13)(R10*4)
+	JNE  cc_miss
+	MOVQ cacheHistos_lit(DX)(R11*8), R13
+	INCL 1120(R13)(R10*4) // lit[280+key]
+	JMP  cc_lvlnext
+
+cc_miss:
+	MOVL AX, (R13)(R10*4)
+	MOVQ R11, R13
+	SHLQ $10, R13
+	ADDQ DX, R13 // + 1024*i: the histograms of size i
+	MOVL AX, R12
+	SHRL $24, R12
+	INCL cacheHistos_alpha(R13)(R12*4)
+	MOVL AX, R12
+	SHRL $16, R12
+	ANDL $0xff, R12
+	INCL cacheHistos_red(R13)(R12*4)
+	MOVL AX, R12
+	ANDL $0xff, R12
+	INCL cacheHistos_blue(R13)(R12*4)
+	MOVL AX, R12
+	SHRL $8, R12
+	ANDL $0xff, R12
+	MOVQ cacheHistos_lit(DX)(R11*8), R13
+	INCL (R13)(R12*4)
+
+cc_lvlnext:
+	SHRL $1, R10
+	DECQ R11
+	JNZ  cc_lvl
+	JMP  cc_ref
+
+cc_copy:
+	SHRL $2, R12 // length
+	JZ   cc_bad
+	CMPL R12, $4096
+	JHI  cc_bad
+	MOVQ BX, R13
+	ADDQ R12, R13
+	CMPQ R13, npix+8(FP)
+	JHI  cc_bad
+	ADDQ $8, DI
+	LEAL -1(R12), R13 // prefix code of the length
+	CMPL R13, $4
+	JCS  cc_code
+	BSRL R13, R10
+	LEAL -1(R10), AX
+	BTL  AX, R13
+	MOVL $0, AX
+	ADCL R10, AX
+	ADDL R10, AX
+	MOVL AX, R13
+
+cc_code:
+	MOVQ R9, R11
+
+cc_codeloop:
+	MOVQ cacheHistos_lit(DX)(R11*8), R10
+	INCL 1024(R10)(R13*4) // lit[256+code]
+	DECQ R11
+	JGE  cc_codeloop
+	ADDQ BX, R12          // end of the copy
+	MOVL (SI)(BX*4), AX
+	NOTL AX               // prev
+
+cc_px:
+	MOVL (SI)(BX*4), R13
+	CMPL R13, AX
+	JEQ  cc_pxnext
+	MOVL R13, AX
+	MOVL R13, R10
+	IMUL3L $0x1e35a7bd, R10, R10
+	SHRL CX, R10
+	MOVQ R9, R11
+
+cc_ins:
+	MOVQ cacheHistos_cache(DX)(R11*8), R13
+	MOVL AX, (R13)(R10*4)
+	SHRL $1, R10
+	DECQ R11
+	JNZ  cc_ins
+
+cc_pxnext:
+	INCQ BX
+	CMPQ BX, R12
+	JLT  cc_px
+	JMP  cc_ref
+
+cc_ok:
+	MOVQ BX, ret+48(FP)
+	RET
+
+cc_bad:
+	MOVQ $-1, ret+48(FP)
+	RET
+
+// ---------------------------------------------------------------------------
+// func rleSSE41(argb *uint32, n, xsize, i int, refs *pixOrCopy, room int) (count, next int)
+//
+// The parse loop of backwardRefsRleGo from position i (1 <= i): at most
+// room references are written to refs. A pixel equal to neither its left
+// nor its top neighbor is a literal; otherwise the lengths of the matches
+// at distances 1 and xsize (at most min(n-i, maxLength)) are measured with
+// MISMATCH and the longer one of at least minLength (distance 1 on a tie)
+// is taken, else a literal. Returns the references written and the next
+// position.
+// SI = argb, BX = i, R8 = n, R9 = xsize, DI = next reference, R10 = end of
+// refs, R11 = length at distance 1.
+TEXT ·rleSSE41(SB), NOSPLIT, $0-64
+	MOVQ argb+0(FP), SI
+	MOVQ n+8(FP), R8
+	MOVQ xsize+16(FP), R9
+	MOVQ i+24(FP), BX
+	MOVQ refs+32(FP), DI
+	MOVQ room+40(FP), R10
+	SHLQ $3, R10
+	ADDQ DI, R10
+
+rle_loop:
+	CMPQ BX, R8
+	JGE  rle_done
+	CMPQ DI, R10
+	JEQ  rle_done
+	MOVL (SI)(BX*4), AX
+	CMPL AX, -4(SI)(BX*4)
+	JEQ  rle_match
+	CMPQ BX, R9
+	JLT  rle_lit
+	MOVQ BX, CX
+	SUBQ R9, CX
+	CMPL AX, (SI)(CX*4)
+	JEQ  rle_match
+
+rle_lit:
+	MOVL AX, (DI)
+	MOVL $4, 4(DI) // 1<<2 | modeLiteral
+	ADDQ $8, DI
+	INCQ BX
+	JMP  rle_loop
+
+rle_match:
+	MOVQ R8, DX
+	SUBQ BX, DX
+	CMPQ DX, $4095
+	JLE  rle_maxlen
+	MOVQ $4095, DX
+
+rle_maxlen:
+	LEAQ (SI)(BX*4), R12
+	LEAQ -4(SI)(BX*4), R13
+	MISMATCH(rle_m1loop, rle_m1found, rle_m1tail, rle_m1done)
+	MOVQ AX, R11
+	XORL AX, AX
+	CMPQ BX, R9
+	JLT  rle_choose
+	LEAQ (SI)(BX*4), R12
+	MOVQ BX, CX
+	SUBQ R9, CX
+	LEAQ (SI)(CX*4), R13
+	MISMATCH(rle_m2loop, rle_m2found, rle_m2tail, rle_m2done)
+
+rle_choose:
+	CMPQ R11, AX
+	JLT  rle_prow
+	CMPQ R11, $4
+	JLT  rle_prow
+	MOVL $1, (DI)
+	MOVL R11, CX
+	SHLL $2, CX
+	ORL  $2, CX // len<<2 | modeCopy
+	MOVL CX, 4(DI)
+	ADDQ $8, DI
+	ADDQ R11, BX
+	JMP  rle_loop
+
+rle_prow:
+	CMPQ AX, $4
+	JLT  rle_lit2
+	MOVL R9, (DI)
+	MOVL AX, CX
+	SHLL $2, CX
+	ORL  $2, CX
+	MOVL CX, 4(DI)
+	ADDQ $8, DI
+	ADDQ AX, BX
+	JMP  rle_loop
+
+rle_lit2:
+	MOVL (SI)(BX*4), AX
+	JMP  rle_lit
+
+rle_done:
+	MOVQ DI, AX
+	SUBQ refs+32(FP), AX
+	SHRQ $3, AX
+	MOVQ AX, count+48(FP)
+	MOVQ BX, next+56(FP)
+	RET

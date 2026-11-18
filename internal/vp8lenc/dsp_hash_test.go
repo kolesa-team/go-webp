@@ -194,6 +194,69 @@ func FuzzHashChainRun(f *testing.F) {
 	})
 }
 
+// rleBoth compares backwardRefsRle with backwardRefsRleGo at every level,
+// from refs of the given capacity (the growth must match too).
+func rleBoth(t *testing.T, argb []uint32, xsize, capacity int) {
+	t.Helper()
+	n := len(argb)
+	want := backwardRefsRleGo(xsize, n, argb, make([]pixOrCopy, 0, capacity))
+	atEveryLevel(func(l cpuinfo.Level) {
+		got := backwardRefsRle(xsize, n, argb, make([]pixOrCopy, 0, capacity))
+		if !slices.Equal(got, want) || cap(got) != cap(want) {
+			t.Fatalf("level %v n %d xsize %d cap %d: %d refs (cap %d), want %d (cap %d)", l, n, xsize, capacity, len(got), cap(got), len(want), cap(want))
+		}
+	})
+}
+
+func TestBackwardRefsRleLevels(t *testing.T) {
+	iters := 600
+	if testing.Short() {
+		iters = 60
+	}
+	rng := rand.New(rand.NewSource(14))
+	for i := 0; i < iters; i++ {
+		xsize := 1 + rng.Intn(300)
+		n := 1 + rng.Intn(20000)
+		if i%10 == 0 {
+			n = 1 + rng.Intn(20)
+		}
+		rleBoth(t, randHashImage(rng, n, xsize), xsize, []int{0, 1, 7, n}[rng.Intn(4)])
+	}
+}
+
+func FuzzBackwardRefsRle(f *testing.F) {
+	f.Add([]byte{1, 1, 1, 1, 1, 2, 2, 2, 2, 3, 1, 1, 1, 1, 1}, uint8(5), uint8(3))
+	f.Fuzz(func(t *testing.T, data []byte, xs, c uint8) {
+		if len(data) == 0 {
+			return
+		}
+		argb := make([]uint32, len(data))
+		for i, b := range data {
+			argb[i] = uint32(b & 3)
+		}
+		rleBoth(t, argb, 1+int(xs)%64, int(c))
+	})
+}
+
+func BenchmarkBackwardRefsRle(b *testing.B) {
+	img := loadTestJPEG(b, "source.jpg")
+	w, h := img.Rect.Dx(), img.Rect.Dy()
+	argb := make([]uint32, w*h)
+	for i := range argb {
+		p := img.Pix[(i/w)*img.Stride+4*(i%w):]
+		argb[i] = uint32(p[3])<<24 | uint32(p[0])<<16 | uint32(p[1])<<8 | uint32(p[2])
+	}
+	refs := make([]pixOrCopy, 0, len(argb))
+	for _, l := range testLevels() {
+		b.Run(l.String(), func(b *testing.B) {
+			defer setLevel(l)()
+			for i := 0; i < b.N; i++ {
+				refs = backwardRefsRle(w, len(argb), argb, refs)
+			}
+		})
+	}
+}
+
 // BenchmarkHashChainRun runs the sequential search on the photo at the
 // qualities of levels 0 and 6, with and without the prefetch.
 func BenchmarkHashChainRun(b *testing.B) {

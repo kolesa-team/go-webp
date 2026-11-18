@@ -202,8 +202,9 @@ func rleEntries(argb []uint32, w, lo, hi int) int {
 	return k
 }
 
-// backwardRefsRle computes references using only distance 1 and xsize.
-func backwardRefsRle(xsize, n int, argb []uint32, refs []pixOrCopy) []pixOrCopy {
+// backwardRefsRleGo computes references using only distance 1 and xsize.
+// It is the Go reference of backwardRefsRle (dsp_amd64.go, dsp_generic.go).
+func backwardRefsRleGo(xsize, n int, argb []uint32, refs []pixOrCopy) []pixOrCopy {
 	refs = refs[:0]
 	argb = argb[:n]
 	if cap(refs) == 0 {
@@ -277,9 +278,10 @@ func applyColorCache(argb []uint32, cacheBits int, refs []pixOrCopy, cache []uin
 	}
 }
 
-// bestCacheBits returns the color cache size minimizing the estimated
-// entropy of refs (which must contain no cache references).
-func bestCacheBits(argb []uint32, quality int, refs []pixOrCopy, maxBits int, sc *scratch) int {
+// bestCacheBitsGo returns the color cache size minimizing the estimated
+// entropy of refs (which must contain no cache references). It is the Go
+// reference of bestCacheBits (dsp_amd64.go, dsp_generic.go).
+func bestCacheBitsGo(argb []uint32, quality int, refs []pixOrCopy, maxBits int, sc *scratch) int {
 	if quality <= 25 || maxBits == 0 {
 		return 0
 	}

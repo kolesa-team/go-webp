@@ -2,7 +2,11 @@
 
 package vp8lenc
 
-import "github.com/kolesa-team/go-webp/v2/internal/cpuinfo"
+import (
+	"math"
+
+	"github.com/kolesa-team/go-webp/v2/internal/cpuinfo"
+)
 
 // SSE4.1 and AVX2 implementations of the kernel entry points, written in
 // dsp_amd64.s. The wrappers below check every bound before calling the
@@ -85,6 +89,98 @@ func (s *hcSearcher) run(hi, lo, stop int, marks []uint64) (last, next int) {
 		return hcRunSSE41(s, hi, lo, stop, m, hcPrefetch)
 	}
 	return s.runGo(hi, lo, stop, marks)
+}
+
+// cacheHistos are the histograms of bestCacheBits for each cache size i
+// (0: no cache): the literal histogram (green, length prefixes and cache
+// indices) and the cache are in a scratch buffer.
+type cacheHistos struct {
+	lit, cache       [maxColorCacheBits + 1]*uint32
+	red, blue, alpha [maxColorCacheBits + 1][256]uint32
+}
+
+//go:noescape
+func cacheCountsSSE41(argb *uint32, npix int, refs *pixOrCopy, nrefs, maxBits int, h *cacheHistos) int
+
+// bestCacheBits is bestCacheBitsGo, with the histograms of every cache
+// size counted by cacheCountsSSE41 (the counting loop of bestCacheBitsGo
+// without bound checks; it returns -1, and the Go code then runs, if refs
+// does not fit argb). The costs are computed as in the Go code.
+func bestCacheBits(argb []uint32, quality int, refs []pixOrCopy, maxBits int, sc *scratch) int {
+	if x86Level < cpuinfo.SSE41 || quality <= 25 || maxBits <= 0 || maxBits > maxColorCacheBits || len(refs) == 0 || len(argb) == 0 {
+		return bestCacheBitsGo(argb, quality, refs, maxBits, sc)
+	}
+	var h cacheHistos
+	var lits [maxColorCacheBits + 1][]uint32
+	total := 0
+	for i := 0; i <= maxBits; i++ {
+		n := numLiteralCodes + numLengthCodes
+		if i > 0 {
+			n += 1 << uint(i)
+		}
+		total += n
+	}
+	buf := sc.u32a(total + (2 << uint(maxBits)))
+	clear(buf)
+	off := 0
+	for i := 0; i <= maxBits; i++ {
+		n := numLiteralCodes + numLengthCodes
+		if i > 0 {
+			n += 1 << uint(i)
+		}
+		lits[i] = buf[off : off+n]
+		h.lit[i] = &buf[off]
+		off += n
+	}
+	for i := 1; i <= maxBits; i++ {
+		h.cache[i] = &buf[off]
+		off += 1 << uint(i)
+	}
+	_ = buf[off-1]
+	if cacheCountsSSE41(&argb[0], len(argb), &refs[0], len(refs), maxBits, &h) < 0 {
+		return bestCacheBitsGo(argb, quality, refs, maxBits, sc)
+	}
+	best := 0
+	bestCost := math.MaxFloat64
+	for i := 0; i <= maxBits; i++ {
+		c := populationCost(lits[i]) + populationCost(h.red[i][:]) +
+			populationCost(h.blue[i][:]) + populationCost(h.alpha[i][:]) +
+			extraCost(lits[i][numLiteralCodes:numLiteralCodes+numLengthCodes])
+		if i == 0 || c < bestCost {
+			bestCost = c
+			best = i
+		}
+	}
+	return best
+}
+
+//go:noescape
+func rleSSE41(argb *uint32, n, xsize, i int, refs *pixOrCopy, room int) (count, next int)
+
+// backwardRefsRle is backwardRefsRleGo: the kernel parses from position i
+// until the end or until refs is full (the buffer then grows as in the Go
+// code), with a pixel equal to neither its left nor its top neighbor taken
+// as a literal at once and the match lengths compared 4 pixels at a time.
+func backwardRefsRle(xsize, n int, argb []uint32, refs []pixOrCopy) []pixOrCopy {
+	if x86Level < cpuinfo.SSE41 || n < 1 || xsize < 1 {
+		return backwardRefsRleGo(xsize, n, argb, refs)
+	}
+	refs = refs[:0]
+	argb = argb[:n]
+	if cap(refs) == 0 {
+		refs = growRefs(refs, n)
+	}
+	refs = append(refs, mkLiteral(argb[0]))
+	for i := 1; i < n; {
+		if len(refs) == cap(refs) {
+			refs = growRefs(refs, n)
+		}
+		room := refs[len(refs):cap(refs)]
+		k, next := rleSSE41(&argb[0], n, xsize, i, &room[0], len(room))
+		refs = refs[:len(refs)+k]
+		i = next
+	}
+	return refs
 }
 
 // popStats are the streak statistics of combinedPopulationCostGo.

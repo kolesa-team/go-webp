@@ -19,3 +19,11 @@ func combinedPopulationCost(a, b []uint32) float64 { return combinedPopulationCo
 func (s *hcSearcher) run(hi, lo, stop int, marks []uint64) (last, next int) {
 	return s.runGo(hi, lo, stop, marks)
 }
+
+func bestCacheBits(argb []uint32, quality int, refs []pixOrCopy, maxBits int, sc *scratch) int {
+	return bestCacheBitsGo(argb, quality, refs, maxBits, sc)
+}
+
+func backwardRefsRle(xsize, n int, argb []uint32, refs []pixOrCopy) []pixOrCopy {
+	return backwardRefsRleGo(xsize, n, argb, refs)
+}
