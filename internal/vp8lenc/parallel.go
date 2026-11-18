@@ -17,9 +17,10 @@ import (
 // are coarse (at least about half a millisecond of work each). The
 // candidate configurations are spread by parallel; the stages within an
 // encoding run on the crew of its scratch, whose helpers are started once
-// per encode and serve all its stages. Every result is independent of the
-// number of goroutines, so the output is byte-identical to the sequential
-// encode.
+// per parallel phase (the match search, the predictor mode search with its
+// dozens of batches, the histogram remap) and released at its end. Every
+// result is independent of the number of goroutines, so the output is
+// byte-identical to the sequential encode.
 
 // parallel runs body on the calling goroutine (worker 0) and on up to
 // helpers helper goroutines (workers 1..helpers, never more than items-1),
@@ -79,8 +80,14 @@ func parallel(items, helpers int, body func(worker int, claim func() (int, bool)
 // one stage per batch of tiles, dozens per image), the first stage starts
 // them through the process-wide budget and the following ones reuse them,
 // woken by a channel send each and joined through one channel; between
-// stages they wait, blocked, on their channel. stop ends them: the encode
-// that started them calls it before returning (the crew of a scratch is
+// stages they wait, blocked, on their channel. stop ends them.
+//
+// Each parallel phase stops the crew when it ends, so that its helpers do
+// not hold budget slots, idle, through the sequential stages that follow:
+// other calls may use them meanwhile (with 2 to 4 concurrent ThreadLevel
+// encodes sharing 7 slots, holding them left about 2-3.5 helpers per stage
+// instead of 5-6). The encode that started them also stops the crew before
+// returning, also on a panic or an interruption (the crew of a scratch is
 // stopped before the scratch goes back to its pool), so that no helper
 // outlives it.
 //

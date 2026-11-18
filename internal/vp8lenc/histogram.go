@@ -738,6 +738,7 @@ func (c *clusterer) remap(out *histoSet, helpers int) {
 					assign(k*remapChunk, min((k+1)*remapChunk, len(orig)))
 				}
 			})
+			c.crew.stop() // (no helpers held through the entropy coding that follows)
 		} else {
 			for k := 0; k < chunks && !c.interrupted(); k++ {
 				assign(k*remapChunk, min((k+1)*remapChunk, len(orig)))

@@ -684,6 +684,7 @@ func (ps *predSearch) runPar(modes []uint32, helpers int) int {
 		cur = b + 1
 		sc.crew.run(batchTiles(cur), helpers, stage)
 	}
+	sc.crew.stop() // (no helpers held through the sequential stages that follow)
 	return ps.finish(modes)
 }
 
