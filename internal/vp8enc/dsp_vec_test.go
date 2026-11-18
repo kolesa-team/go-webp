@@ -818,28 +818,68 @@ func randomResiduals(rng *rand.Rand, n int, mags []int) ([]residual, *encProba) 
 }
 
 func TestResidualCostExact(t *testing.T) {
-	rng := rand.New(rand.NewSource(11))
-	for round := 0; round < 20; round++ {
-		res, p := randomResiduals(rng, 2000, []int{1, 2, 4, 66, 70, 2047})
-		for i := range res {
-			for ctx := 0; ctx < numCtx; ctx++ {
-				if got, want := p.residualCost(ctx, &res[i]), p.residualCostRef(ctx, &res[i]); got != want {
-					t.Fatalf("%+v ctx %d: cost %d, want %d", res[i], ctx, got, want)
+	forEachLevel(t, func(t *testing.T) {
+		rng := rand.New(rand.NewSource(11))
+		for round := 0; round < 20; round++ {
+			res, p := randomResiduals(rng, 2000, []int{1, 2, 3, 4, 66, 67, 68, 70, 2047, 2048, 4095, 32767, 32768})
+			for i := range res {
+				for ctx := 0; ctx < numCtx; ctx++ {
+					want := p.residualCostRef(ctx, &res[i])
+					if got := p.residualCost(ctx, &res[i]); got != want {
+						t.Fatalf("%+v %v ctx %d: cost %d, want %d", res[i], *res[i].coeffs, ctx, got, want)
+					}
+					if got := p.residualCostGo(ctx, &res[i]); got != want {
+						t.Fatalf("%+v %v ctx %d: residualCostGo %d, want %d", res[i], *res[i].coeffs, ctx, got, want)
+					}
 				}
 			}
 		}
-	}
+	})
+}
+
+func FuzzResidualCost(f *testing.F) {
+	f.Add([]byte{0, 1, 2, 0xff, 0x7f, 0, 0x80, 3, 0, 0, 0, 1}, uint8(0), uint8(1))
+	f.Add([]byte{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, uint8(7), uint8(42))
+	f.Fuzz(func(t *testing.T, data []byte, sel, seed uint8) {
+		eachLevel(func(level string) {
+			var c [16]int16
+			for i := range c {
+				if 2*i+1 < len(data) {
+					c[i] = int16(uint16(data[2*i]) | uint16(data[2*i+1])<<8)
+				}
+			}
+			rng := rand.New(rand.NewSource(int64(seed)))
+			p := new(encProba)
+			p.reset()
+			for ty := range p.coeffs {
+				for b := range p.coeffs[ty] {
+					for ctx := range p.coeffs[ty][b] {
+						for i := range p.coeffs[ty][b][ctx] {
+							p.coeffs[ty][b][ctx][i] = uint8(rng.Intn(256))
+						}
+					}
+				}
+			}
+			p.calculateLevelCosts()
+			var res residual
+			res.first = int(sel & 1)
+			res.ctype = int(sel>>1) % numTypes
+			res.setCoeffs(&c)
+			ctx := int(sel>>3) % numCtx
+			if got, want := p.residualCost(ctx, &res), p.residualCostRef(ctx, &res); got != want {
+				t.Fatalf(level+": %v first %d type %d ctx %d: cost %d, want %d", c, res.first, res.ctype, ctx, got, want)
+			}
+		})
+	})
 }
 
 func BenchmarkResidualCost(b *testing.B) {
 	// mostly small levels, as in the mode search
 	res, p := randomResiduals(rand.New(rand.NewSource(12)), 1024, []int{1, 1, 2, 3, 8, 100})
-	b.Run("new", func(b *testing.B) {
-		s := 0
-		for i := 0; i < b.N; i++ {
-			s += p.residualCost(i%numCtx, &res[i&1023])
-		}
-		_ = s
+	i := 0
+	benchLevels(b, "level", func() {
+		p.residualCost(i%numCtx, &res[i&1023])
+		i++
 	})
 	b.Run("ref", func(b *testing.B) {
 		s := 0

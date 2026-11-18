@@ -157,6 +157,19 @@ func TestVecGuardPages(t *testing.T) {
 					}
 				}
 			}
+
+			// residual cost: the block of levels against a guard page
+			res, p := randomResiduals(rng, 64, []int{1, 3, 70, 2047})
+			for i := range res {
+				blk := guardedBlocks(t, 1, atEnd)
+				blk[0] = *res[i].coeffs
+				res[i].coeffs = &blk[0]
+				for ctx := 0; ctx < numCtx; ctx++ {
+					if got, want := p.residualCost(ctx, &res[i]), p.residualCostRef(ctx, &res[i]); got != want {
+						t.Fatalf("residualCost atEnd=%v %v: %d, want %d", atEnd, blk[0], got, want)
+					}
+				}
+			}
 		}
 	})
 }

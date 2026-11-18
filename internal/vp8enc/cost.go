@@ -155,8 +155,10 @@ func abs16(v int16) int {
 	return int(v)
 }
 
-// residualCost returns the bit-cost of coding the residual with context ctx0.
-func (p *encProba) residualCost(ctx0 int, res *residual) int {
+// residualCostGo returns the bit-cost of coding the residual with context
+// ctx0; residualCost (cost_amd64.go, cost_other.go) is bound to it or to
+// an assembly kernel.
+func (p *encProba) residualCostGo(ctx0 int, res *residual) int {
 	n := res.first
 	prob := &p.coeffs[res.ctype]
 	costs := &p.levelCost[res.ctype]
