@@ -94,9 +94,16 @@ var wavefrontMBCost = func() [7]int64 {
 }()
 
 var (
+	// wavefrontPool holds the wfState structs (about 1 KB); their buffers
+	// come from the bufpool pools below, which outlive garbage collections
+	// (sync.Pool drops its content at every other one).
 	wavefrontPool = sync.Pool{New: func() any { return new(wfState) }}
 	// lfValuePool holds the autofilter SSIM lists of the row slots.
 	lfValuePool bufpool.Pool[float64]
+	// wfStatsPool holds the slots' token statistics (4 KB each).
+	wfStatsPool bufpool.Pool[[numTypes]statsArray]
+	// wfRowPool holds the rows' progress counters.
+	wfRowPool bufpool.Pool[wfRow]
 
 	// forceWavefront (tests only) codes every picture of two rows or more
 	// as a wavefront, whatever its size.
@@ -154,12 +161,12 @@ type wfRow struct {
 // wfSlot holds the coded but not yet committed part of a row.
 type wfSlot struct {
 	tokens   tokenBuffer
-	stats    [numTypes]statsArray // statistics of the tokens not committed yet
-	mbEnd    []int32              // mbEnd[x+1]: end of macroblock x's tokens; mbEnd[0] = 0
-	lf       []float64            // autofilter SSIM values (appendFilterSSIMs)
-	lfPos    int                  // values already committed
-	commitX  int                  // macroblocks already committed
-	finished bool                 // under mu: the row is coded
+	stats    *[numTypes]statsArray // statistics of the tokens not committed yet
+	mbEnd    []int32               // mbEnd[x+1]: end of macroblock x's tokens; mbEnd[0] = 0
+	lf       []float64             // autofilter SSIM values (appendFilterSSIMs)
+	lfPos    int                   // values already committed
+	commitX  int                   // macroblocks already committed
+	finished bool                  // under mu: the row is coded
 }
 
 // wfState is the shared state of a wavefront pass.
@@ -179,6 +186,7 @@ type wfState struct {
 
 	rows  []wfRow
 	slots []wfSlot
+	stats [][numTypes]statsArray // the slots' statistics
 
 	mu      sync.Mutex
 	nw      int // registered workers (under mu)
@@ -283,10 +291,7 @@ func (wf *wfState) init(e *encoder, nw int, isLastPass bool, maxCount int) {
 	wf.committed.Store(0)
 	wf.stopped.Store(false)
 	wf.interrupted.Store(false)
-	if cap(wf.rows) < wf.mbH {
-		wf.rows = make([]wfRow, wf.mbH)
-	}
-	wf.rows = wf.rows[:wf.mbH]
+	wf.rows = wfRowPool.Get(wf.mbH)
 	for r := range wf.rows {
 		wf.rows[r].prog.Store(0)
 		wf.rows[r].want.Store(noWant)
@@ -296,8 +301,10 @@ func (wf *wfState) init(e *encoder, nw int, isLastPass bool, maxCount int) {
 		wf.slots = make([]wfSlot, nslots)
 	}
 	wf.slots = wf.slots[:nslots]
+	wf.stats = wfStatsPool.Get(nslots)
 	for i := range wf.slots {
 		s := &wf.slots[i]
+		s.stats = &wf.stats[i]
 		s.mbEnd = int32Pool.Get(wf.mbW + 1)
 		if wf.lf {
 			s.lf = lfValuePool.Get(wf.mbW * maxFilterSSIMs)
@@ -314,8 +321,11 @@ func (wf *wfState) release() {
 		s.tokens.release()
 		int32Pool.Put(s.mbEnd)
 		lfValuePool.Put(s.lf)
-		s.mbEnd, s.lf = nil, nil
+		s.mbEnd, s.lf, s.stats = nil, nil, nil
 	}
+	wfStatsPool.Put(wf.stats)
+	wfRowPool.Put(wf.rows)
+	wf.stats, wf.rows = nil, nil
 	for k := range wf.workers {
 		wf.workers[k].it = nil
 	}
@@ -374,7 +384,7 @@ func (wf *wfState) run(w *wfWorker) {
 		}
 		s := &wf.slots[r%nslots]
 		s.tokens.reset()
-		s.stats = [numTypes]statsArray{}
+		*s.stats = [numTypes]statsArray{}
 		s.mbEnd[0] = 0
 		s.lf = s.lf[:0]
 		s.lfPos, s.commitX = 0, 0
@@ -386,7 +396,7 @@ func (wf *wfState) run(w *wfWorker) {
 			}
 			it.importMB()
 			it.decimate(rd, wf.rdOpt)
-			it.recordTokens(rd, &s.tokens, &s.stats)
+			it.recordTokens(rd, &s.tokens, s.stats)
 			s.mbEnd[x+1] = int32(s.tokens.len())
 			sizeP0 += uint64(rd.H)
 			dist += uint64(rd.D)
@@ -509,12 +519,12 @@ func (wf *wfState) commit(r, x1 int) {
 		e.tokens.appendTokens(c)
 		i += len(c)
 	}
-	if !mergeStats(&e.proba.stats, &s.stats) {
+	if !mergeStats(&e.proba.stats, s.stats) {
 		s.tokens.recordStatsRange(start, end, &e.proba.stats)
 	}
 	if x1 < wf.mbW {
 		// Count the rest of the row from zero.
-		s.stats = [numTypes]statsArray{}
+		*s.stats = [numTypes]statsArray{}
 	}
 	if wf.lf {
 		for x := x0; x < x1; x++ {
