@@ -10,4 +10,6 @@ require (
 	github.com/kolesa-team/go-webp/v2 v2.0.0
 )
 
+require golang.org/x/sys v0.50.0 // indirect
+
 replace github.com/kolesa-team/go-webp/v2 => ../
