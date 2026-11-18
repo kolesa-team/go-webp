@@ -35,8 +35,8 @@ type Config struct {
 	// internal/workers (see parallel.go): candidate encodings are evaluated
 	// two at a time (up to 8 MP), and the match search, the predictor mode
 	// search and the histogram remap of large images are split among
-	// helpers, started at the first such stage and kept until the encode
-	// returns. The output does not depend on it. Ignored with LowMemory.
+	// helpers, started at the beginning of each of these phases and ended
+	// with it. The output does not depend on it. Ignored with LowMemory.
 	ThreadLevel bool
 	// ImageHint is libwebp's WebPImageHint (0 default, 1 picture, 2 photo,
 	// 3 graph). With 3 (graph), palette images additionally try the

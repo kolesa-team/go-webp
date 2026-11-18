@@ -317,6 +317,7 @@ func (s *hcSearcher) fillStripes(helpers int, sc *scratch) {
 			exits[k], _ = s.run(min((k+1)*per-1, size-2), lo, lo, marks)
 		}
 	})
+	sc.crew.stop() // (no helpers held through the sequential parse that follows)
 	if sc.interrupted() {
 		// Some stripes may not have run: the matches are garbage, and the
 		// caller (encodeImageInternal) stops right after the fill.

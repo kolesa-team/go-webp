@@ -7,6 +7,7 @@ import (
 	"image/color"
 	"math/rand"
 	"runtime"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -324,8 +325,8 @@ func TestCrewCallerPanic(t *testing.T) {
 }
 
 // TestThreadLevelAllocs checks that a ThreadLevel encode starts its helpers
-// once (not per stage: the predictor alone runs dozens of stages) and
-// leaves none running.
+// once per parallel phase (not per stage: the predictor alone runs dozens
+// of stages) and leaves none running.
 func TestThreadLevelAllocs(t *testing.T) {
 	if testing.Short() {
 		t.Skip("short")
@@ -339,13 +340,61 @@ func TestThreadLevelAllocs(t *testing.T) {
 	}
 	par := testing.AllocsPerRun(5, func() { Encode(img, cfg) })
 	one := testing.AllocsPerRun(5, func() { Encode(img, seq) })
-	// About 3 per helper (goroutine, Task, channel) plus a few per stage.
-	if par-one > 60 {
+	// About 4 per helper (goroutine, Task, channel, closure) and phase (the
+	// match search, the predictor, the remap), plus a few per stage; about
+	// 720 when the helpers were started for every stage.
+	if par-one > 120 {
 		t.Errorf("%.0f allocations with ThreadLevel, %.0f without", par, one)
 	}
 	if workers.InUse() != 0 {
 		t.Errorf("%d helpers running after the encodes", workers.InUse())
 	}
+}
+
+// TestPhasesReleaseHelpers checks that each parallel phase (the match
+// search, the predictor mode search, the histogram remap) ends its helpers
+// when it ends, so that they do not hold budget slots, idle, through the
+// sequential stages of the encode that follow.
+func TestPhasesReleaseHelpers(t *testing.T) {
+	defer forceParallel()()
+	defer workers.SetLimitForTest(workers.SetLimitForTest(8))
+	img := threadTestImages()[0].img
+	w, h := img.Rect.Dx(), img.Rect.Dy()
+	n := w * h
+	argb := make([]uint32, n)
+	for i := range argb {
+		p := img.Pix[(i/w)*img.Stride+4*(i%w):]
+		argb[i] = uint32(p[3])<<24 | uint32(p[0])<<16 | uint32(p[1])<<8 | uint32(p[2])
+	}
+	check := func(phase string, sc *scratch) {
+		t.Helper()
+		if len(sc.crew.start) == 0 {
+			t.Fatalf("%s: no helper was started", phase)
+		}
+		if workers.InUse() != 0 || len(sc.crew.tasks) != 0 {
+			t.Fatalf("%s: %d helpers still running after the phase", phase, workers.InUse())
+		}
+	}
+
+	sc := new(scratch)
+	var hc hashChain
+	hc.fillPar(argb, w, h, 75, false, 0, intraHelpers, sc)
+	check("match search", sc)
+
+	sc = new(scratch)
+	modes := make([]uint32, subSampleSize(w, 2)*subSampleSize(h, 2))
+	predictorImage(w, h, 2, 2, false, 1, false, false, false, slices.Clone(argb), modes, sc, intraHelpers)
+	check("predictor", sc)
+
+	sc = new(scratch)
+	refs := backwardRefsLz77(n, argb, &hc, nil)
+	var c clusterer
+	var out histoSet
+	c.crew = &sc.crew
+	if ng := c.buildHistoImage(w, h, refs, 75, false, 2, 0, &out, intraHelpers); ng < 2 {
+		t.Fatalf("remap: %d clusters, want a parallel remap", ng)
+	}
+	check("remap", sc)
 }
 
 // TestThreadLevelGOMAXPROCS checks the output against the sequential one
