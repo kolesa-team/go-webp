@@ -10,14 +10,18 @@ import (
 // Algorithm adapted from libwebp (BSD-3-Clause).
 
 const (
-	maxPartition0Size   = 1 << 19
-	maxPartitionSize    = 1 << 24
-	headerSizeEstimate  = 12 + 8 + 10 // RIFF + chunk header + VP8 frame header
-	dqLimit             = 0.4
-	partition0SizeLimit = uint64(maxPartition0Size-2048) << 11
-	minCount            = 96
-	skipProbaThreshold  = 250
+	maxPartition0Size  = 1 << 19
+	maxPartitionSize   = 1 << 24
+	headerSizeEstimate = 12 + 8 + 10 // RIFF + chunk header + VP8 frame header
+	dqLimit            = 0.4
+	minCount           = 96
+	skipProbaThreshold = 250
 )
+
+// partition0SizeLimit is the header bit estimate (1/256 bits) above which a
+// pass is redone with a stronger limit on the intra4 header bits. It is a
+// variable so that tests can reach that path with small pictures.
+var partition0SizeLimit = uint64(maxPartition0Size-2048) << 11
 
 type passStats struct {
 	isFirst      bool
@@ -130,11 +134,9 @@ func getPSNR(mse, size uint64) float64 {
 	return 99
 }
 
-// recordTokens records the coefficient tokens of the current macroblock.
-func (it *iterator) recordTokens(rd *modeScore) {
-	e := it.enc
-	tb := &e.tokens
-	stats := &e.proba.stats
+// recordTokens records the coefficient tokens of the current macroblock into
+// tb and their statistics into stats.
+func (it *iterator) recordTokens(rd *modeScore, tb *tokenBuffer, stats *[numTypes]statsArray) {
 	var res residual
 	it.nzToBytes()
 	if it.mb().typ == 1 { // i16x16
@@ -177,7 +179,6 @@ func (e *encoder) tokenLoop() error {
 	nbMBs := e.mbW * e.mbH
 	maxCount := max(nbMBs>>3, minCount)
 	numPassLeft := e.cfg.Pass
-	rdOpt := e.rdOptLevel
 	pixelCount := uint64(nbMBs) * 384
 	it := &e.it
 	var stats passStats
@@ -186,8 +187,6 @@ func (e *encoder) tokenLoop() error {
 	for numPassLeft > 0 {
 		numPassLeft--
 		isLastPass := math.Abs(float64(stats.dq)) <= dqLimit || numPassLeft == 0 || e.maxI4HeaderBits == 0
-		var sizeP0, distortion uint64
-		cnt := maxCount
 		it.init(e)
 		e.setLoopParams(stats.q)
 		if isLastPass {
@@ -195,32 +194,9 @@ func (e *encoder) tokenLoop() error {
 			e.initFilter()
 		}
 		e.tokens.reset()
-		rd := &it.rd
-		for {
-			if it.x == 0 && e.cfg.interrupted() {
-				return ErrInterrupted
-			}
-			it.importMB()
-			if rdOpt > rdOptNone {
-				cnt--
-				if cnt < 0 {
-					e.proba.finalizeTokenProbas()
-					e.proba.calculateLevelCosts()
-					cnt = maxCount
-				}
-			}
-			it.decimate(rd, rdOpt)
-			e.mbTokStart[it.mbIdx] = int32(e.tokens.len())
-			it.recordTokens(rd)
-			sizeP0 += uint64(rd.H)
-			distortion += uint64(rd.D)
-			if isLastPass {
-				e.storeFilterStats(it)
-			}
-			it.saveBoundary()
-			if !it.next() {
-				break
-			}
+		sizeP0, distortion, err := e.codePass(isLastPass, maxCount)
+		if err != nil {
+			return err
 		}
 		e.mbTokStart[nbMBs] = int32(e.tokens.len())
 		sizeP0 += uint64(e.segHdrSize)
@@ -273,6 +249,55 @@ func (e *encoder) tokenLoop() error {
 	e.proba.finalizeTokenProbas()
 	e.adjustFilterStrength()
 	return nil
+}
+
+// codePass codes every macroblock once (one pass of tokenLoop): it picks
+// the modes, records the tokens into e.tokens (e.mbTokStart) and their
+// statistics, refreshing the cost tables every maxCount+1 macroblocks, and
+// the autofilter statistics on the last pass. It returns the sum of the
+// header bit estimates and of the distortions.
+//
+// With ThreadLevel the pass runs as a wavefront on helper goroutines when
+// the picture is large enough and the budget has a free slot
+// (codePassWavefront); the result is the same.
+func (e *encoder) codePass(isLastPass bool, maxCount int) (sizeP0, distortion uint64, err error) {
+	if nw := e.wavefrontWorkers(); nw > 1 {
+		if sizeP0, distortion, ran, err := e.codePassWavefront(nw, isLastPass, maxCount); ran {
+			return sizeP0, distortion, err
+		}
+	}
+	it := &e.it
+	rd := &it.rd
+	rdOpt := e.rdOptLevel
+	cnt := maxCount
+	for {
+		if it.x == 0 && e.cfg.interrupted() {
+			return 0, 0, ErrInterrupted
+		}
+		it.importMB()
+		if rdOpt > rdOptNone {
+			cnt--
+			if cnt < 0 {
+				e.proba.finalizeTokenProbas()
+				e.proba.calculateLevelCosts()
+				cnt = maxCount
+			}
+		}
+		it.decimate(rd, rdOpt)
+		e.mbTokStart[it.mbIdx] = int32(e.tokens.len())
+		it.recordTokens(rd, &e.tokens, &e.proba.stats)
+		sizeP0 += uint64(rd.H)
+		distortion += uint64(rd.D)
+		if isLastPass {
+			e.storeFilterStats(it)
+		}
+		it.saveBoundary()
+		if !it.next() {
+			break
+		}
+	}
+	e.mergeMaxEdge(it)
+	return sizeP0, distortion, nil
 }
 
 //------------------------------------------------------------------------------

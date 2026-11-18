@@ -78,6 +78,19 @@ func (tb *tokenBuffer) chunk(start, end int) []uint16 {
 	return tb.pages[start>>tokenPageShift][off : off+min(end-start, tokenPageSize-off)]
 }
 
+// appendTokens appends already recorded tokens (the wavefront pass moves
+// each row's tokens into the frame's buffer this way, in raster order).
+func (tb *tokenBuffer) appendTokens(src []uint16) {
+	for len(src) > 0 {
+		if len(tb.cur) == cap(tb.cur) {
+			tb.nextPage()
+		}
+		n := copy(tb.cur[len(tb.cur):cap(tb.cur)], src)
+		tb.cur = tb.cur[:len(tb.cur)+n]
+		src = src[n:]
+	}
+}
+
 func (tb *tokenBuffer) add(bit int, idx int, s *uint32) int {
 	if len(tb.cur) == cap(tb.cur) {
 		tb.nextPage()
