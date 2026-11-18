@@ -201,122 +201,159 @@ func reconIters(t *testing.T) int {
 }
 
 func TestReconRandom(t *testing.T) {
-	r := rand.New(rand.NewPCG(1, 2))
-	var c reconCase
-	n := reconIters(t)
-	for i := 0; i < n; i++ {
-		randReconCase(r, &c)
-		if !checkI4(t, &c) || !checkI16(t, &c) || !checkUV(t, &c) {
-			t.Fatalf("iteration %d", i)
+	forEachReconKernel(t, func(t *testing.T) {
+		r := rand.New(rand.NewPCG(1, 2))
+		var c reconCase
+		n := reconIters(t)
+		for i := 0; i < n; i++ {
+			randReconCase(r, &c)
+			if !checkI4(t, &c) || !checkI16(t, &c) || !checkUV(t, &c) {
+				t.Fatalf("iteration %d", i)
+			}
 		}
-	}
+	})
+}
+
+// TestReconBoundedCoefficients is TestReconRandom with coefficients mostly
+// within the range of the 16-bit transforms of the x86 kernels, where they
+// do not fall back to the reference, including the bound itself.
+func TestReconBoundedCoefficients(t *testing.T) {
+	forEachReconKernel(t, func(t *testing.T) {
+		r := rand.New(rand.NewPCG(41, 42))
+		var c reconCase
+		n := reconIters(t)
+		for i := 0; i < n; i++ {
+			randReconCase(r, &c)
+			for k := range c.coeffs {
+				if c.coeffs[k] != 0 || r.IntN(8) == 0 {
+					switch r.IntN(8) {
+					case 0:
+						c.coeffs[k] = []int16{4095, -4095, 4094, -4094, 4096, -4096}[r.IntN(6)]
+					case 1, 2:
+						c.coeffs[k] = int16(r.IntN(8191) - 4095)
+					default:
+						c.coeffs[k] = int16(r.IntN(4096) - 2048)
+					}
+				}
+			}
+			if !checkI4(t, &c) || !checkI16(t, &c) || !checkUV(t, &c) {
+				t.Fatalf("iteration %d", i)
+			}
+		}
+	})
 }
 
 // TestReconI4Modes checks every 4x4 mode in every sub-block position with
 // random edges, including the top-right samples (replicated below the top
 // row as reconstructMB does, or arbitrary).
 func TestReconI4Modes(t *testing.T) {
-	r := rand.New(rand.NewPCG(3, 4))
-	var c reconCase
-	n := reconIters(t) / 10
-	for mode := 0; mode < 10; mode++ {
-		for i := 0; i < n; i++ {
-			randReconCase(r, &c)
-			for k := range c.modes {
-				c.modes[k] = uint8(mode)
+	forEachReconKernel(t, func(t *testing.T) {
+		r := rand.New(rand.NewPCG(3, 4))
+		var c reconCase
+		n := reconIters(t) / 10
+		for mode := 0; mode < 10; mode++ {
+			for i := 0; i < n; i++ {
+				randReconCase(r, &c)
+				for k := range c.modes {
+					c.modes[k] = uint8(mode)
+					if r.IntN(4) == 0 {
+						c.modes[k] = uint8(r.IntN(10))
+					}
+				}
+				if r.IntN(2) == 0 {
+					tr := yOff - bps + 16
+					for k := 1; k <= 3; k++ {
+						copy(c.b[tr+4*k*bps:][:4], c.b[tr:][:4])
+					}
+				}
 				if r.IntN(4) == 0 {
-					c.modes[k] = uint8(r.IntN(10))
+					c.bits = 0 // prediction only
 				}
-			}
-			if r.IntN(2) == 0 {
-				tr := yOff - bps + 16
-				for k := 1; k <= 3; k++ {
-					copy(c.b[tr+4*k*bps:][:4], c.b[tr:][:4])
+				if !checkI4(t, &c) {
+					t.Fatalf("mode %d iteration %d", mode, i)
 				}
-			}
-			if r.IntN(4) == 0 {
-				c.bits = 0 // prediction only
-			}
-			if !checkI4(t, &c) {
-				t.Fatalf("mode %d iteration %d", mode, i)
 			}
 		}
-	}
+	})
 }
 
 // TestReconTrueMotionExhaustive checks the TM clipping for every (top, left,
 // top-left) sample triple in the 16x16 and chroma predictors.
 func TestReconTrueMotionExhaustive(t *testing.T) {
-	var c reconCase
-	for x := 0; x < 256; x++ {
-		if testing.Short() && x%17 != 0 {
-			continue
-		}
-		for blk := 0; blk < 16; blk++ { // top values 16*blk + i
-			for half := 0; half < 16; half++ { // left values 16*half + j
-				for i := 0; i < 16; i++ {
-					c.b[yOff-bps+i] = byte(16*blk + i)
-					c.b[yOff+i*bps-1] = byte(16*half + i)
-				}
-				for i := 0; i < 8; i++ {
-					c.b[uOff-bps+i] = byte(16*blk + i)
-					c.b[vOff-bps+i] = byte(16*blk + 8 + i)
-					c.b[uOff+i*bps-1] = byte(16*half + i)
-					c.b[vOff+i*bps-1] = byte(16*half + 8 + i)
-				}
-				c.b[yOff-bps-1], c.b[uOff-bps-1], c.b[vOff-bps-1] = byte(x), byte(x), byte(x)
-				c.bits, c.uvBits, c.mode, c.uvMode = 0, 0, bTMPred, bTMPred
-				if !checkI16(t, &c) || !checkUV(t, &c) {
-					t.Fatalf("x=%d blk=%d half=%d", x, blk, half)
+	forEachReconKernel(t, func(t *testing.T) {
+		var c reconCase
+		for x := 0; x < 256; x++ {
+			if testing.Short() && x%17 != 0 {
+				continue
+			}
+			for blk := 0; blk < 16; blk++ { // top values 16*blk + i
+				for half := 0; half < 16; half++ { // left values 16*half + j
+					for i := 0; i < 16; i++ {
+						c.b[yOff-bps+i] = byte(16*blk + i)
+						c.b[yOff+i*bps-1] = byte(16*half + i)
+					}
+					for i := 0; i < 8; i++ {
+						c.b[uOff-bps+i] = byte(16*blk + i)
+						c.b[vOff-bps+i] = byte(16*blk + 8 + i)
+						c.b[uOff+i*bps-1] = byte(16*half + i)
+						c.b[vOff+i*bps-1] = byte(16*half + 8 + i)
+					}
+					c.b[yOff-bps-1], c.b[uOff-bps-1], c.b[vOff-bps-1] = byte(x), byte(x), byte(x)
+					c.bits, c.uvBits, c.mode, c.uvMode = 0, 0, bTMPred, bTMPred
+					if !checkI16(t, &c) || !checkUV(t, &c) {
+						t.Fatalf("x=%d blk=%d half=%d", x, blk, half)
+					}
 				}
 			}
 		}
-	}
+	})
 }
 
 // TestReconTransformFullRange runs the inverse DCT on every value of every
 // coefficient position (all other coefficients zero), and on random pairs
 // of extreme coefficients, against several prediction levels.
 func TestReconTransformFullRange(t *testing.T) {
-	var c reconCase
-	step := 1
-	if testing.Short() {
-		step = 61
-	}
-	levels := []byte{0, 1, 128, 254, 255}
-	for pos := 0; pos < 16; pos++ {
-		for v0 := -32768; v0 < 32768; v0 += 16 * step {
+	forEachReconKernel(t, func(t *testing.T) {
+		var c reconCase
+		step := 1
+		if testing.Short() {
+			step = 61
+		}
+		levels := []byte{0, 1, 128, 254, 255}
+		for pos := 0; pos < 16; pos++ {
+			for v0 := -32768; v0 < 32768; v0 += 16 * step {
+				c.coeffs = [384]int16{}
+				for n := 0; n < 16; n++ {
+					c.coeffs[n*16+pos] = int16(v0 + n*step)
+				}
+				lvl := levels[(v0>>4)&0xffff%len(levels)]
+				for i := range c.b {
+					c.b[i] = lvl
+				}
+				c.bits = 0xffffffff
+				c.mode = bVEPred
+				if !checkI16(t, &c) {
+					t.Fatalf("pos %d v0 %d", pos, v0)
+				}
+			}
+		}
+		r := rand.New(rand.NewPCG(5, 6))
+		n := reconIters(t) / 5
+		for i := 0; i < n; i++ {
 			c.coeffs = [384]int16{}
-			for n := 0; n < 16; n++ {
-				c.coeffs[n*16+pos] = int16(v0 + n*step)
+			for k := 0; k < 384; k++ {
+				if r.IntN(3) == 0 {
+					c.coeffs[k] = randCoeff(r, 3)
+				}
 			}
-			lvl := levels[(v0>>4)&0xffff%len(levels)]
-			for i := range c.b {
-				c.b[i] = lvl
-			}
-			c.bits = 0xffffffff
-			c.mode = bVEPred
-			if !checkI16(t, &c) {
-				t.Fatalf("pos %d v0 %d", pos, v0)
-			}
-		}
-	}
-	r := rand.New(rand.NewPCG(5, 6))
-	n := reconIters(t) / 5
-	for i := 0; i < n; i++ {
-		c.coeffs = [384]int16{}
-		for k := 0; k < 384; k++ {
-			if r.IntN(3) == 0 {
-				c.coeffs[k] = randCoeff(r, 3)
+			fillPixels(r, c.b[:])
+			c.bits, c.uvBits = 0xffffffff, 0xffff
+			c.mode, c.uvMode = r.IntN(7), r.IntN(7)
+			if !checkI16(t, &c) || !checkUV(t, &c) {
+				t.Fatalf("iteration %d", i)
 			}
 		}
-		fillPixels(r, c.b[:])
-		c.bits, c.uvBits = 0xffffffff, 0xffff
-		c.mode, c.uvMode = r.IntN(7), r.IntN(7)
-		if !checkI16(t, &c) || !checkUV(t, &c) {
-			t.Fatalf("iteration %d", i)
-		}
-	}
+	})
 }
 
 // reconBlockRef is reconBlock with the reference kernels.
@@ -334,6 +371,10 @@ func reconBlockRef(b *[yuvSize]byte, mbX, mbY int, blk *mbBlock) {
 // state, so the edge handling (initRowEdges, top-right replication) is the
 // real one.
 func TestReconDecoderStates(t *testing.T) {
+	forEachReconLevel(t, testReconDecoderStates)
+}
+
+func testReconDecoderStates(t *testing.T) {
 	names := []string{"m4_q75.webp", "webp-logo-lossy.webp", "100x150_lossy.webp",
 		"grad_250x199_o9.webp", "mix_250x199_o4.webp", "noise_129x65_o7.webp", "mix_64x48_p1.webp"}
 	for _, name := range names {
@@ -411,7 +452,8 @@ func harvestRecon(tb testing.TB, name string) []reconState {
 }
 
 // BenchmarkRecon replays the macroblocks of an image through the bound
-// kernels ("kernel") and the Go reference ("ref"), in ns per macroblock:
+// kernels (at each SIMD level on amd64: "go", "sse41", "avx2", "avx512";
+// "kernel" elsewhere) and the Go reference ("ref"), in ns per macroblock:
 // "mb" is reconBlock, the others a single kernel on the macroblocks that use
 // it. The work buffer is reset (an 832-byte copy) before each call.
 func BenchmarkRecon(b *testing.B) {
@@ -440,18 +482,26 @@ func BenchmarkRecon(b *testing.B) {
 		all := func(*mbBlock) bool { return true }
 		i4 := func(blk *mbBlock) bool { return blk.isI4x4 }
 		i16 := func(blk *mbBlock) bool { return !blk.isI4x4 }
-		run("mb/kernel", all, func(s *reconState) { reconBlock(&work, s.mbX, s.mbY, &s.blk) })
+		eachReconLevel(false, func(level string) {
+			run("mb/"+level, all, func(s *reconState) { reconBlock(&work, s.mbX, s.mbY, &s.blk) })
+		})
 		run("mb/ref", all, func(s *reconState) { reconBlockRef(&work, s.mbX, s.mbY, &s.blk) })
-		run("i4/kernel", i4, func(s *reconState) { reconI4(&work, &s.blk.coeffs, s.blk.nonZeroY, &s.blk.imodes) })
+		eachReconLevel(false, func(level string) {
+			run("i4/"+level, i4, func(s *reconState) { reconI4(&work, &s.blk.coeffs, s.blk.nonZeroY, &s.blk.imodes) })
+		})
 		run("i4/ref", i4, func(s *reconState) { reconI4Ref(&work, &s.blk.coeffs, s.blk.nonZeroY, &s.blk.imodes) })
-		run("i16/kernel", i16, func(s *reconState) {
-			reconI16(&work, &s.blk.coeffs, s.blk.nonZeroY, checkMode(s.mbX, s.mbY, s.blk.imodes[0]))
+		eachReconLevel(false, func(level string) {
+			run("i16/"+level, i16, func(s *reconState) {
+				reconI16(&work, &s.blk.coeffs, s.blk.nonZeroY, checkMode(s.mbX, s.mbY, s.blk.imodes[0]))
+			})
 		})
 		run("i16/ref", i16, func(s *reconState) {
 			reconI16Ref(&work, &s.blk.coeffs, s.blk.nonZeroY, checkMode(s.mbX, s.mbY, s.blk.imodes[0]))
 		})
-		run("uv/kernel", all, func(s *reconState) {
-			reconUV(&work, &s.blk.coeffs, s.blk.nonZeroUV, checkMode(s.mbX, s.mbY, s.blk.uvmode))
+		eachReconLevel(false, func(level string) {
+			run("uv/"+level, all, func(s *reconState) {
+				reconUV(&work, &s.blk.coeffs, s.blk.nonZeroUV, checkMode(s.mbX, s.mbY, s.blk.uvmode))
+			})
 		})
 		run("uv/ref", all, func(s *reconState) {
 			reconUVRef(&work, &s.blk.coeffs, s.blk.nonZeroUV, checkMode(s.mbX, s.mbY, s.blk.uvmode))
@@ -468,21 +518,25 @@ func BenchmarkReconGlue(b *testing.B) {
 	const ys, uvs = 1024, 512
 	cy, cu, cv := make([]byte, 16*ys), make([]byte, 8*uvs), make([]byte, 8*uvs)
 	flags := uint32(edgeRotate | edgeTop | edgeTopRight | edgeI4)
-	b.Run("load/kernel", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			loadEdges(&buf, &top, 0x01020304, flags)
-		}
+	eachReconLevel(false, func(level string) {
+		b.Run("load/"+level, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				loadEdges(&buf, &top, 0x01020304, flags)
+			}
+		})
 	})
 	b.Run("load/ref", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			loadEdgesRef(&buf, &top, 0x01020304, flags)
 		}
 	})
-	b.Run("store/kernel", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			o := i & 63 * 16
-			storeMBRows(&buf, &top, cy[o:], cu[o/2:], cv[o/2:], ys, uvs)
-		}
+	eachReconLevel(false, func(level string) {
+		b.Run("store/"+level, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				o := i & 63 * 16
+				storeMBRows(&buf, &top, cy[o:], cu[o/2:], cv[o/2:], ys, uvs)
+			}
+		})
 	})
 	b.Run("store/ref", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
@@ -519,9 +573,11 @@ func FuzzRecon(f *testing.F) {
 		for i := range c.coeffs {
 			c.coeffs[i] = int16(uint16(at(24+yuvSize+2*i)) | uint16(at(25+yuvSize+2*i))<<8)
 		}
-		if !checkI4(t, &c) || !checkI16(t, &c) || !checkUV(t, &c) {
-			t.FailNow()
-		}
+		eachReconLevel(false, func(level string) {
+			if !checkI4(t, &c) || !checkI16(t, &c) || !checkUV(t, &c) {
+				t.Fatalf("level %s", level)
+			}
+		})
 	})
 }
 
@@ -573,37 +629,39 @@ func checkStoreRows(t *testing.T, r *rand.Rand, b *[yuvSize]byte, withTop bool, 
 }
 
 func TestReconEdgesAndStore(t *testing.T) {
-	r := rand.New(rand.NewPCG(9, 10))
-	var b [yuvSize]byte
-	var top topSamples
-	n := reconIters(t) / 10
-	for i := 0; i < n; i++ {
-		fillPixels(r, b[:])
-		fillPixels(r, top.y[:])
-		fillPixels(r, top.u[:])
-		fillPixels(r, top.v[:])
-		if !checkEdges(t, &b, &top, r.Uint32(), uint32(r.IntN(16))) {
-			t.Fatalf("iteration %d", i)
-		}
-		if i%8 == 0 {
-			ys, uvs := 16+r.IntN(200), 8+r.IntN(100)
-			if r.IntN(4) == 0 {
-				ys, uvs = 16, 8 // a single macroblock column
-			}
-			if !checkStoreRows(t, r, &b, r.IntN(2) == 0, ys, uvs) {
+	forEachReconLevel(t, func(t *testing.T) {
+		r := rand.New(rand.NewPCG(9, 10))
+		var b [yuvSize]byte
+		var top topSamples
+		n := reconIters(t) / 10
+		for i := 0; i < n; i++ {
+			fillPixels(r, b[:])
+			fillPixels(r, top.y[:])
+			fillPixels(r, top.u[:])
+			fillPixels(r, top.v[:])
+			if !checkEdges(t, &b, &top, r.Uint32(), uint32(r.IntN(16))) {
 				t.Fatalf("iteration %d", i)
 			}
+			if i%8 == 0 {
+				ys, uvs := 16+r.IntN(200), 8+r.IntN(100)
+				if r.IntN(4) == 0 {
+					ys, uvs = 16, 8 // a single macroblock column
+				}
+				if !checkStoreRows(t, r, &b, r.IntN(2) == 0, ys, uvs) {
+					t.Fatalf("iteration %d", i)
+				}
+			}
 		}
-	}
-	// Geometries the kernel does not take go to the reference (which may
-	// panic on overlapping rows; only the absence of a crash or of a
-	// mismatch matters here).
-	for _, g := range [][2]int{{0, 0}, {1, 1}, {15, 7}} {
-		func() {
-			defer func() { _ = recover() }()
-			checkStoreRows(t, r, &b, true, g[0], g[1])
-		}()
-	}
+		// Geometries the kernel does not take go to the reference (which
+		// may panic on overlapping rows; only the absence of a crash or of
+		// a mismatch matters here).
+		for _, g := range [][2]int{{0, 0}, {1, 1}, {15, 7}} {
+			func() {
+				defer func() { _ = recover() }()
+				checkStoreRows(t, r, &b, true, g[0], g[1])
+			}()
+		}
+	})
 }
 
 // FuzzReconGlue compares loadEdges and storeMBRows with the reference on
@@ -628,13 +686,15 @@ func FuzzReconGlue(f *testing.F) {
 			top.u[i], top.v[i] = at(5+3*i), at(6+5*i)
 		}
 		tr := uint32(at(3)) | uint32(at(4))<<8 | uint32(at(5))<<16 | uint32(at(6))<<24
-		if !checkEdges(t, &b, &top, tr, uint32(at(0))) {
-			t.FailNow()
-		}
-		r := rand.New(rand.NewPCG(uint64(at(1)), uint64(at(2))))
-		if !checkStoreRows(t, r, &b, at(0)&0x10 != 0, 16+int(at(1)), 8+int(at(2))) {
-			t.FailNow()
-		}
+		eachReconLevel(false, func(level string) {
+			if !checkEdges(t, &b, &top, tr, uint32(at(0))) {
+				t.Fatalf("level %s", level)
+			}
+			r := rand.New(rand.NewPCG(uint64(at(1)), uint64(at(2))))
+			if !checkStoreRows(t, r, &b, at(0)&0x10 != 0, 16+int(at(1)), 8+int(at(2))) {
+				t.Fatalf("level %s", level)
+			}
+		})
 	})
 }
 
@@ -663,40 +723,42 @@ func checkWHT(t *testing.T, in *[16]int16, out *[384]int16) bool {
 }
 
 func TestTransformWHT(t *testing.T) {
-	r := rand.New(rand.NewPCG(13, 14))
-	var in [16]int16
-	var out [384]int16
-	for i := range out {
-		out[i] = int16(r.Uint32())
-	}
-	step := 1
-	if testing.Short() {
-		step = 7
-	}
-	// Every value at every position (the others zero or extreme).
-	for pos := 0; pos < 16; pos++ {
-		for v := -32768; v < 32768; v += step {
-			in = [16]int16{}
-			if v&1 != 0 {
-				for k := range in {
-					in[k] = randCoeff(r, 3)
+	forEachReconKernel(t, func(t *testing.T) {
+		r := rand.New(rand.NewPCG(13, 14))
+		var in [16]int16
+		var out [384]int16
+		for i := range out {
+			out[i] = int16(r.Uint32())
+		}
+		step := 1
+		if testing.Short() {
+			step = 7
+		}
+		// Every value at every position (the others zero or extreme).
+		for pos := 0; pos < 16; pos++ {
+			for v := -32768; v < 32768; v += step {
+				in = [16]int16{}
+				if v&1 != 0 {
+					for k := range in {
+						in[k] = randCoeff(r, 3)
+					}
+				}
+				in[pos] = int16(v)
+				if !checkWHT(t, &in, &out) {
+					t.FailNow()
 				}
 			}
-			in[pos] = int16(v)
+		}
+		for i := 0; i < reconIters(t); i++ {
+			kind := r.IntN(5)
+			for k := range in {
+				in[k] = randCoeff(r, kind)
+			}
 			if !checkWHT(t, &in, &out) {
 				t.FailNow()
 			}
 		}
-	}
-	for i := 0; i < reconIters(t); i++ {
-		kind := r.IntN(5)
-		for k := range in {
-			in[k] = randCoeff(r, kind)
-		}
-		if !checkWHT(t, &in, &out) {
-			t.FailNow()
-		}
-	}
+	})
 }
 
 func FuzzTransformWHT(f *testing.F) {
@@ -713,19 +775,23 @@ func FuzzTransformWHT(f *testing.F) {
 		for i := range out {
 			out[i] = int16(i * 37)
 		}
-		if !checkWHT(t, &in, &out) {
-			t.FailNow()
-		}
+		eachReconLevel(false, func(level string) {
+			if !checkWHT(t, &in, &out) {
+				t.Fatalf("level %s", level)
+			}
+		})
 	})
 }
 
 func BenchmarkTransformWHT(b *testing.B) {
 	in := [16]int16{100, -20, 3, 0, 7, 1, -1, 0, 0, 0, 2, 0, -5, 0, 0, 1}
 	var out [384]int16
-	b.Run("kernel", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			transformWHT(&in, &out)
-		}
+	eachReconLevel(false, func(level string) {
+		b.Run(level, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				transformWHT(&in, &out)
+			}
+		})
 	})
 	b.Run("ref", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {

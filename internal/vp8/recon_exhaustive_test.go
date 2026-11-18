@@ -44,6 +44,10 @@ func sameUV(c *reconCase) bool {
 // positions either zero or extreme, over prediction levels that hit both
 // clipping bounds.
 func TestReconTransformCodesFullRange(t *testing.T) {
+	forEachReconKernel(t, testReconTransformCodesFullRange)
+}
+
+func testReconTransformCodesFullRange(t *testing.T) {
 	r := rand.New(rand.NewPCG(21, 22))
 	var c reconCase
 	step := 1
@@ -104,8 +108,19 @@ func TestReconTransformCodesFullRange(t *testing.T) {
 // range (where the kernels saturate before the final clip): every sign
 // pattern of extreme coefficients in a block (+32767 or -32768 at each of
 // the 16 positions; for the AC3 code, of in[0], in[1], in[4]), on the
-// prediction levels at both clipping bounds.
+// prediction levels at both clipping bounds. The same patterns at the
+// magnitudes around the bound of the x86 kernels' 16-bit transform (4095,
+// beyond which they fall back to the reference) test it where its
+// intermediate sums come closest to overflowing.
 func TestReconTransformSaturation(t *testing.T) {
+	forEachReconKernel(t, func(t *testing.T) {
+		for _, m := range [][2]int16{{32767, -32768}, {4096, -4096}, {4095, -4095}, {4094, -4094}, {2048, -2048}} {
+			testReconTransformSaturation(t, m[0], m[1])
+		}
+	})
+}
+
+func testReconTransformSaturation(t *testing.T, pos, neg int16) {
 	var c reconCase
 	step := 1
 	if testing.Short() {
@@ -116,9 +131,9 @@ func TestReconTransformSaturation(t *testing.T) {
 		for n := 0; n < 24; n++ {
 			q := p ^ n*0x1111 // a different pattern in each block
 			for k := 0; k < 16; k++ {
-				c.coeffs[n*16+k] = 32767
+				c.coeffs[n*16+k] = pos
 				if q>>k&1 != 0 {
-					c.coeffs[n*16+k] = -32768
+					c.coeffs[n*16+k] = neg
 				}
 			}
 		}
@@ -136,7 +151,7 @@ func TestReconTransformSaturation(t *testing.T) {
 				checkI4(t, &c)
 				checkI16(t, &c)
 				checkUV(t, &c)
-				t.Fatalf("pattern %#x bits %#x", p, bits)
+				t.Fatalf("magnitude %d/%d pattern %#x bits %#x", pos, neg, p, bits)
 			}
 		}
 	}
@@ -146,6 +161,10 @@ func TestReconTransformSaturation(t *testing.T) {
 // byte arithmetic in the kernel) for every (top, left, top-left) triple:
 // each call covers four top and four left samples of sub-block 0.
 func TestReconI4TrueMotionExhaustive(t *testing.T) {
+	forEachReconKernel(t, testReconI4TrueMotionExhaustive)
+}
+
+func testReconI4TrueMotionExhaustive(t *testing.T) {
 	var c reconCase
 	for k := range c.modes {
 		c.modes[k] = bTMPred
@@ -176,6 +195,10 @@ func TestReconI4TrueMotionExhaustive(t *testing.T) {
 // through VL: each call places one triple or pair at the start of the top
 // window of each of the four sub-blocks of the first row.
 func TestReconI4AverageExhaustive(t *testing.T) {
+	forEachReconKernel(t, testReconI4AverageExhaustive)
+}
+
+func testReconI4AverageExhaustive(t *testing.T) {
 	var c reconCase
 	const s0 = yOff - bps - 1 // top-left sample of sub-block 0
 	for k := range c.modes {
@@ -222,6 +245,10 @@ func TestReconI4AverageExhaustive(t *testing.T) {
 // for the 16x16 and chroma modes) on random buffers: out-of-range values
 // must select the reference's default predictor.
 func TestReconModeBoundaries(t *testing.T) {
+	forEachReconLevel(t, testReconModeBoundaries)
+}
+
+func testReconModeBoundaries(t *testing.T) {
 	r := rand.New(rand.NewPCG(23, 24))
 	var c reconCase
 	modes := []int{math.MinInt, math.MinInt32, -256, -1, math.MaxInt32, math.MaxInt}
@@ -244,6 +271,10 @@ func TestReconModeBoundaries(t *testing.T) {
 // every offset 0..15 from a 16-byte boundary, for every luma stride 16..80
 // and chroma stride 8..40, with guard bytes around each row cache.
 func TestStoreMBRowsUnaligned(t *testing.T) {
+	forEachReconLevel(t, testStoreMBRowsUnaligned)
+}
+
+func testStoreMBRowsUnaligned(t *testing.T) {
 	r := rand.New(rand.NewPCG(25, 26))
 	var b [yuvSize]byte
 	backing := func(n int) []byte {

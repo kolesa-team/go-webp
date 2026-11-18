@@ -37,6 +37,10 @@ func guardedBuf(t *testing.T, n int, atEnd bool) []byte {
 // sit against inaccessible pages on either side: an out-of-bounds read or
 // write in a kernel crashes the test.
 func TestReconGuardPages(t *testing.T) {
+	forEachReconLevel(t, testReconGuardPages)
+}
+
+func testReconGuardPages(t *testing.T) {
 	r := rand.New(rand.NewPCG(7, 8))
 	var c reconCase
 	for _, atEnd := range []bool{false, true} {
@@ -50,6 +54,12 @@ func TestReconGuardPages(t *testing.T) {
 		n := reconIters(t) / 20
 		for i := 0; i < n; i++ {
 			randReconCase(r, &c)
+			if i&1 == 0 {
+				// Within the range the x86 kernels transform themselves.
+				for k := range c.coeffs {
+					c.coeffs[k] %= 4096
+				}
+			}
 			*coeffs, *modes = c.coeffs, c.modes
 
 			*b = c.b
@@ -91,6 +101,10 @@ func TestReconGuardPages(t *testing.T) {
 // TestReconGlueGuardPages runs loadEdges and storeMBRows on buffers that
 // sit against inaccessible pages (cache rows sized exactly).
 func TestReconGlueGuardPages(t *testing.T) {
+	forEachReconLevel(t, testReconGlueGuardPages)
+}
+
+func testReconGlueGuardPages(t *testing.T) {
 	r := rand.New(rand.NewPCG(11, 12))
 	for _, atEnd := range []bool{false, true} {
 		bm := guardedBuf(t, yuvSize, atEnd)
