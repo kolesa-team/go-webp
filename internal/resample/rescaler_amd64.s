@@ -298,10 +298,11 @@ s1done:
 // one lane, the previous group's last one entering lane 0.
 //
 // Registers of both: DI frow, DX acc (nil: no accumulation), SI src, BX
-// records, CX records left, AX/R8/R9/R10 window offsets. X0 sums then
-// frow, X4 B, X6 fr, X7 carries out, X9 carries in, X11 previous carries
-// out, X12 xSub, X13 fx, X14 rnd31, X15 zero (Y for AVX2, where Y10 holds
-// rot1 and Y11 the previous carries out rotated).
+// records, CX records left, AX/R8/R9/R10 window offsets. X0-X3 windows,
+// then X0 sums and frow, X4 B, X5 scratch, X6 fr, X7 carries out, X8
+// scratch, X9 carries in, X10 acc, X11 previous carries out, X12 xSub,
+// X13 fx, X14 rnd31, X15 zero (Y for AVX2, where Y10 holds rot1 and Y11
+// the previous carries out rotated).
 
 // SH1_TAIL_SSE completes a group of 4 pixels from the sums (X0), B (X4)
 // and the record's na at na(BX); skip is a fresh label.
