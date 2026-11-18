@@ -4,8 +4,9 @@ package vp8
 
 import "github.com/kolesa-team/go-webp/v2/internal/cpuinfo"
 
-// SSE4.1 loop filters (filter_amd64.s), one call per macroblock, selected
-// by filterLevel.
+// SSE4.1 and AVX2 loop filters (filter_amd64.s), one call per macroblock,
+// selected by filterLevel. The simple filter has an SSE4.1 kernel only
+// (the AVX2 level uses it).
 
 // filterMBComplexSSE41 filters the edges of one macroblock selected by
 // flags (filterEdgeLeft, filterEdgeTop, filterEdgeInner) with the complex
@@ -16,6 +17,12 @@ import "github.com/kolesa-team/go-webp/v2/internal/cpuinfo"
 //
 //go:noescape
 func filterMBComplexSSE41(y, u, v *byte, yStride, uvStride, thrMB, thrIn, ilevel, hevThresh, flags int)
+
+// filterMBComplexAVX2 is filterMBComplexSSE41 filtering luma and chroma
+// together in the two lanes of ymm registers.
+//
+//go:noescape
+func filterMBComplexAVX2(y, u, v *byte, yStride, uvStride, thrMB, thrIn, ilevel, hevThresh, flags int)
 
 // filterMBSimpleSSE41 filters the luma edges selected by flags with the
 // simple filter; rows -2..15 and columns -2..15 must be accessible for the
@@ -69,5 +76,9 @@ func (d *decoder) filterMB(mbX, mbY int, f fInfo) {
 		d.filterMBGo(mbX, mbY, f)
 		return
 	}
-	filterMBComplexSSE41(&cy[yo], &cu[uvo], &cv[uvo], ys, uvs, limit+4, limit, int(f.ilevel), int(f.hevThresh), flags)
+	if filterLevel >= cpuinfo.AVX2 {
+		filterMBComplexAVX2(&cy[yo], &cu[uvo], &cv[uvo], ys, uvs, limit+4, limit, int(f.ilevel), int(f.hevThresh), flags)
+	} else {
+		filterMBComplexSSE41(&cy[yo], &cu[uvo], &cv[uvo], ys, uvs, limit+4, limit, int(f.ilevel), int(f.hevThresh), flags)
+	}
 }

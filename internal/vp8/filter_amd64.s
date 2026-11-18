@@ -479,6 +479,323 @@ GLOBL fT4x4<>(SB), RODATA|NOPTR, $32
 	PEXTRD $2, T0, (R9)(R8*2) \
 	PEXTRD $3, T0, (R9)(R11*1)
 
+// ---- AVX2 -----------------------------------------------------------------
+//
+// The AVX2 complex filter runs the same algorithm with VEX encodings
+// (three operands, no register copies) on ymm registers holding luma in
+// the low and chroma (U|V) in the high 128-bit lane, so that one pass
+// filters the same edge of all three planes: the left and top macroblock
+// edges and the first inner edge of each direction (column/row 4). The
+// other two inner luma edges use the low lane only (the high lane holds
+// don't-care values that are never stored). Every macro below is the
+// ymm counterpart of the SSE4.1 macro of the same name without _Y, on the
+// same register numbers; the frame holds 32-byte broadcast thresholds:
+// macroblock edge at 0(SP), inner edge at 32(SP), interior limit at
+// 64(SP), hev threshold at 96(SP).
+
+#define ABSDIFF_Y(A, B, D, T) \
+	VPSUBUSB B, A, D \
+	VPSUBUSB A, B, T \
+	VPOR T, D, D
+
+#define SSHR3_Y(X) \
+	VPXOR Y15, X, X \
+	VPSRLW $3, X, X \
+	VPAND fK1F<>(SB), X, X \
+	VPSUBB fK10<>(SB), X, X
+
+#define COMPLEX_MASK_Y(THROFF) \
+	ABSDIFF_Y(Y2, Y3, Y10, Y15) \
+	ABSDIFF_Y(Y5, Y4, Y11, Y15) \
+	VPMAXUB Y11, Y10, Y9 \
+	ABSDIFF_Y(Y0, Y1, Y12, Y15) \
+	VPMAXUB Y12, Y10, Y10 \
+	ABSDIFF_Y(Y1, Y2, Y12, Y15) \
+	VPMAXUB Y12, Y10, Y10 \
+	ABSDIFF_Y(Y7, Y6, Y12, Y15) \
+	VPMAXUB Y12, Y11, Y11 \
+	ABSDIFF_Y(Y6, Y5, Y12, Y15) \
+	VPMAXUB Y12, Y11, Y11 \
+	VPMAXUB Y11, Y10, Y10 \
+	VPSUBUSB 64(SP), Y10, Y10 \
+	ABSDIFF_Y(Y3, Y4, Y11, Y15) \
+	VPADDUSB Y11, Y11, Y11 \
+	ABSDIFF_Y(Y2, Y5, Y12, Y15) \
+	VPAND fKFE<>(SB), Y12, Y12 \
+	VPSRLW $1, Y12, Y12 \
+	VPADDUSB Y12, Y11, Y11 \
+	VPSUBUSB THROFF(SP), Y11, Y11 \
+	VPOR Y11, Y10, Y10 \
+	VPXOR Y8, Y8, Y8 \
+	VPCMPEQB Y8, Y10, Y8 \
+	VPSUBUSB 96(SP), Y9, Y9 \
+	VPXOR Y10, Y10, Y10 \
+	VPCMPEQB Y10, Y9, Y9
+
+#define UPDATE2_Y(P, Q) \
+	VPSRAW $7, Y12, Y14 \
+	VPSRAW $7, Y13, Y8 \
+	VPACKSSWB Y8, Y14, Y14 \
+	VPADDSB Y14, P, P \
+	VPSUBSB Y14, Q, Q
+
+#define FILTER6_Y \
+	VMOVDQU fK80<>(SB), Y15 \
+	VPXOR Y15, Y1, Y1 \
+	VPXOR Y15, Y2, Y2 \
+	VPXOR Y15, Y3, Y3 \
+	VPXOR Y15, Y4, Y4 \
+	VPXOR Y15, Y5, Y5 \
+	VPXOR Y15, Y6, Y6 \
+	VPSUBSB Y5, Y2, Y10 \
+	VPSUBSB Y3, Y4, Y11 \
+	VPADDSB Y11, Y10, Y10 \
+	VPADDSB Y11, Y10, Y10 \
+	VPADDSB Y11, Y10, Y10 \
+	VPANDN Y8, Y9, Y11 \
+	VPAND Y10, Y11, Y11 \
+	VPAND Y8, Y9, Y9 \
+	VPAND Y10, Y9, Y9 \
+	VPADDSB fK3<>(SB), Y11, Y12 \
+	SSHR3_Y(Y12) \
+	VPADDSB Y12, Y3, Y3 \
+	VPADDSB fK4<>(SB), Y11, Y11 \
+	SSHR3_Y(Y11) \
+	VPSUBSB Y11, Y4, Y4 \
+	VPXOR Y10, Y10, Y10 \
+	VPUNPCKHBW Y9, Y10, Y11 \
+	VPUNPCKLBW Y9, Y10, Y10 \
+	VPMULHW fK0900<>(SB), Y10, Y10 \
+	VPMULHW fK0900<>(SB), Y11, Y11 \
+	VPADDW fK63<>(SB), Y10, Y12 \
+	VPADDW fK63<>(SB), Y11, Y13 \
+	UPDATE2_Y(Y1, Y6) \
+	VPADDW Y10, Y12, Y12 \
+	VPADDW Y11, Y13, Y13 \
+	UPDATE2_Y(Y2, Y5) \
+	VPADDW Y10, Y12, Y12 \
+	VPADDW Y11, Y13, Y13 \
+	UPDATE2_Y(Y3, Y4) \
+	VPXOR Y15, Y1, Y1 \
+	VPXOR Y15, Y2, Y2 \
+	VPXOR Y15, Y3, Y3 \
+	VPXOR Y15, Y4, Y4 \
+	VPXOR Y15, Y5, Y5 \
+	VPXOR Y15, Y6, Y6
+
+#define FILTER4_Y \
+	VMOVDQU fK80<>(SB), Y15 \
+	VPXOR Y15, Y2, Y2 \
+	VPXOR Y15, Y3, Y3 \
+	VPXOR Y15, Y4, Y4 \
+	VPXOR Y15, Y5, Y5 \
+	VPSUBSB Y5, Y2, Y10 \
+	VPANDN Y10, Y9, Y11 \
+	VPSUBSB Y3, Y4, Y12 \
+	VPADDSB Y12, Y11, Y11 \
+	VPADDSB Y12, Y11, Y11 \
+	VPADDSB Y12, Y11, Y11 \
+	VPAND Y8, Y11, Y11 \
+	VPADDSB fK3<>(SB), Y11, Y12 \
+	SSHR3_Y(Y12) \
+	VPADDSB fK4<>(SB), Y11, Y11 \
+	SSHR3_Y(Y11) \
+	VPADDSB Y12, Y3, Y3 \
+	VPSUBSB Y11, Y4, Y4 \
+	VPXOR Y15, Y11, Y11 \
+	VPXOR Y12, Y12, Y12 \
+	VPAVGB Y12, Y11, Y11 \
+	VPSUBB fK40<>(SB), Y11, Y11 \
+	VPAND Y9, Y11, Y11 \
+	VPADDSB Y11, Y2, Y2 \
+	VPSUBSB Y11, Y5, Y5 \
+	VPXOR Y15, Y2, Y2 \
+	VPXOR Y15, Y3, Y3 \
+	VPXOR Y15, Y4, Y4 \
+	VPXOR Y15, Y5, Y5
+
+// TRANSPOSE8_Y transposes the two 8x8 byte blocks of each lane of Y0-Y7
+// in place (TRANSPOSE8 on both lanes at once). Clobbers Y8-Y11.
+#define TRANSPOSE8_Y \
+	VPUNPCKHBW Y1, Y0, Y8 \
+	VPUNPCKLBW Y1, Y0, Y0 \
+	VPUNPCKHBW Y3, Y2, Y9 \
+	VPUNPCKLBW Y3, Y2, Y2 \
+	VPUNPCKHBW Y5, Y4, Y10 \
+	VPUNPCKLBW Y5, Y4, Y4 \
+	VPUNPCKHBW Y7, Y6, Y11 \
+	VPUNPCKLBW Y7, Y6, Y6 \
+	VPUNPCKHWD Y2, Y0, Y1 \
+	VPUNPCKLWD Y2, Y0, Y0 \
+	VPUNPCKHWD Y9, Y8, Y3 \
+	VPUNPCKLWD Y9, Y8, Y8 \
+	VPUNPCKHWD Y6, Y4, Y5 \
+	VPUNPCKLWD Y6, Y4, Y4 \
+	VPUNPCKHWD Y11, Y10, Y7 \
+	VPUNPCKLWD Y11, Y10, Y10 \
+	VPUNPCKHDQ Y4, Y0, Y2 \
+	VPUNPCKLDQ Y4, Y0, Y0 \
+	VPUNPCKHDQ Y5, Y1, Y6 \
+	VPUNPCKLDQ Y5, Y1, Y1 \
+	VPUNPCKHDQ Y10, Y8, Y9 \
+	VPUNPCKLDQ Y10, Y8, Y8 \
+	VPUNPCKHDQ Y7, Y3, Y11 \
+	VPUNPCKLDQ Y7, Y3, Y3 \
+	VPUNPCKLQDQ Y3, Y1, Y4 \
+	VPUNPCKHQDQ Y3, Y1, Y5 \
+	VPUNPCKHQDQ Y8, Y0, Y1 \
+	VPUNPCKLQDQ Y8, Y0, Y0 \
+	VPUNPCKHQDQ Y9, Y2, Y3 \
+	VPUNPCKLQDQ Y9, Y2, Y2 \
+	VPUNPCKHQDQ Y11, Y6, Y7 \
+	VPUNPCKLQDQ Y11, Y6, Y6
+
+// LROW8_YC(YR, XR, AL, BL, AC, BC) loads 8 bytes of luma at AL (low half)
+// and BL (high half) into the low lane of YR, and 8 bytes of U at AC and
+// of V at BC into its high lane. Clobbers X8.
+#define LROW8_YC(YR, XR, AL, BL, AC, BC) \
+	VMOVQ AL, XR \
+	VMOVHPS BL, XR, XR \
+	VMOVQ AC, X8 \
+	VMOVHPS BC, X8, X8 \
+	VINSERTI128 $1, X8, YR, YR
+
+// SROW8_YC is the reverse of LROW8_YC. Clobbers X8.
+#define SROW8_YC(YR, XR, AL, BL, AC, BC) \
+	VMOVQ XR, AL \
+	VMOVHPS XR, BL \
+	VEXTRACTI128 $1, YR, X8 \
+	VMOVQ X8, AC \
+	VMOVHPS X8, BC
+
+// LOAD8T_YC(PA, PB, PU, PV) is LOAD8T for luma (rows 0-7 at PA, 8-15 at
+// PB, stride R8, R11 = 3*R8) in the low lane and chroma (8 rows of U at
+// PU and of V at PV, stride R12, R13 = 3*R12) in the high lane. Advances
+// the four pointers by 4 rows. Clobbers Y8-Y11.
+#define LOAD8T_YC(PA, PB, PU, PV) \
+	LROW8_YC(Y0, X0, (PA), (PB), (PU), (PV)) \
+	LROW8_YC(Y1, X1, (PA)(R8*1), (PB)(R8*1), (PU)(R12*1), (PV)(R12*1)) \
+	LROW8_YC(Y2, X2, (PA)(R8*2), (PB)(R8*2), (PU)(R12*2), (PV)(R12*2)) \
+	LROW8_YC(Y3, X3, (PA)(R11*1), (PB)(R11*1), (PU)(R13*1), (PV)(R13*1)) \
+	LEAQ (PA)(R8*4), PA \
+	LEAQ (PB)(R8*4), PB \
+	LEAQ (PU)(R12*4), PU \
+	LEAQ (PV)(R12*4), PV \
+	LROW8_YC(Y4, X4, (PA), (PB), (PU), (PV)) \
+	LROW8_YC(Y5, X5, (PA)(R8*1), (PB)(R8*1), (PU)(R12*1), (PV)(R12*1)) \
+	LROW8_YC(Y6, X6, (PA)(R8*2), (PB)(R8*2), (PU)(R12*2), (PV)(R12*2)) \
+	LROW8_YC(Y7, X7, (PA)(R11*1), (PB)(R11*1), (PU)(R13*1), (PV)(R13*1)) \
+	TRANSPOSE8_Y
+
+// STORE8T_YC is the reverse of LOAD8T_YC (same pointers, advanced by 4
+// rows). Clobbers Y8-Y11.
+#define STORE8T_YC(PA, PB, PU, PV) \
+	TRANSPOSE8_Y \
+	SROW8_YC(Y0, X0, (PA), (PB), (PU), (PV)) \
+	SROW8_YC(Y1, X1, (PA)(R8*1), (PB)(R8*1), (PU)(R12*1), (PV)(R12*1)) \
+	SROW8_YC(Y2, X2, (PA)(R8*2), (PB)(R8*2), (PU)(R12*2), (PV)(R12*2)) \
+	SROW8_YC(Y3, X3, (PA)(R11*1), (PB)(R11*1), (PU)(R13*1), (PV)(R13*1)) \
+	LEAQ (PA)(R8*4), PA \
+	LEAQ (PB)(R8*4), PB \
+	LEAQ (PU)(R12*4), PU \
+	LEAQ (PV)(R12*4), PV \
+	SROW8_YC(Y4, X4, (PA), (PB), (PU), (PV)) \
+	SROW8_YC(Y5, X5, (PA)(R8*1), (PB)(R8*1), (PU)(R12*1), (PV)(R12*1)) \
+	SROW8_YC(Y6, X6, (PA)(R8*2), (PB)(R8*2), (PU)(R12*2), (PV)(R12*2)) \
+	SROW8_YC(Y7, X7, (PA)(R11*1), (PB)(R11*1), (PU)(R13*1), (PV)(R13*1))
+
+// LROW16_YC(YR, XR, AL, AC, BC) loads a 16-byte luma row at AL into the
+// low lane of YR and the 8-byte U and V rows at AC and BC into its high
+// lane; SROW16_YC stores them back. Both clobber X8.
+#define LROW16_YC(YR, XR, AL, AC, BC) \
+	VMOVDQU AL, XR \
+	VMOVQ AC, X8 \
+	VMOVHPS BC, X8, X8 \
+	VINSERTI128 $1, X8, YR, YR
+
+#define SROW16_YC(YR, XR, AL, AC, BC) \
+	VMOVDQU XR, AL \
+	VEXTRACTI128 $1, YR, X8 \
+	VMOVQ X8, AC \
+	VMOVHPS X8, BC
+
+// LOAD4T_V and STORE4T_V are LOAD4T and STORE4T with VEX encodings, on
+// xmm registers (low lane). STORE4T_V keeps S2 and S3 and clobbers S0,
+// S1 and T0-T3.
+#define LOAD4T_V(PA, PB, D0, D1, D2, D3, T0, T1) \
+	VMOVD (PA), D0 \
+	VPINSRD $1, (PA)(R8*1), D0, D0 \
+	VPINSRD $2, (PA)(R8*2), D0, D0 \
+	VPINSRD $3, (PA)(R11*1), D0, D0 \
+	LEAQ (PA)(R8*4), R9 \
+	VMOVD (R9), D1 \
+	VPINSRD $1, (R9)(R8*1), D1, D1 \
+	VPINSRD $2, (R9)(R8*2), D1, D1 \
+	VPINSRD $3, (R9)(R11*1), D1, D1 \
+	VMOVD (PB), D2 \
+	VPINSRD $1, (PB)(R8*1), D2, D2 \
+	VPINSRD $2, (PB)(R8*2), D2, D2 \
+	VPINSRD $3, (PB)(R11*1), D2, D2 \
+	LEAQ (PB)(R8*4), R9 \
+	VMOVD (R9), D3 \
+	VPINSRD $1, (R9)(R8*1), D3, D3 \
+	VPINSRD $2, (R9)(R8*2), D3, D3 \
+	VPINSRD $3, (R9)(R11*1), D3, D3 \
+	VPSHUFB fT4x4<>(SB), D0, D0 \
+	VPSHUFB fT4x4<>(SB), D1, D1 \
+	VPSHUFB fT4x4<>(SB), D2, D2 \
+	VPSHUFB fT4x4<>(SB), D3, D3 \
+	VPUNPCKHDQ D1, D0, T0 \
+	VPUNPCKLDQ D1, D0, D0 \
+	VPUNPCKHDQ D3, D2, T1 \
+	VPUNPCKLDQ D3, D2, D2 \
+	VPUNPCKHQDQ D2, D0, D1 \
+	VPUNPCKLQDQ D2, D0, D0 \
+	VPUNPCKLQDQ T1, T0, D2 \
+	VPUNPCKHQDQ T1, T0, D3
+
+#define STORE4T_V(PA, PB, S0, S1, S2, S3, T0, T1, T2, T3) \
+	VPUNPCKLQDQ S1, S0, T0 \
+	VPUNPCKHQDQ S1, S0, T1 \
+	VPUNPCKLQDQ S3, S2, S0 \
+	VPUNPCKHQDQ S3, S2, S1 \
+	VSHUFPS $0x88, S0, T0, T2 \
+	VSHUFPS $0xDD, S0, T0, T3 \
+	VSHUFPS $0x88, S1, T1, T0 \
+	VSHUFPS $0xDD, S1, T1, T1 \
+	VPSHUFB fT4x4<>(SB), T2, T2 \
+	VPSHUFB fT4x4<>(SB), T3, T3 \
+	VPSHUFB fT4x4<>(SB), T0, T0 \
+	VPSHUFB fT4x4<>(SB), T1, T1 \
+	VMOVD T2, (PA) \
+	VPEXTRD $1, T2, (PA)(R8*1) \
+	VPEXTRD $2, T2, (PA)(R8*2) \
+	VPEXTRD $3, T2, (PA)(R11*1) \
+	LEAQ (PA)(R8*4), R9 \
+	VMOVD T3, (R9) \
+	VPEXTRD $1, T3, (R9)(R8*1) \
+	VPEXTRD $2, T3, (R9)(R8*2) \
+	VPEXTRD $3, T3, (R9)(R11*1) \
+	VMOVD T0, (PB) \
+	VPEXTRD $1, T0, (PB)(R8*1) \
+	VPEXTRD $2, T0, (PB)(R8*2) \
+	VPEXTRD $3, T0, (PB)(R11*1) \
+	LEAQ (PB)(R8*4), R9 \
+	VMOVD T1, (R9) \
+	VPEXTRD $1, T1, (R9)(R8*1) \
+	VPEXTRD $2, T1, (R9)(R8*2) \
+	VPEXTRD $3, T1, (R9)(R11*1)
+
+// ---- SSE4.1 and AVX2 kernels ----------------------------------------------
+
+// BCAST_Y(SRC, OFF) broadcasts the low byte of the argument SRC to the 32
+// bytes at OFF(SP). Clobbers R9, Y0.
+#define BCAST_Y(SRC, OFF) \
+	MOVQ SRC, R9 \
+	VMOVD R9, X0 \
+	VPBROADCASTB X0, Y0 \
+	VMOVDQU Y0, OFF(SP)
+
 // BCAST(SRC, OFF) broadcasts the low byte of the argument SRC to the 16
 // bytes at OFF(SP) (X15 must be zero).
 #define BCAST(SRC, OFF) \
@@ -798,4 +1115,174 @@ shloop:
 	JMP shloop
 
 sdone:
+	RET
+
+// func filterMBComplexAVX2(y, u, v *byte, yStride, uvStride, thrMB, thrIn, ilevel, hevThresh, flags int)
+//
+// filterMBComplexSSE41 with luma and chroma filtered together where their
+// edges coincide (see the AVX2 section comment), in libwebp's DoFilter
+// order per plane: left edge (luma+chroma), inner vertical edges (column 4
+// of luma+chroma, then luma columns 8 and 12 rolling 4-column loads), top
+// edge (luma+chroma), inner horizontal edges (row 4 of luma+chroma, then
+// luma rows 8 and 12). Same arguments and memory requirements.
+//
+// GPRs: AX y, BX u, CX v, R8/R11 luma stride and 3*stride, R12/R13 chroma
+// stride and 3*stride, R10 flags, DI/DX luma pointers, SI/R9 chroma
+// pointers (R9 is also LOAD4T_V/STORE4T_V scratch), BP is not used.
+TEXT ·filterMBComplexAVX2(SB), NOSPLIT, $128-80
+	BCAST_Y(thrMB+40(FP), 0)
+	BCAST_Y(thrIn+48(FP), 32)
+	BCAST_Y(ilevel+56(FP), 64)
+	BCAST_Y(hevThresh+64(FP), 96)
+	MOVQ y+0(FP), AX
+	MOVQ u+8(FP), BX
+	MOVQ v+16(FP), CX
+	MOVQ yStride+24(FP), R8
+	LEAQ (R8)(R8*2), R11
+	MOVQ uvStride+32(FP), R12
+	LEAQ (R12)(R12*2), R13
+	MOVQ flags+72(FP), R10
+
+	TESTQ $1, R10
+	JZ anoleft
+	// left edge: luma columns -4..3 of rows 0-15, chroma columns -4..3
+	LEAQ -4(AX), DI
+	LEAQ (DI)(R8*8), DX
+	LEAQ -4(BX), SI
+	LEAQ -4(CX), R9
+	LOAD8T_YC(DI, DX, SI, R9)
+	COMPLEX_MASK_Y(0)
+	FILTER6_Y
+	LEAQ -4(AX), DI
+	LEAQ (DI)(R8*8), DX
+	LEAQ -4(BX), SI
+	LEAQ -4(CX), R9
+	STORE8T_YC(DI, DX, SI, R9)
+
+anoleft:
+	TESTQ $4, R10
+	JZ anoinnerv
+	// inner vertical edge at column 4 of luma and chroma: columns 0..7
+	MOVQ AX, DI
+	LEAQ (AX)(R8*8), DX
+	MOVQ BX, SI
+	MOVQ CX, R9
+	LOAD8T_YC(DI, DX, SI, R9)
+	COMPLEX_MASK_Y(32)
+	FILTER4_Y
+	VMOVDQA X4, X12
+	VMOVDQA X5, X13
+	VMOVDQA X6, X14
+	VMOVDQA X7, X15
+	MOVQ AX, DI
+	LEAQ (AX)(R8*8), DX
+	MOVQ BX, SI
+	MOVQ CX, R9
+	STORE8T_YC(DI, DX, SI, R9)
+	// luma columns 8 and 12: p3..p0 = the luma columns 4..7 just filtered
+	VMOVDQA X12, X0
+	VMOVDQA X13, X1
+	VMOVDQA X14, X2
+	VMOVDQA X15, X3
+	LEAQ 4(AX), DI
+	LEAQ (DI)(R8*8), DX
+	MOVQ $2, SI
+
+ahinner:
+	ADDQ $4, DI
+	ADDQ $4, DX
+	LOAD4T_V(DI, DX, X4, X5, X6, X7, X8, X9)
+	COMPLEX_MASK_Y(32)
+	FILTER4_Y
+	SUBQ $2, DI
+	SUBQ $2, DX
+	STORE4T_V(DI, DX, X2, X3, X4, X5, X8, X9, X10, X11)
+	ADDQ $2, DI
+	ADDQ $2, DX
+	VMOVDQA X4, X0
+	VMOVDQA X5, X1
+	VMOVDQA X6, X2
+	VMOVDQA X7, X3
+	DECQ SI
+	JNZ ahinner
+
+anoinnerv:
+	TESTQ $2, R10
+	JZ anotop
+	// top edge: rows -4..3 of luma and chroma
+	MOVQ R8, R9
+	SHLQ $2, R9
+	MOVQ AX, DI
+	SUBQ R9, DI
+	MOVQ R12, R9
+	SHLQ $2, R9
+	MOVQ BX, SI
+	SUBQ R9, SI
+	MOVQ CX, DX
+	SUBQ R9, DX
+	LROW16_YC(Y0, X0, (DI), (SI), (DX))
+	LROW16_YC(Y1, X1, (DI)(R8*1), (SI)(R12*1), (DX)(R12*1))
+	LROW16_YC(Y2, X2, (DI)(R8*2), (SI)(R12*2), (DX)(R12*2))
+	LROW16_YC(Y3, X3, (DI)(R11*1), (SI)(R13*1), (DX)(R13*1))
+	LROW16_YC(Y4, X4, (AX), (BX), (CX))
+	LROW16_YC(Y5, X5, (AX)(R8*1), (BX)(R12*1), (CX)(R12*1))
+	LROW16_YC(Y6, X6, (AX)(R8*2), (BX)(R12*2), (CX)(R12*2))
+	LROW16_YC(Y7, X7, (AX)(R11*1), (BX)(R13*1), (CX)(R13*1))
+	COMPLEX_MASK_Y(0)
+	FILTER6_Y
+	SROW16_YC(Y1, X1, (DI)(R8*1), (SI)(R12*1), (DX)(R12*1))
+	SROW16_YC(Y2, X2, (DI)(R8*2), (SI)(R12*2), (DX)(R12*2))
+	SROW16_YC(Y3, X3, (DI)(R11*1), (SI)(R13*1), (DX)(R13*1))
+	SROW16_YC(Y4, X4, (AX), (BX), (CX))
+	SROW16_YC(Y5, X5, (AX)(R8*1), (BX)(R12*1), (CX)(R12*1))
+	SROW16_YC(Y6, X6, (AX)(R8*2), (BX)(R12*2), (CX)(R12*2))
+
+anotop:
+	TESTQ $4, R10
+	JZ adone
+	// inner horizontal edge at row 4 of luma and chroma: rows 0..7
+	LROW16_YC(Y0, X0, (AX), (BX), (CX))
+	LROW16_YC(Y1, X1, (AX)(R8*1), (BX)(R12*1), (CX)(R12*1))
+	LROW16_YC(Y2, X2, (AX)(R8*2), (BX)(R12*2), (CX)(R12*2))
+	LROW16_YC(Y3, X3, (AX)(R11*1), (BX)(R13*1), (CX)(R13*1))
+	LEAQ (AX)(R8*4), DI
+	LEAQ (BX)(R12*4), SI
+	LEAQ (CX)(R12*4), DX
+	LROW16_YC(Y4, X4, (DI), (SI), (DX))
+	LROW16_YC(Y5, X5, (DI)(R8*1), (SI)(R12*1), (DX)(R12*1))
+	LROW16_YC(Y6, X6, (DI)(R8*2), (SI)(R12*2), (DX)(R12*2))
+	LROW16_YC(Y7, X7, (DI)(R11*1), (SI)(R13*1), (DX)(R13*1))
+	COMPLEX_MASK_Y(32)
+	FILTER4_Y
+	SROW16_YC(Y2, X2, (AX)(R8*2), (BX)(R12*2), (CX)(R12*2))
+	SROW16_YC(Y3, X3, (AX)(R11*1), (BX)(R13*1), (CX)(R13*1))
+	SROW16_YC(Y4, X4, (DI), (SI), (DX))
+	SROW16_YC(Y5, X5, (DI)(R8*1), (SI)(R12*1), (DX)(R12*1))
+	// luma rows 8 and 12, rolling: p3..p0 = rows 4..7 just filtered
+	MOVQ $2, SI
+
+avinner:
+	VMOVDQA X4, X0
+	VMOVDQA X5, X1
+	VMOVDQA X6, X2
+	VMOVDQA X7, X3
+	LEAQ (DI)(R8*4), DI
+	VMOVDQU (DI), X4
+	VMOVDQU (DI)(R8*1), X5
+	VMOVDQU (DI)(R8*2), X6
+	VMOVDQU (DI)(R11*1), X7
+	COMPLEX_MASK_Y(32)
+	FILTER4_Y
+	MOVQ DI, DX
+	SUBQ R8, DX
+	VMOVDQU X3, (DX)
+	SUBQ R8, DX
+	VMOVDQU X2, (DX)
+	VMOVDQU X4, (DI)
+	VMOVDQU X5, (DI)(R8*1)
+	DECQ SI
+	JNZ avinner
+
+adone:
+	VZEROUPPER
 	RET
