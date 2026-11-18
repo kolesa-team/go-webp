@@ -82,6 +82,7 @@ type decoder struct {
 	out      int
 	sink     pipeline.Sink
 	alpha    []byte
+	alphaRow int // the frame row alpha[0] holds (AlphaDecoder.DecodeRowsAt)
 	width    int // final image width
 	height   int
 	xsize    int // level-0 coded width (after color-index bundling)
@@ -349,6 +350,14 @@ func (a *AlphaDecoder) Rows() int { return a.rows }
 // longer copy of the previous buffer). After an error every call returns
 // that error.
 func (a *AlphaDecoder) DecodeRows(dst []byte, upTo int) error {
+	return a.DecodeRowsAt(dst, 0, upTo)
+}
+
+// DecodeRowsAt is DecodeRows into a window of the plane: dst holds the rows
+// [first, upTo) (stride width), first <= Rows(), and only the rows
+// [Rows(), upTo) are written. The rows before first are not needed, so a
+// caller may keep a few rows of the plane at a time.
+func (a *AlphaDecoder) DecodeRowsAt(dst []byte, first, upTo int) error {
 	if a.err != nil {
 		return a.err
 	}
@@ -360,10 +369,11 @@ func (a *AlphaDecoder) DecodeRows(dst []byte, upTo int) error {
 	if upTo <= a.rows {
 		return nil
 	}
-	if len(dst) < upTo*d.width {
+	if first < 0 || first > a.rows || len(dst) < (upTo-first)*d.width {
 		return status.InvalidParam("vp8l: alpha buffer too small")
 	}
 	d.alpha = dst
+	d.alphaRow = first
 	d.needRows = upTo
 	var err error
 	if d.use8b {

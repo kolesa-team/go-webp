@@ -72,7 +72,10 @@ type Config struct {
 	// Encode calls:
 	//   - lossy pictures of at least 1024 macroblocks (about 512x512):
 	//     one helper reconstructs, filters and emits batches of macroblock
-	//     rows while the calling goroutine parses the next ones;
+	//     rows while the calling goroutine parses the next ones, and parses
+	//     the prediction modes ahead when it has nothing else to do; when
+	//     that helper is the slower stage, a second one takes over the
+	//     conversion to RGBA;
 	//   - lossy pictures with alpha whose alpha rows down to the bottom of
 	//     the output region hold 256K pixels or more: another helper
 	//     decodes the alpha plane ahead of the rows that need it;
