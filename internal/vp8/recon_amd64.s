@@ -35,14 +35,15 @@
 // The work buffer b (*[yuvSize]byte, stride const_bps) holds the luma block
 // at const_yOff and the chroma blocks at const_uOff/const_vOff, each with
 // its top row (and top-left/top-right samples) and left column of context.
-// The kernels write only what the Go reference writes, and read only what it
-// reads plus these over-reads, which stay inside b: the 4x4 kernels load the
-// 16 bytes from column -1 of the row above sub-blocks of the first row
-// (columns -1..26 of row -1). coeffs (*[384]int16) is read in whole 32-byte
-// blocks, modes (*[16]uint8) and top (*topSamples) element by element, and
-// the row cache only within the bounds the Go wrapper checked.
-// TestReconGuardPages and TestReconGlueGuardPages check this with every
-// buffer placed against inaccessible pages.
+// The kernels read and write in b only bytes the Go reference reads and
+// writes. A kernel that returns false may already have written pixels of
+// the block; the reference then recomputes every one of them from context
+// (the row above, the left column, the top-right samples) that no kernel
+// writes. coeffs
+// (*[384]int16) is read in whole 32-byte blocks, modes (*[16]uint8) and top
+// (*topSamples) element by element, and the row cache only within the bounds
+// the Go wrapper checked. TestReconGuardPages and TestReconGlueGuardPages
+// check this with every buffer placed against inaccessible pages.
 //
 // Register conventions: R14/R15 and BP are never touched; the AVX2 kernels
 // end with VZEROUPPER on every path. Functions with a frame keep their

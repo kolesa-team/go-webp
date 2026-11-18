@@ -549,11 +549,12 @@ func BenchmarkReconGlue(b *testing.B) {
 // FuzzRecon compares the reconstruction entry points with the reference on
 // arbitrary work buffers, coefficients, non-zero bits and modes. The input
 // bytes seed the buffers (repeated as needed); the first bytes pick the
-// bits and modes.
+// bits and modes, and byte 23 whether the coefficients are cut to 13 bits.
 func FuzzRecon(f *testing.F) {
 	f.Add([]byte{0})
 	f.Add([]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 0x80, 0x7f})
 	f.Add(bytes.Repeat([]byte{0x00, 0x80, 0xff, 0x7f, 0x01}, 300))
+	f.Add(append(bytes.Repeat([]byte{0xff, 0x01, 0x30}, 8)[:23], 1, 0x10, 0xf0, 0x7f, 0x80))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		if len(data) == 0 {
 			return
@@ -572,6 +573,11 @@ func FuzzRecon(f *testing.F) {
 		}
 		for i := range c.coeffs {
 			c.coeffs[i] = int16(uint16(at(24+yuvSize+2*i)) | uint16(at(25+yuvSize+2*i))<<8)
+			if at(23)&1 != 0 {
+				// Within [-4096, 4095], mostly the range the x86 kernels
+				// transform without falling back to the reference.
+				c.coeffs[i] = c.coeffs[i] << 3 >> 3
+			}
 		}
 		eachReconLevel(false, func(level string) {
 			if !checkI4(t, &c) || !checkI16(t, &c) || !checkUV(t, &c) {
