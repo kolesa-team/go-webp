@@ -6,6 +6,7 @@ import (
 	"image"
 	"testing"
 
+	"github.com/kolesa-team/go-webp/v2/internal/cpuinfo"
 	"github.com/kolesa-team/go-webp/v2/internal/vp8l"
 )
 
@@ -85,5 +86,16 @@ func FuzzEncode(f *testing.F) {
 		if !bytes.Equal(got, plane) {
 			t.Fatal("alpha plane does not decode to the source")
 		}
+		// Every kernel level (dsp_amd64.go) gives the same bytes.
+		atEveryLevel(func(l cpuinfo.Level) {
+			o, err := Encode(img, cfg)
+			if err != nil || !bytes.Equal(o, out) {
+				t.Fatalf("level %v %+v: output differs from the default level's (%v)", l, *cfg, err)
+			}
+			a, err := EncodeAlpha(plane, w, h, w, method, quality)
+			if err != nil || !bytes.Equal(a, stream) {
+				t.Fatalf("level %v: alpha stream differs from the default level's (%v)", l, err)
+			}
+		})
 	})
 }

@@ -1,5 +1,6 @@
 //go:build amd64 && !purego
 
+#include "go_asm.h"
 #include "textflag.h"
 
 // SSE4.1 and AVX2 kernels of the lossless encoder (see dsp_amd64.go for
@@ -485,3 +486,366 @@ avx_m13: // clamp(a + (a - TL) / 2), a = avg(L, T)
 avx_done:
 	VZEROUPPER
 	RET
+
+// ---------------------------------------------------------------------------
+// Entropy helpers. They keep the floating-point operations of the Go code,
+// in its order, so that the results are bit-identical: only the integer
+// bookkeeping (which bins to visit) changes.
+
+// SLOG2_SLOW sets X2 to slog2Slow(AX) (AX >= 4096, zero-extended):
+// float64(v) * (log2Tab[m] + float64(shift) + float64(rem) /
+// (float64(m) * Ln2 * float64(1<<shift))) with shift = Len32(v) - 12,
+// m = v >> shift, rem = v & (1<<shift - 1), as entropy.go evaluates it.
+// Clobbers CX, R9, R13, X3, X4, X5; X14 holds Ln2.
+#define SLOG2_SLOW \
+	BSRL     AX, CX;             \
+	SUBL     $11, CX;            \
+	MOVL     AX, R13;            \
+	SHRL     CX, R13;            \
+	MOVL     $1, R9;             \
+	SHLL     CX, R9;             \
+	DECL     R9;                 \
+	ANDL     AX, R9;             \
+	CVTSQ2SD R9, X3;             \
+	CVTSQ2SD R13, X4;            \
+	MULSD    X14, X4;            \
+	MOVL     $1, R9;             \
+	SHLQ     CX, R9;             \
+	CVTSQ2SD R9, X5;             \
+	MULSD    X5, X4;             \
+	DIVSD    X4, X3;             \
+	LEAQ     ·log2Tab(SB), R9;   \
+	MOVSD    (R9)(R13*8), X2;    \
+	CVTSQ2SD CX, X5;             \
+	ADDSD    X5, X2;             \
+	ADDSD    X3, X2;             \
+	CVTSQ2SD AX, X5;             \
+	MULSD    X5, X2
+
+// SLOG2 sets X2 to slog2(AX) (R8 = &slog2Tab), through slow (which jumps
+// back to back) for AX >= 4096.
+#define SLOG2(slow, back) \
+	CMPL  AX, $4096;      \
+	JAE   slow;           \
+	MOVSD (R8)(AX*8), X2; \
+back:
+
+// ZEROMASK16 ORs into R12, at bit sh, the mask of the zero bins among the
+// 16 int32 at off(AX): the bins are packed with signed saturation to bytes
+// (a bin is zero iff its byte is), compared with 0 (X15) and PMOVMSKB'd.
+#define ZEROMASK16(off, sh) \
+	MOVOU    off(AX), X1;      \
+	MOVOU    off+16(AX), X2;   \
+	MOVOU    off+32(AX), X3;   \
+	MOVOU    off+48(AX), X4;   \
+	PACKSSLW X2, X1;           \
+	PACKSSLW X4, X3;           \
+	PACKSSWB X3, X1;           \
+	PCMPEQB  X15, X1;          \
+	PMOVMSKB X1, R13;          \
+	SHLQ     $sh, R13;         \
+	ORQ      R13, R12
+
+// func combinedShannonEntropySSE41(x, y *[256]int32, acc *accEntropy) float64
+//
+// combinedShannonEntropyGo (libwebp CombinedShannonEntropy_SSE2/_AVX2 use
+// the same bit-mask walk): for each chunk of 64 bins, a mask of the
+// non-zero bins of x, then for each set bit i (BSF, clear lowest):
+// sumX += x[i]; r += (acc.s[i] - slog2(x[i])) - slog2(x[i]+y[i]).
+// SI = x, DI = y, DX = acc, R8 = &slog2Tab, R10 = sumX, R11 = chunk base,
+// R12 = mask, BX = bin, X0 = r, X14 = Ln2, X15 = 0.
+TEXT ·combinedShannonEntropySSE41(SB), NOSPLIT, $0-32
+	MOVQ  x+0(FP), SI
+	MOVQ  y+8(FP), DI
+	MOVQ  acc+16(FP), DX
+	LEAQ  ·slog2Tab(SB), R8
+	MOVQ  $0x3fe62e42fefa39ef, AX // math.Ln2
+	MOVQ  AX, X14
+	PXOR  X15, X15
+	MOVQ  $0x8000000000000000, AX
+	MOVQ  AX, X1
+	MOVSD accEntropy_total(DX), X0
+	XORPD X1, X0                 // r = -acc.total
+	XORL  R10, R10
+	XORL  R11, R11
+
+cse_chunk:
+	LEAQ (SI)(R11*4), AX
+	XORL R12, R12
+	ZEROMASK16(0, 0)
+	ZEROMASK16(64, 16)
+	ZEROMASK16(128, 32)
+	ZEROMASK16(192, 48)
+	NOTQ R12
+
+cse_bin:
+	TESTQ R12, R12
+	JZ    cse_next
+	BSFQ  R12, BX
+	LEAQ  -1(R12), AX
+	ANDQ  AX, R12
+	ADDQ  R11, BX
+	MOVL  (SI)(BX*4), AX
+	ADDL  AX, R10
+	MOVSD accEntropy_s(DX)(BX*8), X1
+	SLOG2(cse_slow1, cse_back1)
+	SUBSD X2, X1
+	ADDL  (DI)(BX*4), AX
+	SLOG2(cse_slow2, cse_back2)
+	SUBSD X2, X1
+	ADDSD X1, X0
+	JMP   cse_bin
+
+cse_next:
+	ADDQ $64, R11
+	CMPQ R11, $256
+	JB   cse_chunk
+	MOVL R10, AX
+	SLOG2(cse_slow3, cse_back3)
+	ADDSD X2, X0
+	MOVL  R10, AX
+	ADDL  accEntropy_sum(DX), AX
+	SLOG2(cse_slow4, cse_back4)
+	ADDSD X2, X0
+	MOVSD X0, ret+24(FP)
+	RET
+
+cse_slow1:
+	SLOG2_SLOW
+	JMP cse_back1
+
+cse_slow2:
+	SLOG2_SLOW
+	JMP cse_back2
+
+cse_slow3:
+	SLOG2_SLOW
+	JMP cse_back3
+
+cse_slow4:
+	SLOG2_SLOW
+	JMP cse_back4
+
+// SLOG2T is SLOG2 with the table address loaded into R9 (which the slow
+// path clobbers anyway), for kernels short of registers.
+#define SLOG2T(slow, back) \
+	CMPL  AX, $4096;          \
+	JAE   slow;               \
+	LEAQ  ·slog2Tab(SB), R9;  \
+	MOVSD (R9)(AX*8), X2;     \
+back:
+
+
+// CHANGEMASK4 ORs into R12, at bit sh, the mask of the positions p of
+// [BX+off/4, BX+off/4+4) where a[p]+b[p] == a[p-1]+b[p-1] (SI = a,
+// DI = b), and folds the sums a[p]+b[p] (X0) into the maximum X9.
+#define CHANGEMASK4(off, sh) \
+	MOVOU    off(SI)(BX*4), X0;   \
+	MOVOU    off(DI)(BX*4), X1;   \
+	PADDL    X1, X0;              \
+	MOVOU    off-4(SI)(BX*4), X1; \
+	MOVOU    off-4(DI)(BX*4), X2; \
+	PADDL    X2, X1;              \
+	PMAXUD   X0, X9;              \
+	PCMPEQL  X0, X1;              \
+	MOVMSKPS X1, AX;              \
+	SHLL     $sh, AX;             \
+	ORL      AX, R12
+
+// CHANGEMASK4S is CHANGEMASK4 that also adds the sums into X8 and counts
+// the zero sums into X10 (X15 = 0).
+#define CHANGEMASK4S(off, sh) \
+	CHANGEMASK4(off, sh); \
+	PADDL   X0, X8;       \
+	PCMPEQL X15, X0;      \
+	PSUBL   X0, X10
+
+// CHANGEMASK16 sets R12 to the mask of the positions of [BX, BX+16) where
+// a streak ends (a[p]+b[p] != a[p-1]+b[p-1]); CHANGEMASK16S also adds
+// their sums and zero counts.
+#define CHANGEMASK16 \
+	XORL R12, R12;        \
+	CHANGEMASK4(0, 0);    \
+	CHANGEMASK4(16, 4);   \
+	CHANGEMASK4(32, 8);   \
+	CHANGEMASK4(48, 12);  \
+	XORL $0xffff, R12
+
+#define CHANGEMASK16S \
+	XORL R12, R12;        \
+	CHANGEMASK4S(0, 0);   \
+	CHANGEMASK4S(16, 4);  \
+	CHANGEMASK4S(32, 8);  \
+	CHANGEMASK4S(48, 12); \
+	XORL $0xffff, R12
+
+// STREAK adds a streak of R13 bins of value R10, as combinedPopulationCostGo
+// does, without branches: with nz = (R10 != 0) and long = (R13 > 3), the
+// long streaks are counted and their lengths summed per kind in R8 (four
+// 16-bit fields: count of zero streaks, count of non-zero streaks, length
+// of zero streaks, length of non-zero streaks), and X7 -= slog2(R10) *
+// float64(R13). For a zero value X7 - (+0 * R13) == X7 exactly, as when
+// the Go code skips it. The other statistics follow from the bins
+// themselves (popStatsSSE41). Clobbers AX, CX, R9, R13, X2-X6.
+#define STREAK(slow, back) \
+	XORL     CX, CX;      \
+	TESTL    R10, R10;    \
+	SETNE    CX;          \
+	XORL     R9, R9;      \
+	CMPQ     R13, $3;     \
+	SETGT    R9;          \
+	NEGQ     R9;          \
+	MOVQ     R13, AX;     \
+	SHLQ     $32, AX;     \
+	INCQ     AX;          \
+	ANDQ     R9, AX;      \
+	SHLL     $4, CX;      \
+	SHLQ     CX, AX;      \
+	ADDQ     AX, R8;      \
+	CVTSQ2SD R13, X6;     \
+	MOVL     R10, AX;     \
+	SLOG2T(slow, back);   \
+	MULSD    X6, X2;      \
+	SUBSD    X2, X7
+
+// func popStatsSSE41(a, b *uint32, n int, st *popStats)
+//
+// The streak loop of combinedPopulationCostGo (16 < n < 65536, st zeroed):
+// a streak ends at each position p in [1, n) where a[p]+b[p] differs from
+// the previous sum, and at n. The positions are scanned 16 at a time
+// (CHANGEMASK16S); the last, partial group is the 16 positions ending at n
+// with the positions already scanned masked out (and their sums added one
+// by one). Each streak end (BSF, clear lowest) is added with STREAK.
+// The statistics that do not depend on the streaks are computed from the
+// sums: e.sum is their total (mod 2^32: the Go code adds value*length per
+// non-zero streak), e.maxVal their maximum, e.nonzeros the count of the
+// non-zero ones, which is also the total length of the non-zero streaks
+// (the short ones are the rest).
+// SI = a, DI = b, DX = st, BX = first position of the group, R10 = value
+// of the current streak, R11 = its start, R12 = mask, R8 = long streaks,
+// X7 = entropy, X8 = sums, X9 = maximum, X10 = zero counts (4 lanes),
+// X14 = Ln2, X15 = 0.
+TEXT ·popStatsSSE41(SB), NOSPLIT, $0-32
+	MOVQ  a+0(FP), SI
+	MOVQ  b+8(FP), DI
+	MOVQ  st+24(FP), DX
+	MOVQ  $0x3fe62e42fefa39ef, AX // math.Ln2
+	MOVQ  AX, X14
+	PXOR  X15, X15
+	XORPS X7, X7
+	MOVL  (SI), R10
+	ADDL  (DI), R10
+	MOVQ  R10, X8
+	MOVQ  R10, X9
+	XORL  AX, AX
+	TESTL R10, R10
+	SETEQ AX
+	MOVQ  AX, X10
+	XORL  R8, R8
+	XORL  R11, R11
+	MOVL  $1, BX
+
+pop_group:
+	LEAQ 16(BX), AX
+	CMPQ AX, n+16(FP)
+	JA   pop_tail
+	CHANGEMASK16S
+
+pop_walk:
+	TESTL R12, R12
+	JZ    pop_walked
+	BSFL  R12, AX
+	LEAL  -1(R12), CX
+	ANDL  CX, R12
+	ADDQ  BX, AX
+	MOVQ  AX, R13
+	SUBQ  R11, R13
+	MOVQ  AX, R11
+	STREAK(pop_slow1, pop_back1)
+	MOVL  (SI)(R11*4), R10
+	ADDL  (DI)(R11*4), R10
+	JMP   pop_walk
+
+pop_walked:
+	ADDQ $16, BX
+	JMP  pop_group
+
+pop_tail:
+	MOVQ BX, CX
+	CMPQ CX, n+16(FP)
+	JAE  pop_final
+
+pop_tailsum: // the sums of the positions not scanned yet, one by one
+	MOVL  (SI)(CX*4), AX
+	ADDL  (DI)(CX*4), AX
+	MOVQ  AX, X0
+	PADDL X0, X8
+	XORL  R9, R9
+	TESTL AX, AX
+	SETEQ R9
+	MOVQ  R9, X0
+	PADDL X0, X10
+	INCQ  CX
+	CMPQ  CX, n+16(FP)
+	JB    pop_tailsum
+	MOVQ  BX, CX
+	MOVQ  n+16(FP), BX
+	SUBQ  $16, BX        // the last group
+	SUBQ  BX, CX         // its positions already scanned (1..15)
+	CHANGEMASK16
+	SHRL  CX, R12
+	SHLL  CX, R12
+	JMP   pop_walk
+
+pop_final:
+	MOVQ   n+16(FP), R13
+	SUBQ   R11, R13
+	STREAK(pop_slow2, pop_back2)
+	MOVSD  X7, popStats_e+bitEntropy_entropy(DX)
+	PSHUFD $0x4e, X8, X0
+	PADDL  X0, X8
+	PSHUFD $0xb1, X8, X0
+	PADDL  X0, X8
+	MOVQ   X8, AX
+	MOVL   AX, popStats_e+bitEntropy_sum(DX)
+	PSHUFD $0x4e, X9, X0
+	PMAXUD X0, X9
+	PSHUFD $0xb1, X9, X0
+	PMAXUD X0, X9
+	MOVQ   X9, AX
+	MOVL   AX, popStats_e+bitEntropy_maxVal(DX)
+	PSHUFD $0x4e, X10, X0
+	PADDL  X0, X10
+	PSHUFD $0xb1, X10, X0
+	PADDL  X0, X10
+	MOVQ   X10, CX
+	MOVL   CX, CX                 // zero bins
+	MOVQ   n+16(FP), AX
+	SUBQ   CX, AX                 // non-zero bins
+	MOVQ   AX, popStats_e+bitEntropy_nonzeros(DX)
+	MOVQ   R8, R9
+	SHRQ   $48, R9                // length of the long non-zero streaks
+	MOVQ   R9, popStats_s+streaks_streaks+24(DX)
+	SUBQ   R9, AX
+	MOVQ   AX, popStats_s+streaks_streaks+16(DX)
+	MOVQ   R8, R9
+	SHRQ   $32, R9
+	ANDQ   $0xffff, R9            // length of the long zero streaks
+	MOVQ   R9, popStats_s+streaks_streaks+8(DX)
+	SUBQ   R9, CX
+	MOVQ   CX, popStats_s+streaks_streaks+0(DX)
+	MOVQ   R8, R9
+	ANDQ   $0xffff, R9
+	MOVQ   R9, popStats_s+streaks_counts+0(DX)
+	SHRQ   $16, R8
+	ANDQ   $0xffff, R8
+	MOVQ   R8, popStats_s+streaks_counts+8(DX)
+	RET
+
+pop_slow1:
+	SLOG2_SLOW
+	JMP pop_back1
+
+pop_slow2:
+	SLOG2_SLOW
+	JMP pop_back2

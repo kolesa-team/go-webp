@@ -153,8 +153,10 @@ func populationCost(pop []uint32) float64 {
 	return e.refine() + s.finalHuffmanCost()
 }
 
-// combinedPopulationCost is populationCost(a+b) without materializing a+b.
-func combinedPopulationCost(a, b []uint32) float64 {
+// combinedPopulationCostGo is populationCost(a+b) without materializing
+// a+b. It is the Go reference of combinedPopulationCost (dsp_amd64.go,
+// dsp_generic.go).
+func combinedPopulationCostGo(a, b []uint32) float64 {
 	var e bitEntropy
 	var s streaks
 	n := len(a)
@@ -226,9 +228,11 @@ func (a *accEntropy) init(h *[256]int32) {
 	}
 }
 
-// combinedShannonEntropy returns the entropy of X plus the entropy of X+Y
-// (libwebp VP8LCombinedShannonEntropy), where Y is described by acc.
-func combinedShannonEntropy(x, y *[256]int32, acc *accEntropy) float64 {
+// combinedShannonEntropyGo returns the entropy of X plus the entropy of X+Y
+// (libwebp VP8LCombinedShannonEntropy), where Y is described by acc. It is
+// the Go reference of combinedShannonEntropy (dsp_amd64.go,
+// dsp_generic.go).
+func combinedShannonEntropyGo(x, y *[256]int32, acc *accEntropy) float64 {
 	r := -acc.total
 	var sumX uint32
 	for i := 0; i < 256; i++ {
