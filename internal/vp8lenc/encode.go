@@ -7,6 +7,7 @@ import (
 	"errors"
 	"image"
 	"math"
+	"slices"
 )
 
 // Config controls the lossless encoder. Field semantics follow libwebp's
@@ -34,7 +35,8 @@ type Config struct {
 	// internal/workers (see parallel.go): candidate encodings are evaluated
 	// two at a time (up to 8 MP), and the match search, the predictor mode
 	// search and the histogram remap of large images are split among
-	// helpers. The output does not depend on it. Ignored with LowMemory.
+	// helpers, started at the beginning of each of these phases and ended
+	// with it. The output does not depend on it. Ignored with LowMemory.
 	ThreadLevel bool
 	// ImageHint is libwebp's WebPImageHint (0 default, 1 picture, 2 photo,
 	// 3 graph). With 3 (graph), palette images additionally try the
@@ -271,7 +273,7 @@ func (a *AlphaEncoder) Encode(plane []byte, width, height, stride int, method in
 		}
 	}
 	if a.sc == nil {
-		a.sc = getScratch()
+		a.sc = getScratch(n)
 	}
 	cfg := &Config{Quality: q, Method: method, Exact: true, NearLossless: 100, Interrupt: a.Interrupt}
 	out, spare := encodeARGB(argb, width, height, cfg, true, 0, a.sc, a.spare, &info)
@@ -453,9 +455,12 @@ func encodeARGB(argb []uint32, w, h int, cfg *Config, useCache bool, prefix int,
 	}
 
 	if sc == nil {
-		sc = getScratch()
+		sc = getScratch(n)
 		defer putScratch(sc)
 	}
+	// The helpers of the parallel stages end with the encode (before the
+	// scratch goes back to its pool).
+	defer sc.crew.stop()
 	if len(configs) == 1 {
 		// argb is private to the caller and not needed afterwards: let the
 		// transforms work in place (libwebp also transforms the picture's
@@ -762,6 +767,9 @@ func getBackwardRefs(argb []uint32, w, h int, quality int, lowEffort, box bool, 
 	// libwebp's for a small cost.
 	cacheBuf := sc.cacheBuf(1 << maxColorCacheBits)
 	trace := quality >= 25 && !lowEffort
+	if !tryNoCache {
+		return append(cands[:0], bestRefs(argb, w, n, quality, types, trace, cacheBitsMax, refsCap, cacheBuf, sc))
+	}
 	// sc.refs slots: best[0] with cache, best[1] without (tryNoCache), tmp.
 	best := [2]int{0, 1}
 	tmp := 2
@@ -838,6 +846,113 @@ func getBackwardRefs(argb []uint32, w, h int, quality int, lowEffort, box bool, 
 		cands = append(cands, refsCandidate{sc.refs[best[1]], 0, bestCost[1]})
 	}
 	return cands
+}
+
+// parseRefs computes the parse of type typ of argb into refs.
+func parseRefs(typ, w, n int, argb []uint32, sc *scratch, refs []pixOrCopy) []pixOrCopy {
+	switch typ {
+	case lz77Standard:
+		return backwardRefsLz77(n, argb, &sc.hc, refs)
+	case lz77RLE:
+		return backwardRefsRle(w, n, argb, refs)
+	}
+	return backwardRefsLz77(n, argb, &sc.hcBox, refs)
+}
+
+// sparseRefs: a parse estimated at no more than one entry per sparseRefs
+// pixels is sparse (see bestRefs).
+const sparseRefs = 8
+
+// bestRefs is getBackwardRefs without tryNoCache. A dense parse (a photo:
+// up to one entry, 8 bytes, per pixel) is kept in a single buffer
+// (sc.refs[0]): every parse type is evaluated in the same buffer, and the
+// best one is computed again (the parses are deterministic) when a later
+// candidate has overwritten it. Usually it has not: the last candidate
+// (the RLE parse, which the residuals of a photo favor), or the cost-based
+// parse, wins. A sparse parse (graphics: at most one entry per sparseRefs
+// pixels, estimated) costs little memory but as much to recompute (a pass
+// over all the pixels): the best one so far keeps its buffer (sc.refs[0] or
+// sc.refs[1]) and the next candidate goes to the other one.
+func bestRefs(argb []uint32, w, n, quality int, types []int, trace bool, cacheBitsMax, refsCap int, cacheBuf []uint32, sc *scratch) refsCandidate {
+	if refsCap < n && slices.Contains(types, lz77RLE) {
+		// The buffer holds the RLE parse in turn, often the longest one:
+		// size it for that parse too, rather than growing it during the
+		// parse (a copy, with both buffers alive).
+		e := rleRefsEstimate(argb, w, n/w)
+		refsCap = max(refsCap, min(n, e+e/8+4096))
+	}
+	sparse := refsCap <= n/sparseRefs
+	var bufs [2][]pixOrCopy
+	var inBuf [2]int // parse type in bufs[k] (0: none)
+	cur, best := 0, 0
+	buf := func(k int) []pixOrCopy {
+		if bufs[k] == nil {
+			bufs[k] = sc.refsBuf(k, refsCap)
+		}
+		return bufs[k]
+	}
+	bestCost := math.Inf(1)
+	bestType, bestCB := 0, 0
+	for _, typ := range types {
+		r := parseRefs(typ, w, n, argb, sc, buf(cur))
+		bufs[cur], inBuf[cur] = r, typ
+		cb := bestCacheBits(argb, quality, r, cacheBitsMax, sc)
+		applyColorCache(argb, cb, r, cacheBuf)
+		cost := histoCost(r, w, cb, trace, sc)
+		if cost < bestCost || bestType == 0 {
+			bestCost, bestType, bestCB = cost, typ, cb
+			best = cur
+		}
+		if sparse {
+			cur = 1 - best
+		}
+	}
+	redo := func(r []pixOrCopy) []pixOrCopy {
+		r = parseRefs(bestType, w, n, argb, sc, r)
+		applyColorCache(argb, bestCB, r, cacheBuf)
+		return r
+	}
+	r := bufs[best]
+	if inBuf[best] != bestType {
+		r = redo(r)
+	}
+	// Improve on the simple LZ77 with the cost-based parse (only for high
+	// quality, as it is costly).
+	if (bestType == lz77Standard || bestType == lz77Box) && trace {
+		hc := &sc.hc
+		if bestType == lz77Box {
+			hc = &sc.hcBox
+		}
+		// traceBackwards reads its input parse only before it writes its
+		// output: both can share the buffer of a dense parse.
+		out := r[:0]
+		if sparse {
+			out = buf(1 - best)[:0]
+		}
+		t := traceBackwards(w, n, argb, bestCB, hc, r, out, sc)
+		applyColorCache(argb, bestCB, t, cacheBuf)
+		switch {
+		case histoCost(t, w, bestCB, true, sc) < bestCost:
+			if sparse {
+				bufs[1-best] = t
+				best = 1 - best
+			}
+			r = t
+		case sparse:
+			bufs[1-best] = t // (keeps its capacity)
+		default:
+			r = redo(t)
+		}
+		bufs[best] = r
+	}
+	for k := range bufs {
+		if bufs[k] != nil {
+			sc.refs[k] = bufs[k]
+		}
+	}
+	// (A cost-based parse only replaces a candidate when cheaper, so
+	// bestCost bounds the estimate of the returned parse.)
+	return refsCandidate{r, bestCB, bestCost}
 }
 
 // encodeImageNoHuffman encodes a sub-image (transform data, entropy image or
@@ -979,9 +1094,9 @@ func writeMainImage(bw *bitWriter, w, h int, p *params, c refsCandidate, sc *scr
 		bw.putBits(0, 1)
 	}
 	hb := p.histoBits
-	sc.clus.interrupt = p.interrupt
+	sc.clus.interrupt, sc.clus.crew = p.interrupt, &sc.crew
 	ng := sc.clus.buildHistoImage(w, h, c.refs, p.quality, p.lowEffort, hb, c.cacheBits, &sc.out, p.remapHelpers())
-	sc.clus.interrupt = nil
+	sc.clus.interrupt, sc.clus.crew = nil, nil
 	if p.interrupted() {
 		return
 	}

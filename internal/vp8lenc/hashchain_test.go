@@ -76,6 +76,7 @@ func TestHashChainStripes(t *testing.T) {
 									var hc hashChain
 									sc := new(scratch)
 									hc.fillPar(in.argb, in.w, in.h, q, low, wcap, helpers, sc)
+									sc.crew.stop()
 									if !slices.Equal(hc.ol, want) {
 										i := 0
 										for hc.ol[i] == want[i] {
@@ -104,7 +105,9 @@ func TestHashChainStripesExhausted(t *testing.T) {
 	for _, in := range hcInputs() {
 		var ref, hc hashChain
 		ref.fill(in.argb, in.w, in.h, 75, false, 0)
-		hc.fillPar(in.argb, in.w, in.h, 75, false, 0, 7, new(scratch))
+		sc := new(scratch)
+		hc.fillPar(in.argb, in.w, in.h, 75, false, 0, 7, sc)
+		sc.crew.stop()
 		if !slices.Equal(hc.ol, ref.ol) {
 			t.Fatalf("%s: striped search differs", in.name)
 		}
@@ -126,6 +129,7 @@ func BenchmarkHashChainStripes(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				hc.fillPar(big, w, h, 75, false, 0, helpers, sc)
 			}
+			sc.crew.stop()
 		})
 	}
 }
