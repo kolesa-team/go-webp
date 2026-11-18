@@ -177,6 +177,9 @@ func TestWavefrontGOMAXPROCS(t *testing.T) {
 // on how many rows at once (the cases hold with the vector kernels and
 // with the Go reference ones).
 func TestWavefrontWorkers(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(16))
+	defer activeEncodes.Store(activeEncodes.Load())
+	activeEncodes.Store(1)
 	for _, tc := range []struct{ w, h, method, want int }{
 		{1, 1, 4, 1}, {256, 256, 4, 1}, {256, 256, 0, 1}, {960, 1280, 0, 1},
 		{960, 1280, 4, 7}, {640, 480, 6, 5}, {4000, 3000, 4, 8}, {4000, 3000, 2, 8},
@@ -193,8 +196,20 @@ func TestWavefrontWorkers(t *testing.T) {
 			t.Errorf("%dx%d m%d without ThreadLevel: %d workers", tc.w, tc.h, tc.method, got)
 		}
 	}
+	// Concurrent encodes share the processors.
+	e := &encoder{mbW: 4000 / 16, mbH: 3000 / 16, method: 4}
+	e.cfg.ThreadLevel = true
+	for _, tc := range []struct{ active, procs, want int }{{2, 16, 8}, {3, 16, 5}, {4, 16, 4}, {9, 16, 1}, {20, 16, 1}, {1, 3, 3}, {1, 1, 1}} {
+		activeEncodes.Store(int32(tc.active))
+		runtime.GOMAXPROCS(tc.procs)
+		if got := e.wavefrontWorkers(); got != tc.want {
+			t.Errorf("%d encodes on %d processors: %d workers, want %d", tc.active, tc.procs, got, tc.want)
+		}
+	}
+	runtime.GOMAXPROCS(16)
+	activeEncodes.Store(1)
 	// Forced (tests): any picture of two rows or more, rows two
-	// macroblocks apart at least.
+	// macroblocks apart at least, whatever the other encodes.
 	forceWavefrontForTest(t)
 	for _, tc := range []struct{ w, h, want int }{{16, 160, 1}, {64, 64, 2}, {64, 16, 1}, {640, 480, 8}} {
 		e := &encoder{mbW: (tc.w + 15) >> 4, mbH: (tc.h + 15) >> 4}

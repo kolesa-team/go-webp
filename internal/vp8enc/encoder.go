@@ -148,6 +148,8 @@ func EncodeWithHeadroom(pic *Picture, cfg *Config, headroom int) ([]byte, error)
 	if err := pic.validate(); err != nil {
 		return nil, err
 	}
+	activeEncodes.Add(1)
+	defer activeEncodes.Add(-1)
 	e := encoderPool.Get().(*encoder)
 	defer func() {
 		e.release()
