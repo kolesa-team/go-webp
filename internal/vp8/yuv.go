@@ -70,7 +70,7 @@ var opaque2 uint64 = 0xff000000ff000000
 // alpha rows of the two output rows, or nil for opaque output.
 //
 // This is the portable reference; upsamplePair (yuv_arm64.go,
-// yuv_generic.go) is the entry point used by the decoder.
+// yuv_amd64.go, yuv_generic.go) is the entry point used by the decoder.
 func upsamplePairGo(topY, botY, topU, topV, curU, curV, topDst, botDst, topA, botA []byte, uvT, uvB []uint32, w int) {
 	if botY == nil {
 		upsampleUV(topU, topV, curU, curV, uvT, nil, w)
