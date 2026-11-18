@@ -2,3 +2,4 @@
 /vendor
 .DS_Store
 /example/output*
+/benchmarks/out
