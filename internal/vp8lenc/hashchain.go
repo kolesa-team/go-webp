@@ -306,7 +306,7 @@ func (s *hcSearcher) fillStripes(helpers int, sc *scratch) {
 	stripes := (size-2)/per + 1 // stripe k covers [k*per, (k+1)*per) within [1, size-2]
 	marks := sc.hcMarkBuf((size + 63) / 64)
 	exits := sc.hcExitBuf(stripes)
-	parallel(stripes, helpers, func(worker int, claim func() (int, bool)) {
+	sc.crew.run(stripes, helpers, func(worker int, claim func() (int, bool)) {
 		for {
 			k, ok := claim()
 			if !ok || sc.interrupted() {
@@ -317,6 +317,7 @@ func (s *hcSearcher) fillStripes(helpers int, sc *scratch) {
 			exits[k], _ = s.run(min((k+1)*per-1, size-2), lo, lo, marks)
 		}
 	})
+	sc.crew.stop() // (no helpers held through the sequential parse that follows)
 	if sc.interrupted() {
 		// Some stripes may not have run: the matches are garbage, and the
 		// caller (encodeImageInternal) stops right after the fill.
