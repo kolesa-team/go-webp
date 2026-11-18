@@ -108,10 +108,24 @@ func TestWavefrontIdentical(t *testing.T) {
 	if testing.Short() {
 		limits = []int{1, 3, 8}
 	}
+	// Under the race detector one budget per case, on the cases that
+	// exercise different synchronization (refresh points, several passes,
+	// the partition #0 retry, narrow and wide rows); the identity of every
+	// case for every budget is checked without -race.
+	raceCases := map[string]bool{
+		"source/m4": true, "source/target-size": true, "source/autofilter-m4": true,
+		"wide/m4": true, "narrow/m4": true, "source/p0-retry-m4": true,
+	}
+	if raceEnabled {
+		limits = []int{3}
+	}
 	var rows atomic.Int64
 	testHookWavefrontRow = func(int) { rows.Add(1) }
 	for _, c := range wavefrontCases(t) {
 		if testing.Short() && c.cfg.Method != 4 && c.cfg.Method != 0 {
+			continue
+		}
+		if raceEnabled && !raceCases[c.name] {
 			continue
 		}
 		workers.SetLimitForTest(0)
@@ -161,7 +175,11 @@ func TestWavefrontGOMAXPROCS(t *testing.T) {
 		c := wavefrontCase{name: "source/m" + strconv.Itoa(m), img: source, cfg: cfg}
 		want := c.encode(t)
 		c.cfg.ThreadLevel = true
-		for p := 1; p <= 8; p++ {
+		procs := []int{1, 2, 3, 4, 5, 6, 7, 8}
+		if raceEnabled {
+			procs = []int{1, 3, 8}
+		}
+		for _, p := range procs {
 			runtime.GOMAXPROCS(p)
 			for _, limit := range []int{0, 6} { // 0: the default, GOMAXPROCS-1
 				workers.SetLimitForTest(limit)

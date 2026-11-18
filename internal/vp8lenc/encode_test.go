@@ -126,7 +126,13 @@ func TestAllConfigsNoPanic(t *testing.T) {
 		{Quality: -5, Method: 99, NearLossless: 100, ImageHint: 3, UseDeltaPalette: true},
 	}
 	for _, ti := range imgs {
+		if raceEnabled && ti.img.Rect.Dx()*ti.img.Rect.Dy() > 40000 {
+			continue // the large pictures take minutes under the race detector
+		}
 		for i := range cfgs {
+			if raceEnabled && !cfgs[i].ThreadLevel {
+				continue // no goroutines: covered by the run without -race
+			}
 			out, err := Encode(ti.img, &cfgs[i])
 			if err != nil {
 				t.Fatalf("%s cfg %d: %v", ti.name, i, err)
@@ -134,6 +140,9 @@ func TestAllConfigsNoPanic(t *testing.T) {
 			if len(out) < 6 {
 				t.Fatalf("%s cfg %d: short output", ti.name, i)
 			}
+		}
+		if raceEnabled {
+			continue // EncodeAlpha starts no goroutines either
 		}
 		w, h := ti.img.Rect.Dx(), ti.img.Rect.Dy()
 		plane := make([]byte, w*h)

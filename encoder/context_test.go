@@ -42,6 +42,15 @@ func (c *pollCtx) Err() error {
 // ones) otherwise.
 func pollPoints(n int64) []int64 {
 	var ks []int64
+	if raceEnabled && n > 12 {
+		// Under the race detector (slow CI runners): the first and last
+		// polls and 8 spread over the encode.
+		ks = append(ks, 1, 2)
+		for i := int64(1); i <= 8; i++ {
+			ks = append(ks, 2+i*(n-4)/9)
+		}
+		return append(ks, n-1, n)
+	}
 	if n <= 48 {
 		for k := int64(1); k <= n; k++ {
 			ks = append(ks, k)

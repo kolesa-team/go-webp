@@ -46,7 +46,18 @@ jobs:
         working-directory: benchmarks
         run: go vet ./suite ./v2/...
       - name: Test
-        run: go test ./...
+        # Coverage for Codecov is collected here, not in the race detector
+        # step: under -race every update of the (then atomic) coverage
+        # counters goes through the race runtime, and with the encoders'
+        # helper goroutines updating the same counters in their hot loops
+        # that made some packages ~300x slower and time out.
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Linux ] && [ "$RUNNER_ARCH" = X64 ] && [ "${{ matrix.go }}" = stable ]; then
+            go test -coverprofile=coverage.txt ./...
+          else
+            go test ./...
+          fi
       # The arm64 assembly kernels are compared with the pure Go code they
       # replace by the tests above; this runs the whole suite on the pure Go
       # code path as well (what other architectures use).
@@ -64,7 +75,10 @@ jobs:
         if: runner.os != 'Windows'
         env:
           CGO_ENABLED: "1"
-        run: go test -race -short -coverprofile=coverage.txt -covermode=atomic ./...
+        # Under the race detector the heaviest tests check fewer
+        # combinations (raceEnabled in the test files); the longer timeout
+        # is a margin for slow runners.
+        run: go test -race -short -timeout 30m ./...
       # Memory accesses made by assembly are invisible to the race detector:
       # on arm64 also race-check the pure Go kernels, which write the same
       # buffers.
@@ -72,7 +86,7 @@ jobs:
         if: runner.os != 'Windows' && runner.arch == 'ARM64'
         env:
           CGO_ENABLED: "1"
-        run: go test -race -short -tags purego ./...
+        run: go test -race -short -timeout 30m -tags purego ./...
       - name: Vet other architectures
         # Pure Go fallbacks only (no assembly there): catches build and vet
         # errors on 32-bit, big-endian and wasm targets.
