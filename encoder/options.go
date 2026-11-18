@@ -144,9 +144,12 @@ type Config struct {
 	// process-wide budget of GOMAXPROCS-1 helpers shared by all concurrent
 	// Encode and Decode calls:
 	//   - lossy: the analysis pass runs in row bands (pictures of at least
-	//     384 macroblocks, 1024 at methods 0-1), and the compressed alpha
-	//     plane of a transparent picture (64K pixels or more) is coded
-	//     while the VP8 frame is;
+	//     384 macroblocks, 1024 at methods 0-1), the macroblock rows are
+	//     coded as a wavefront on up to 8 goroutines when the picture is
+	//     large enough to pay for it (about 0.3 MP at methods 3-6, several
+	//     MP at methods 0-2), and the compressed alpha plane of a
+	//     transparent picture (64K pixels or more) is coded while the VP8
+	//     frame is;
 	//   - lossless and compressed alpha (256K pixels or more): the
 	//     hash-chain match search, the predictor search (methods 0-4) and
 	//     the histogram remap are split among helpers, and level 9 codes at

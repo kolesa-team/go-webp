@@ -78,10 +78,12 @@ type Config struct {
 	Partitions      int
 	PartitionLimit  int // 0..100: quality degradation allowed to fit the 512k limit on partition #0
 	EmulateJPEGSize bool
-	// ThreadLevel allows the analysis pass to be split into up to 8 row
-	// bands analyzed by helper goroutines from the process-wide budget of
+	// ThreadLevel allows helper goroutines from the process-wide budget of
 	// internal/workers (the caller does the work itself when none is
-	// free). The output does not depend on it.
+	// free): the analysis pass is split into up to 8 row bands, and the
+	// coding passes of large enough pictures code up to 8 macroblock rows
+	// at once as a wavefront (wavefront.go). The output does not depend on
+	// it.
 	ThreadLevel bool
 	// LowMemory is accepted for compatibility. The encoder always uses a
 	// compact token buffer; like libwebp's low_memory it only re-enables
