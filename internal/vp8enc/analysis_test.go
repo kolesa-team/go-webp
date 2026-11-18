@@ -186,15 +186,27 @@ func TestAnalysisBandsPanic(t *testing.T) {
 	for _, onHelper := range []bool{true, false} {
 		caller := goroutineID()
 		helperStarted := make(chan struct{})
-		var once sync.Once
+		callerIn := make(chan struct{})
+		var once, callerOnce sync.Once
 		testHookAnalysisBand = func(int) {
 			if goroutineID() != caller {
 				once.Do(func() { close(helperStarted) })
 				if onHelper {
 					panic(boom)
 				}
+				// Hold this band until the caller has taken one: the
+				// caller starts its own bands only after spawning the
+				// helpers, and on a slow machine the helpers could
+				// otherwise claim all 5 bands first (at most 4 helpers
+				// hold one each here, so one band is left for it).
+				select {
+				case <-callerIn:
+				case <-time.After(5 * time.Second):
+					t.Error("the caller analyzed no band")
+				}
 				return
 			}
+			callerOnce.Do(func() { close(callerIn) })
 			// Make sure a helper takes part before the caller goes on.
 			select {
 			case <-helperStarted:
