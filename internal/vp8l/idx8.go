@@ -438,10 +438,11 @@ func (d *decoder) emitPaletteIdx8(t *transform, src, dst []byte) {
 	expandBundledRGBA(d.paletteRGBA(t), d.bundleTable(t), t.bits, src, dst)
 }
 
-// lookupRGBA writes the RGBA words pal[src[i]] to dst (as many pixels as
-// fit), 8 pixels per step. (A 256-color palette does not fit NEON tables,
-// and scalar assembly measured only 1.08x faster than this loop.)
-func lookupRGBA(pal *[256]uint32, src, dst []byte) {
+// lookupRGBAGo is the reference of lookupRGBA (dsp_*.go): it writes the
+// RGBA words pal[src[i]] to dst (as many pixels as fit), 8 pixels per step.
+// (A 256-color palette does not fit NEON tables, and scalar arm64 assembly
+// measured only 1.08x faster than this loop.)
+func lookupRGBAGo(pal *[256]uint32, src, dst []byte) {
 	n := min(len(src), len(dst)/4)
 	src, dst = src[:n], dst[:4*n]
 	i := 0

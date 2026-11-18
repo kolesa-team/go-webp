@@ -36,7 +36,9 @@ func edgePixels(rng *rand.Rand, n int) []uint32 {
 // TestPredictRowModePairs runs every ordered pair of predictor modes in
 // alternating tiles, for tile sizes 4, 8 and 16 and every width up to
 // three tiles and a bit, with edge channel values.
-func TestPredictRowModePairs(t *testing.T) {
+func TestPredictRowModePairs(t *testing.T) { forEachLevel(t, testPredictRowModePairs) }
+
+func testPredictRowModePairs(t *testing.T) {
 	rng := rand.New(rand.NewSource(11))
 	reps := 3
 	if testing.Short() {
@@ -67,7 +69,9 @@ func TestPredictRowModePairs(t *testing.T) {
 
 // TestPredictRowWide checks long rows with large tiles (bits 5-9) and
 // random modes, the shape of real images, on edge channel values.
-func TestPredictRowWide(t *testing.T) {
+func TestPredictRowWide(t *testing.T) { forEachLevel(t, testPredictRowWide) }
+
+func testPredictRowWide(t *testing.T) {
 	rng := rand.New(rand.NewSource(12))
 	iters := 2000
 	if testing.Short() {
@@ -86,7 +90,9 @@ func TestPredictRowWide(t *testing.T) {
 
 // TestByteKernelsOffsets runs the byte-oriented kernels on slices that
 // start at every offset modulo 16, for every short length.
-func TestByteKernelsOffsets(t *testing.T) {
+func TestByteKernelsOffsets(t *testing.T) { forEachLevel(t, testByteKernelsOffsets) }
+
+func testByteKernelsOffsets(t *testing.T) {
 	rng := rand.New(rand.NewSource(13))
 	var pal [256]byte
 	rng.Read(pal[:])
@@ -137,7 +143,9 @@ func TestByteKernelsOffsets(t *testing.T) {
 // TestExpandBundledOffsets runs the bundled-index expansions on packed
 // rows and destinations starting at every offset modulo 16, with palettes
 // of edge values, for widths covering zero to three asm blocks.
-func TestExpandBundledOffsets(t *testing.T) {
+func TestExpandBundledOffsets(t *testing.T) { forEachLevel(t, testExpandBundledOffsets) }
+
+func testExpandBundledOffsets(t *testing.T) {
 	rng := rand.New(rand.NewSource(14))
 	for bits := 1; bits <= 3; bits++ {
 		pal := edgePixels(rng, 1<<(8>>bits))
@@ -191,7 +199,9 @@ func TestExpandBundledOffsets(t *testing.T) {
 // TestPixelKernelsShortRows checks crossColorRow and addGreen on every
 // width up to 64 at every start offset modulo 4 pixels, with edge values
 // and edge multipliers.
-func TestPixelKernelsShortRows(t *testing.T) {
+func TestPixelKernelsShortRows(t *testing.T) { forEachLevel(t, testPixelKernelsShortRows) }
+
+func testPixelKernelsShortRows(t *testing.T) {
 	rng := rand.New(rand.NewSource(15))
 	edgeMult := func() uint32 {
 		var m uint32

@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/rand"
+	"runtime"
 	"slices"
 	"testing"
 )
@@ -61,7 +62,9 @@ func u32Bytes(p []uint32) []byte {
 	return b
 }
 
-func TestEmitKernels(t *testing.T) {
+func TestEmitKernels(t *testing.T) { forEachLevel(t, testEmitKernels) }
+
+func testEmitKernels(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
 	kernels := []struct {
 		name     string
@@ -95,7 +98,9 @@ func TestEmitKernels(t *testing.T) {
 	}
 }
 
-func TestAddGreenKernel(t *testing.T) {
+func TestAddGreenKernel(t *testing.T) { forEachLevel(t, testAddGreenKernel) }
+
+func testAddGreenKernel(t *testing.T) {
 	rng := rand.New(rand.NewSource(2))
 	for iter := 0; iter < 20000; iter++ {
 		n := rng.Intn(80)
@@ -125,7 +130,9 @@ func TestAddGreenKernel(t *testing.T) {
 	}
 }
 
-func TestLookupBytesKernel(t *testing.T) {
+func TestLookupBytesKernel(t *testing.T) { forEachLevel(t, testLookupBytesKernel) }
+
+func testLookupBytesKernel(t *testing.T) {
 	rng := rand.New(rand.NewSource(3))
 	for iter := 0; iter < 5000; iter++ {
 		var pal [256]byte
@@ -152,6 +159,43 @@ func TestLookupBytesKernel(t *testing.T) {
 			t.Fatalf("%d bytes: output differs", n)
 		}
 		checkGuard(t, all, "lookupBytes")
+	}
+}
+
+func TestLookupRGBAKernel(t *testing.T) { forEachLevel(t, testLookupRGBAKernel) }
+
+func testLookupRGBAKernel(t *testing.T) {
+	rng := rand.New(rand.NewSource(9))
+	for iter := 0; iter < 5000; iter++ {
+		var pal [256]uint32
+		copy(pal[:], randomPixels(rng, 256))
+		n := rng.Intn(100)
+		if iter%50 == 0 {
+			n = rng.Intn(10000)
+		}
+		src := make([]byte, n)
+		if iter == 0 {
+			n = 256 * 4
+			src = make([]byte, n)
+			for i := range src {
+				src[i] = byte(i) // every index, in each lane position
+			}
+		} else {
+			rng.Read(src)
+		}
+		// The destination may hold fewer or more pixels, or a partial one.
+		dn := 4 * n
+		if iter%3 == 0 {
+			dn = max(0, dn+rng.Intn(17)-8)
+		}
+		want := bytes.Repeat([]byte{guard}, dn)
+		lookupRGBAGo(&pal, src, want)
+		all, got := guarded(dn)
+		lookupRGBA(&pal, src, got)
+		if !bytes.Equal(got, want) {
+			t.Fatalf("%d indices into %d bytes: output differs", n, dn)
+		}
+		checkGuard(t, all, "lookupRGBA")
 	}
 }
 
@@ -191,7 +235,9 @@ func crossColorCheck(t *testing.T, mults, src []uint32, width, bits int) {
 // every value of the channels it combines: (g2r, G, R), (g2b, G, B) and
 // (r2b, R', B) with R' = R (g2r = 0), the other channels and multipliers
 // random, in tiles of 4 pixels.
-func TestCrossColorExhaustive(t *testing.T) {
+func TestCrossColorExhaustive(t *testing.T) { forEachLevel(t, testCrossColorExhaustive) }
+
+func testCrossColorExhaustive(t *testing.T) {
 	rng := rand.New(rand.NewSource(4))
 	const bits = 2
 	const width = 1024 // 256 tiles
@@ -228,7 +274,9 @@ func TestCrossColorExhaustive(t *testing.T) {
 	}
 }
 
-func TestCrossColorRow(t *testing.T) {
+func TestCrossColorRow(t *testing.T) { forEachLevel(t, testCrossColorRow) }
+
+func testCrossColorRow(t *testing.T) {
 	rng := rand.New(rand.NewSource(5))
 	for iter := 0; iter < 20000; iter++ {
 		bits := 2 + rng.Intn(8)
@@ -283,7 +331,9 @@ func predictCheck(t *testing.T, modes, in, up []uint32, bits int, what string) {
 
 // TestPredictRow checks every predictor mode, in runs of tiles of every
 // size, against the Go reference.
-func TestPredictRow(t *testing.T) {
+func TestPredictRow(t *testing.T) { forEachLevel(t, testPredictRow) }
+
+func testPredictRow(t *testing.T) {
 	rng := rand.New(rand.NewSource(6))
 	iters := 40000
 	if testing.Short() {
@@ -319,7 +369,9 @@ func TestPredictRow(t *testing.T) {
 
 // TestPredictSelectTies checks mode 11 on pixels whose sums of channel
 // differences are equal or off by one.
-func TestPredictSelectTies(t *testing.T) {
+func TestPredictSelectTies(t *testing.T) { forEachLevel(t, testPredictSelectTies) }
+
+func testPredictSelectTies(t *testing.T) {
 	rng := rand.New(rand.NewSource(7))
 	for iter := 0; iter < 20000; iter++ {
 		width := 2 + rng.Intn(40)
@@ -375,7 +427,9 @@ func bundledCheck(t *testing.T, pal []uint32, bits int, src []byte, dn int) {
 	}
 }
 
-func TestExpandBundled(t *testing.T) {
+func TestExpandBundled(t *testing.T) { forEachLevel(t, testExpandBundled) }
+
+func testExpandBundled(t *testing.T) {
 	rng := rand.New(rand.NewSource(8))
 	for iter := 0; iter < 10000; iter++ {
 		bits := 1 + rng.Intn(3)
@@ -408,7 +462,7 @@ func FuzzExpandBundled(f *testing.F) {
 	f.Fuzz(func(t *testing.T, src []byte, bits uint8, dn uint16) {
 		b := 1 + int(bits)%3
 		pal := fuzzPixels(src, 1<<(8>>b))
-		bundledCheck(t, pal, b, src, min(int(dn), len(src)<<b+5))
+		atEachLevel(func() { bundledCheck(t, pal, b, src, min(int(dn), len(src)<<b+5)) })
 	})
 }
 
@@ -432,24 +486,27 @@ func FuzzEmitKernels(f *testing.F) {
 		n := len(data) / 4
 		src := fuzzPixels(data, n)
 		dn = min(max(dn, 0), 4*n+64)
-		for _, k := range []struct {
-			got, ref func([]uint32, []byte)
-		}{{emitRGBA, emitRGBAGo}, {emitAddGreen, emitAddGreenGo}} {
-			want := bytes.Repeat([]byte{guard}, dn)
-			k.ref(src, want)
-			all, dst := guarded(dn)
-			k.got(src, dst)
-			if !bytes.Equal(dst, want) {
-				t.Fatal("output differs")
+		atEachLevel(func() {
+			for _, k := range []struct {
+				got, ref func([]uint32, []byte)
+			}{{emitRGBA, emitRGBAGo}, {emitAddGreen, emitAddGreenGo}} {
+				want := bytes.Repeat([]byte{guard}, dn)
+				k.ref(src, want)
+				all, dst := guarded(dn)
+				k.got(src, dst)
+				if !bytes.Equal(dst, want) {
+					t.Fatal("output differs")
+				}
+				checkGuard(t, all, "emit")
 			}
-			checkGuard(t, all, "emit")
-		}
-		want := make([]uint32, n)
-		addGreenGo(src, want)
-		addGreen(src, src)
-		if !slices.Equal(src, want) {
-			t.Fatal("addGreen differs")
-		}
+			want := make([]uint32, n)
+			addGreenGo(src, want)
+			got := slices.Clone(src)
+			addGreen(got, got)
+			if !slices.Equal(got, want) {
+				t.Fatal("addGreen differs")
+			}
+		})
 	})
 }
 
@@ -460,12 +517,33 @@ func FuzzLookupBytes(f *testing.F) {
 		copy(pal[:], p)
 		want := make([]byte, len(in))
 		lookupBytesGo(&pal, in, want)
-		all, out := guarded(len(in))
-		lookupBytes(&pal, in, out)
-		if !bytes.Equal(out, want) {
-			t.Fatal("output differs")
-		}
-		checkGuard(t, all, "lookupBytes")
+		atEachLevel(func() {
+			all, out := guarded(len(in))
+			lookupBytes(&pal, in, out)
+			if !bytes.Equal(out, want) {
+				t.Fatal("output differs")
+			}
+			checkGuard(t, all, "lookupBytes")
+		})
+	})
+}
+
+func FuzzLookupRGBA(f *testing.F) {
+	f.Add([]byte("palette colors"), []byte("0123456789abcdefghij"), uint16(70))
+	f.Fuzz(func(t *testing.T, p, src []byte, dn uint16) {
+		var pal [256]uint32
+		copy(pal[:], fuzzPixels(p, 256))
+		n := min(int(dn), 4*len(src)+7)
+		want := bytes.Repeat([]byte{guard}, n)
+		lookupRGBAGo(&pal, src, want)
+		atEachLevel(func() {
+			all, out := guarded(n)
+			lookupRGBA(&pal, src, out)
+			if !bytes.Equal(out, want) {
+				t.Fatal("output differs")
+			}
+			checkGuard(t, all, "lookupRGBA")
+		})
 	})
 }
 
@@ -476,7 +554,7 @@ func FuzzCrossColorRow(f *testing.F) {
 		w := 1 + int(width)%600
 		mults := fuzzPixels(data, subSampleSize(w, b))
 		src := fuzzPixels(data[min(len(data), 3):], w)
-		crossColorCheck(t, mults, src, w, b)
+		atEachLevel(func() { crossColorCheck(t, mults, src, w, b) })
 	})
 }
 
@@ -493,12 +571,13 @@ func FuzzPredictRow(f *testing.F) {
 		}
 		in := fuzzPixels(data, w)
 		up := fuzzPixels(data[min(len(data), 5):], w)
-		predictCheck(t, modes, in, up, b, "fuzz")
+		atEachLevel(func() { predictCheck(t, modes, in, up, b, "fuzz") })
 	})
 }
 
 // BenchmarkKernels times each kernel against its Go reference on rows of
-// 3000 pixels.
+// 3000 pixels: <kernel>/go is the reference, <kernel>/asm the wrapper on
+// arm64, and <kernel>/<level> the wrapper at each SIMD level on amd64.
 func BenchmarkKernels(b *testing.B) {
 	const w = 3000
 	rng := rand.New(rand.NewSource(1))
@@ -515,20 +594,34 @@ func BenchmarkKernels(b *testing.B) {
 		name string
 		f    func()
 	}
+	run := func(name string, bytes int, f func()) {
+		b.Run(name, func(b *testing.B) {
+			b.SetBytes(int64(bytes))
+			for i := 0; i < b.N; i++ {
+				f()
+			}
+		})
+	}
 	bench := func(name string, bytes int, impls ...impl) {
 		for _, im := range impls {
-			b.Run(name+"/"+im.name, func(b *testing.B) {
-				b.SetBytes(int64(bytes))
-				for i := 0; i < b.N; i++ {
-					im.f()
-				}
-			})
+			if im.name != "asm" || runtime.GOARCH != "amd64" {
+				run(name+"/"+im.name, bytes, im.f)
+				continue
+			}
+			for _, l := range simdLevels()[1:] {
+				restore := setLevel(l)
+				run(name+"/"+l.name, bytes, im.f)
+				restore()
+			}
 		}
 	}
 	bench("emitRGBA", 4*w, impl{"go", func() { emitRGBAGo(src, dst) }}, impl{"asm", func() { emitRGBA(src, dst) }})
 	bench("emitAddGreen", 4*w, impl{"go", func() { emitAddGreenGo(src, dst) }}, impl{"asm", func() { emitAddGreen(src, dst) }})
 	bench("addGreen", 4*w, impl{"go", func() { addGreenGo(src, tmp) }}, impl{"asm", func() { addGreen(src, tmp) }})
 	bench("lookupBytes", len(idx), impl{"go", func() { lookupBytesGo(&pal, idx, idxOut) }}, impl{"asm", func() { lookupBytes(&pal, idx, idxOut) }})
+	var palRGBA [256]uint32
+	copy(palRGBA[:], randomPixels(rng, 256))
+	bench("lookupRGBA", 4*w, impl{"go", func() { lookupRGBAGo(&palRGBA, idx[:w], dst) }}, impl{"asm", func() { lookupRGBA(&palRGBA, idx[:w], dst) }})
 	for _, bits := range []int{2, 4, 5} {
 		mults := randomPixels(rng, subSampleSize(w, bits))
 		bench(fmt.Sprintf("crossColor/bits%d", bits), 4*w,

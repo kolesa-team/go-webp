@@ -130,6 +130,11 @@ func expandBundledRow(a *alphaTables, bits int, src, dst []byte) {
 	expandBundledRowGo(a, bits, src, dst)
 }
 
+// lookupRGBA writes the RGBA words pal[src[i]] to dst (as many pixels as
+// fit): the Go reference, since a 256-color palette does not fit NEON
+// tables.
+func lookupRGBA(pal *[256]uint32, src, dst []byte) { lookupRGBAGo(pal, src, dst) }
+
 // expandBundledRGBA expands one row of bundled palette indices (each byte
 // of src holds 1<<bits of them, bits 1 to 3) into the RGBA bytes dst (as
 // many pixels as fit), from the RGBA palette pal (at most 16 entries). For
