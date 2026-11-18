@@ -128,3 +128,29 @@ jobs:
       # Same scope as "make interop": the internal packages have interop
       # tests too.
       - run: go test -tags interop -run Interop ./...
+
+  interop-arm64:
+    # The same conformance tests on native linux/arm64, where the NEON
+    # kernels run (amd64, above, runs the pure Go code).
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      # Google's prebuilt libwebp 1.6.0 for aarch64 (static binaries). The
+      # SHA256 is that of the tarball whose OpenPGP signature (.asc) checked
+      # out against the WebP release signing key
+      # 6B0E6B70976DE303EDF2F601F9C3D6BDB8232B5D.
+      - name: Install libwebp 1.6.0 tools
+        env:
+          LIBWEBP: libwebp-1.6.0-linux-aarch64
+          SHA256: 69f5eebe203e0f3942fe37986209a1725741be19c152950a4283b376c95ec798
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/libwebp.tar.gz" \
+            "https://storage.googleapis.com/downloads.webmproject.org/releases/webp/$LIBWEBP.tar.gz"
+          echo "$SHA256  $RUNNER_TEMP/libwebp.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/libwebp.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$LIBWEBP/bin" >> "$GITHUB_PATH"
+      - run: dwebp -version && cwebp -version
+      - run: go test -tags interop -run Interop ./...
