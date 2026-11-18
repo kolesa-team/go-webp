@@ -114,12 +114,13 @@ type ycbcrSink struct {
 // PutYUV implements vp8.YUVSink.
 func (s *ycbcrSink) PutYUV(y, n int, ys []byte, yStride int, us, vs []byte, uvStride int) error {
 	var aplane []byte
+	abase := 0
 	if s.alpha != nil {
-		p, err := s.alpha.get(s.top + y + n)
+		p, base, err := s.alpha.get(s.top+y, s.top+y+n)
 		if err != nil {
 			return err
 		}
-		aplane = p
+		aplane, abase = p, base
 	}
 	if s.yuv == nil {
 		r := image.Rect(0, 0, s.w, s.h)
@@ -152,7 +153,7 @@ func (s *ycbcrSink) PutYUV(y, n int, ys []byte, yStride int, us, vs []byte, uvSt
 				dst[i] = 0xff
 			}
 		} else {
-			copy(dst, aplane[(s.top+y+j)*s.alphaStride+s.left:][:w])
+			copy(dst, aplane[(s.top+y+j-abase)*s.alphaStride+s.left:][:w])
 		}
 	}
 	return nil

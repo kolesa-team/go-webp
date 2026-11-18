@@ -42,7 +42,7 @@ var kScan = [16]int{
 
 // parseIntraMode reads the segment, skip flag and prediction modes of the
 // macroblock at column mbX from the first partition.
-func (d *decoder) parseIntraMode(mbX int, blk *mbBlock) {
+func (d *decoder) parseIntraMode(mbX int, blk *mbModes) {
 	br := &d.br
 	top := (*[4]uint8)(d.intraT[4*mbX:])
 	left := &d.intraL

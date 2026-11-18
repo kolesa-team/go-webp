@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -42,6 +43,33 @@ func setBatch(t testing.TB, mbs int) {
 	old := mtBatchMBs
 	mtBatchMBs = mbs
 	t.Cleanup(func() { mtBatchMBs = old })
+}
+
+// setEmit sets mtEmitWaits (when the emit helper starts) for the rest of
+// the test.
+func setEmit(t testing.TB, waits int) {
+	old := mtEmitWaits
+	mtEmitWaits = waits
+	t.Cleanup(func() { mtEmitWaits = old })
+}
+
+// emitModes are the emit helper policies the threaded decoder must be
+// insensitive to: never, from the first batch, adaptive (the default).
+var emitModes = []struct {
+	name  string
+	waits int
+}{{"emitNever", -1}, {"emitFirst", 0}, {"emitAdaptive", mtEmitWaits}}
+
+// emitModesFor returns the emit policies worth testing with budget b: the
+// emit helper needs a second helper slot.
+func emitModesFor(limit int, exhausted bool) []struct {
+	name  string
+	waits int
+} {
+	if exhausted || limit < 2 {
+		return emitModes[2:]
+	}
+	return emitModes
 }
 
 // setBudget sets the helper budget for the rest of the test. With
@@ -260,21 +288,24 @@ func TestThreadedMatchesSequential(t *testing.T) {
 						if w*h > 1<<20 && (mbs < 64 || b.name == "limit8") {
 							continue // keep the large sample fast
 						}
-						t.Run(fmt.Sprintf("%s/opts%d/crop%v/mbs%d/%s", name, oi, crop != nil, mbs, b.name), func(t *testing.T) {
-							setBatch(t, mbs)
-							setBudget(t, b.limit, b.exhausted)
-							caller := goid()
-							got := runDecode(vp8, opts, crop, 0, 0)
-							if msg := sameRun(got, want); msg != "" {
-								t.Fatal(msg)
-							}
-							helper := len(got.gids) > 1 || !got.gids[caller]
-							mbW, rows := (w+15)/16, frameRows(t, vp8, opts, crop)
-							k := max(1, (mbs+mbW-1)/mbW)
-							if wantHelper := !b.exhausted && rows >= 2*k; helper != wantHelper {
-								t.Errorf("helper used: %v, want %v (rows %d, batch %d)", helper, wantHelper, rows, k)
-							}
-						})
+						for _, em := range emitModesFor(b.limit, b.exhausted) {
+							t.Run(fmt.Sprintf("%s/opts%d/crop%v/mbs%d/%s/%s", name, oi, crop != nil, mbs, b.name, em.name), func(t *testing.T) {
+								setBatch(t, mbs)
+								setBudget(t, b.limit, b.exhausted)
+								setEmit(t, em.waits)
+								caller := goid()
+								got := runDecode(vp8, opts, crop, 0, 0)
+								if msg := sameRun(got, want); msg != "" {
+									t.Fatal(msg)
+								}
+								helper := len(got.gids) > 1 || !got.gids[caller]
+								mbW, rows := (w+15)/16, frameRows(t, vp8, opts, crop)
+								k := max(1, (mbs+mbW-1)/mbW)
+								if wantHelper := !b.exhausted && rows >= 2*k; helper != wantHelper {
+									t.Errorf("helper used: %v, want %v (rows %d, batch %d)", helper, wantHelper, rows, k)
+								}
+							})
+						}
 					}
 				}
 			}
@@ -319,7 +350,9 @@ func TestThreadedYUV(t *testing.T) {
 	setBatch(t, 1)
 	setBudget(t, 2, false)
 	vp8 := loadVP8(t, "mix_250x199_o4.webp")
-	for _, crop := range []*image.Rectangle{nil, {Min: image.Pt(37, 51), Max: image.Pt(200, 180)}} {
+	for _, c := range [][2]int{{0, -1}, {0, 0}, {1, -1}, {1, 0}} {
+		crop := []*image.Rectangle{nil, {Min: image.Pt(37, 51), Max: image.Pt(200, 180)}}[c[0]]
+		setEmit(t, c[1])
 		w := 250
 		if crop != nil {
 			w = crop.Dx()
@@ -386,16 +419,19 @@ func TestThreadedErrorsMatchSequential(t *testing.T) {
 		}
 		for _, mbs := range []int{1, 32} {
 			for _, b := range budgets[:2] {
-				t.Run(fmt.Sprintf("%s/mbs%d/%s", name, mbs, b.name), func(t *testing.T) {
-					setBatch(t, mbs)
-					setBudget(t, b.limit, b.exhausted)
-					for k, w := range want {
-						got := runDecode(vp8[:k.cut], Options{UseThreads: true}, nil, k.need, 0)
-						if msg := sameRun(got, w); msg != "" {
-							t.Fatalf("cut %d need %d: %s", k.cut, k.need, msg)
+				for _, em := range emitModesFor(b.limit, b.exhausted) {
+					t.Run(fmt.Sprintf("%s/mbs%d/%s/%s", name, mbs, b.name, em.name), func(t *testing.T) {
+						setBatch(t, mbs)
+						setBudget(t, b.limit, b.exhausted)
+						setEmit(t, em.waits)
+						for k, w := range want {
+							got := runDecode(vp8[:k.cut], Options{UseThreads: true}, nil, k.need, 0)
+							if msg := sameRun(got, w); msg != "" {
+								t.Fatalf("cut %d need %d: %s", k.cut, k.need, msg)
+							}
 						}
-					}
-				})
+					})
+				}
 			}
 		}
 	}
@@ -415,10 +451,11 @@ func TestThreadedSinkError(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, mbs := range []int{1, 16, 64} {
-		for _, failAt := range []int{1, 2, 5} {
+		for _, failAt := range []int{1, 2, 5, 9} {
 			want := runDecode(p.VP8, Options{}, nil, 0, failAt)
 			setBatch(t, mbs)
 			setBudget(t, 2, false)
+			setEmit(t, []int{-1, 0, 2}[(mbs+failAt)%3])
 			done := make(chan decodeRun, 1)
 			go func() { done <- runDecode(p.VP8, Options{UseThreads: true}, nil, 0, failAt) }()
 			select {
@@ -464,26 +501,29 @@ func TestThreadedHelperPanic(t *testing.T) {
 	vp8 := loadVP8(t, "mix_250x199_o4.webp")
 	for _, mbs := range []int{1, 16} {
 		for _, panicAt := range []int{1, 2, 6} {
-			setBatch(t, mbs)
-			setBudget(t, 1, false)
-			done := make(chan any, 1)
-			go func() {
-				defer func() { done <- recover() }()
-				s := newTraceSink(250, 199)
-				s.panicAt = panicAt
-				_ = Decode(vp8, nil, &Options{UseThreads: true}, s)
-			}()
-			select {
-			case r := <-done:
-				pe, ok := r.(*workers.PanicError)
-				if !ok || pe.Value != "sink panic" {
-					t.Fatalf("mbs %d panicAt %d: recovered %v, want a *workers.PanicError of the sink panic", mbs, panicAt, r)
+			for _, em := range emitModes {
+				setBatch(t, mbs)
+				setBudget(t, 2, false)
+				setEmit(t, em.waits)
+				done := make(chan any, 1)
+				go func() {
+					defer func() { done <- recover() }()
+					s := newTraceSink(250, 199)
+					s.panicAt = panicAt
+					_ = Decode(vp8, nil, &Options{UseThreads: true}, s)
+				}()
+				select {
+				case r := <-done:
+					pe, ok := r.(*workers.PanicError)
+					if !ok || pe.Value != "sink panic" {
+						t.Fatalf("mbs %d panicAt %d: recovered %v, want a *workers.PanicError of the sink panic", mbs, panicAt, r)
+					}
+				case <-time.After(10 * time.Second):
+					t.Fatalf("mbs %d panicAt %d: Decode deadlocked after a helper panic", mbs, panicAt)
 				}
-			case <-time.After(10 * time.Second):
-				t.Fatalf("mbs %d panicAt %d: Decode deadlocked after a helper panic", mbs, panicAt)
-			}
-			if n := workers.InUse(); n != 0 {
-				t.Fatalf("%d helper slots in use after the panic", n)
+				if n := workers.InUse(); n != 0 {
+					t.Fatalf("%d helper slots in use after the panic", n)
+				}
 			}
 		}
 	}
@@ -553,16 +593,26 @@ func TestThreadedAlphaCallback(t *testing.T) {
 		plane[i] = byte(i*7 + i/w)
 	}
 	run := func(threads bool, crop *image.Rectangle, failAt int, opaque bool) (string, map[uint64]bool) {
-		var calls []int
-		opts := Options{UseThreads: threads, Alpha: func(rowEnd int) ([]byte, error) {
-			calls = append(calls, rowEnd)
+		var calls [][2]int
+		var win []byte
+		opts := Options{UseThreads: threads, Alpha: func(rowStart, rowEnd int) ([]byte, int, error) {
+			calls = append(calls, [2]int{rowStart, rowEnd})
 			switch {
 			case len(calls) == failAt:
-				return nil, errAlpha
+				return nil, 0, errAlpha
 			case opaque:
-				return nil, nil
+				return nil, 0, nil
 			}
-			return plane[:rowEnd*w], nil
+			// A window of just the rows asked for; the previous one is
+			// overwritten, so reading it after this call shows.
+			for i := range win {
+				win[i] = 0x5a
+			}
+			if len(calls)%2 == 0 {
+				return plane[:rowEnd*w], 0, nil // a whole plane is a window too
+			}
+			win = append(win[:0], plane[rowStart*w:rowEnd*w]...)
+			return win, rowStart, nil
 		}}
 		r := runDecode(vp8, opts, crop, 0, 0)
 		return fmt.Sprintf("calls %v err %q log %s pix %x", calls, r.err, r.log, sha256.Sum256(r.pix)), r.gids
@@ -574,21 +624,24 @@ func TestThreadedAlphaCallback(t *testing.T) {
 				want, _ := run(false, crop, failAt, opaque)
 				for _, mbs := range []int{1, 32} {
 					for _, b := range budgets {
-						// A subtest, so that the budget (and the slots an
-						// exhausted budget takes) is restored after each run.
-						t.Run(fmt.Sprintf("crop%d/fail%d/opaque%v/mbs%d/%s", ci, failAt, opaque, mbs, b.name), func(t *testing.T) {
-							setBatch(t, mbs)
-							setBudget(t, b.limit, b.exhausted)
-							got, gids := run(true, crop, failAt, opaque)
-							if got != want {
-								t.Fatalf("got  %s\nwant %s", got, want)
-							}
-							// Both regions span all 13 macroblock rows, enough
-							// for two batches of either size.
-							if helper := len(gids) > 1 || (len(gids) == 1 && !gids[goid()]); helper != !b.exhausted && failAt != 1 {
-								t.Errorf("helper used: %v, want %v", helper, !b.exhausted)
-							}
-						})
+						for _, em := range emitModesFor(b.limit, b.exhausted) {
+							// A subtest, so that the budget (and the slots an
+							// exhausted budget takes) is restored after each run.
+							t.Run(fmt.Sprintf("crop%d/fail%d/opaque%v/mbs%d/%s/%s", ci, failAt, opaque, mbs, b.name, em.name), func(t *testing.T) {
+								setBatch(t, mbs)
+								setBudget(t, b.limit, b.exhausted)
+								setEmit(t, em.waits)
+								got, gids := run(true, crop, failAt, opaque)
+								if got != want {
+									t.Fatalf("got  %s\nwant %s", got, want)
+								}
+								// Both regions span all 13 macroblock rows, enough
+								// for two batches of either size.
+								if helper := len(gids) > 1 || (len(gids) == 1 && !gids[goid()]); helper != !b.exhausted && failAt != 1 {
+									t.Errorf("helper used: %v, want %v", helper, !b.exhausted)
+								}
+							})
+						}
 					}
 				}
 			}
@@ -607,11 +660,12 @@ func TestThreadedAlphaCallback(t *testing.T) {
 func TestThreadedParserPanic(t *testing.T) {
 	checkNoLeak(t)
 	setBatch(t, 1)
-	setBudget(t, 1, false)
+	setBudget(t, 2, false)
 	vp8 := loadVP8(t, "mix_64x48_p1.webp")
 	want := runDecode(vp8, Options{}, nil, 0, 0)
 	for _, part := range []int{0, 1} {
-		for round := 0; round < 20; round++ {
+		for round := 0; round < 30; round++ {
+			setEmit(t, []int{-1, 0, 2}[round%3])
 			d := new(decoder)
 			if err := d.parseHeaders(vp8); err != nil {
 				t.Fatal(err)
@@ -648,6 +702,86 @@ func TestThreadedParserPanic(t *testing.T) {
 			}
 			if part == 0 && len(s.log) != 0 {
 				t.Fatalf("partition 0: sink calls %v before the first row was parsed", s.log)
+			}
+		}
+	}
+}
+
+// TestThreadedModesAhead slows the token parser down so that the idle
+// helpers parse the first partition ahead of it, and checks that the
+// output, the sink calls and the errors (truncations inside the first
+// partition and inside the tokens, early stops) stay those of the
+// sequential decoder, for every emit policy.
+func TestThreadedModesAhead(t *testing.T) {
+	checkNoLeak(t)
+	for _, name := range []string{"mix_250x199_o4.webp", "grad_250x199_o9.webp", "mix_64x48_p1.webp"} {
+		vp8 := loadVP8(t, name)
+		_, h, _ := DecodeHeader(vp8)
+		start := 10 + partLen(vp8)
+		cuts := []int{len(vp8), len(vp8) - 2, start + (len(vp8)-start)/2, start + 1, start - 1, start * 3 / 4, start / 2}
+		for _, em := range emitModes {
+			t.Run(name+"/"+em.name, func(t *testing.T) {
+				setBatch(t, 1)
+				setBudget(t, 2, false)
+				setEmit(t, em.waits)
+				var ahead atomic.Int64
+				old := testHookTokenRow
+				testHookTokenRow = func(d *decoder, mbY int) {
+					time.Sleep(200 * time.Microsecond)
+					// The token parser only parses the modes of the row it
+					// needs: those of later rows come from a helper.
+					if int(d.mt.modeReady.Load()) > mbY+1 {
+						ahead.Add(1)
+					}
+				}
+				t.Cleanup(func() { testHookTokenRow = old })
+				for _, cut := range cuts {
+					for _, need := range []int{0, h / 2} {
+						opts := Options{DitheringStrength: 30}
+						want := runDecode(vp8[:cut], opts, nil, need, 0)
+						if cut == len(vp8) && need == 0 && want.err != "" {
+							t.Fatalf("full stream: %s", want.err)
+						}
+						opts.UseThreads = true
+						got := runDecode(vp8[:cut], opts, nil, need, 0)
+						if msg := sameRun(got, want); msg != "" {
+							t.Fatalf("cut %d need %d: %s", cut, need, msg)
+						}
+					}
+				}
+				if ahead.Load() == 0 {
+					t.Errorf("no mode row was parsed ahead by a helper")
+				}
+			})
+		}
+	}
+}
+
+// TestThreadedDeterministicAcrossBudgets decodes with UseThreads under
+// every helper budget from 1 to 8 and several GOMAXPROCS values, with the
+// default policies, and checks that every output is the sequential one.
+func TestThreadedDeterministicAcrossBudgets(t *testing.T) {
+	checkNoLeak(t)
+	files := testVP8Files(t)
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(0))
+	for name, vp8 := range files {
+		want := runDecode(vp8, Options{}, nil, 0, 0)
+		if want.err != "" {
+			t.Fatalf("%s: %s", name, want.err)
+		}
+		for _, mbs := range []int{16, 512} {
+			for limit := 1; limit <= 8; limit++ {
+				for _, p := range []int{1, 2, 4, runtime.NumCPU()} {
+					t.Run(fmt.Sprintf("%s/mbs%d/limit%d/procs%d", name, mbs, limit, p), func(t *testing.T) {
+						runtime.GOMAXPROCS(p)
+						setBatch(t, mbs)
+						setBudget(t, limit, false)
+						got := runDecode(vp8, Options{UseThreads: true}, nil, 0, 0)
+						if msg := sameRun(got, want); msg != "" {
+							t.Fatal(msg)
+						}
+					})
+				}
 			}
 		}
 	}

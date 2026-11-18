@@ -427,7 +427,7 @@ func (d *decoder) emitRows(argb []uint32, y0, row int) error {
 	}
 
 	if d.out == outGreen {
-		dst := d.alpha[y0*fw : row*fw]
+		dst := d.alpha[(y0-d.alphaRow)*fw : (row-d.alphaRow)*fw]
 		argb = argb[:len(dst)]
 		for i, c := range argb {
 			dst[i] = byte(c >> 8)
@@ -640,7 +640,7 @@ func (d *decoder) extractAlpha8(row int) {
 		return
 	}
 	w, fw, base := d.xsize, d.width, d.px.base
-	inverseColorIndexAlpha(&d.transforms[0], d.alphaTab, row-y0, d.ib[y0*w-base:row*w-base], d.alpha[y0*fw:row*fw])
+	inverseColorIndexAlpha(&d.transforms[0], d.alphaTab, row-y0, d.ib[y0*w-base:row*w-base], d.alpha[(y0-d.alphaRow)*fw:(row-d.alphaRow)*fw])
 	d.lastRow = row
 }
 

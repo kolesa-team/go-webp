@@ -1,6 +1,7 @@
 package decoder
 
 import (
+	"runtime"
 	"sync"
 
 	"github.com/kolesa-team/go-webp/v2/internal/alpha"
@@ -42,6 +43,11 @@ import (
 //
 // Alpha dithering of quantized planes needs the whole plane at once and
 // stays sequential.
+//
+// With a ring (see lazyAlpha), the helper's look-ahead bounds the rows it
+// writes: they stay below the first row of the last request (which the
+// requester may still read) plus the ring size, which ringRows makes
+// larger than the look-ahead, a step and the rows of a request.
 
 var (
 	// alphaBandPixels is the amount of alpha work per wake-up of the
@@ -70,7 +76,7 @@ type alphaHelper struct {
 	// Guarded by mu.
 	requested int    // largest rowEnd requested
 	published int    // rows [0, published) of pub are final
-	pub       []byte // plane holding the published rows
+	pub       []byte // buffer holding the published rows
 	idle      bool   // the helper sleeps (published is its row count)
 	waiting   bool   // the requester waits for rows
 	stop      bool   // set by release: exit after the current step
@@ -81,6 +87,15 @@ type alphaHelper struct {
 	// touched by the requesting goroutine).
 	reqs []int
 }
+
+// handOff yields the processor after waking the other goroutine of the
+// alpha helper (the helper or the requester) while continuing to work:
+// otherwise the woken goroutine waits in this goroutine's next-to-run slot,
+// from which other threads only take it after a back-off (tens of
+// microseconds on darwin, hundreds on Linux VMs; see the vp8 package's
+// parked.handOff). It is no wait: Gosched returns at once when nothing
+// else is runnable.
+func handOff() { runtime.Gosched() }
 
 // errHelperPanic aborts a decode whose alpha helper panicked; the panic
 // itself is re-raised on the decoding goroutine by release.
@@ -95,11 +110,18 @@ func (a *lazyAlpha) useHelper() bool {
 	return a.w*a.crop.Max.Y >= minHelperPixels && a.h > 1
 }
 
+// helperRows returns the rows of a step and of a band of the helper, for
+// planes of width w.
+func helperRows(w int) (step, band int) {
+	band = max((alphaBandPixels+w-1)/w, 1)
+	step = min(max((alphaStepPixels+w-1)/w, 1), band)
+	return step, band
+}
+
 // startHelper starts the helper goroutine, if the worker budget allows;
 // a.rows must be 0 (nothing decoded yet).
 func (a *lazyAlpha) startHelper() bool {
-	band := max((alphaBandPixels+a.w-1)/a.w, 1)
-	step := min(max((alphaStepPixels+a.w-1)/a.w, 1), band)
+	step, band := helperRows(a.w)
 	// No request goes past the bottom of the output region (crop), so the
 	// helper stops there instead of working ahead on rows nobody needs.
 	limit := min(a.h-1, a.crop.Max.Y)
@@ -127,6 +149,9 @@ func (a *lazyAlpha) runHelper(hp *alphaHelper) error {
 		hp.cond.Broadcast()
 		hp.mu.Unlock()
 	}()
+	// A ring sized for the look-ahead (allocated here, so that a decode
+	// whose helper cannot start keeps the smaller sequential ring).
+	a.alloc(true)
 	for {
 		hp.mu.Lock()
 		if !hp.stop && a.rows < hp.limit && a.rows >= hp.requested+hp.ahead {
@@ -152,11 +177,15 @@ func (a *lazyAlpha) runHelper(hp *alphaHelper) error {
 			hp.mu.Unlock()
 			return nil
 		}
-		hp.published, hp.pub = a.rows, a.plane
-		if hp.waiting {
+		hp.published, hp.pub = a.rows, a.buf
+		wake := hp.waiting
+		if wake {
 			hp.cond.Broadcast()
 		}
 		hp.mu.Unlock()
+		if wake {
+			handOff()
+		}
 	}
 }
 
@@ -164,28 +193,36 @@ func (a *lazyAlpha) runHelper(hp *alphaHelper) error {
 // published rowEnd rows. When the helper has exited without them (it
 // reached its row limit, failed or panicked) the decode continues on the
 // calling goroutine.
-func (a *lazyAlpha) getAsync(rowEnd int) ([]byte, error) {
+func (a *lazyAlpha) getAsync(rowStart, rowEnd int) ([]byte, int, error) {
 	hp := a.hp
 	if n := len(hp.reqs); n == 0 || rowEnd > hp.reqs[n-1] {
 		hp.reqs = append(hp.reqs, rowEnd)
 	}
 	hp.mu.Lock()
+	wake := false
 	if rowEnd > hp.requested {
 		hp.requested = rowEnd
 		// A sleeping helper has published all its rows.
 		if hp.idle && hp.published+hp.band <= hp.requested+hp.ahead {
 			hp.cond.Broadcast()
+			wake = true
 		}
 	}
 	for hp.published < rowEnd && !hp.exited {
 		hp.waiting = true
+		wake = false // waiting lets the helper run
 		hp.cond.Wait()
 	}
 	hp.waiting = false
 	if hp.published >= rowEnd {
 		p := hp.pub
 		hp.mu.Unlock()
-		return p, nil
+		if wake {
+			handOff()
+		}
+		// The helper only writes rows from published on, below rowStart
+		// plus the ring size: not the rows of the window.
+		return a.window(p, rowStart, rowEnd)
 	}
 	failed := hp.failed
 	hp.mu.Unlock()
@@ -194,22 +231,23 @@ func (a *lazyAlpha) getAsync(rowEnd int) ([]byte, error) {
 	a.async = false
 	if hp.task.Panicked() {
 		a.err = errHelperPanic
-		return nil, a.err
+		return nil, 0, a.err
 	}
 	if failed {
-		a.err = a.replay(hp.reqs)
+		a.err = a.replay(hp.reqs, rowStart)
 	} else {
-		a.err = a.decodeRows(rowEnd)
+		a.err = a.decodeRequest(rowStart, rowEnd)
 	}
 	if a.err != nil {
-		return nil, a.err
+		return nil, 0, a.err
 	}
-	return a.plane, nil
+	return a.window(a.buf, rowStart, rowEnd)
 }
 
 // replay redoes the requests reqs from the first row with a fresh decoder,
 // as the sequential path would have made them, and returns the first error.
-func (a *lazyAlpha) replay(reqs []int) error {
+// rowStart is the first row of the last request.
+func (a *lazyAlpha) replay(reqs []int, rowStart int) error {
 	if a.dec != nil {
 		a.dec.Close()
 		a.dec = nil
@@ -218,8 +256,14 @@ func (a *lazyAlpha) replay(reqs []int) error {
 	if err := a.init(); err != nil {
 		return err
 	}
-	for _, r := range reqs {
-		if err := a.decodeRows(r); err != nil {
+	for i, r := range reqs {
+		// The rows before the last request are not needed any more: any
+		// earlier row will do as the first row of a request.
+		start := min(rowStart, r)
+		if i < len(reqs)-1 {
+			start = max(r-1, 0)
+		}
+		if err := a.decodeRequest(start, r); err != nil {
 			return err
 		}
 	}
@@ -238,7 +282,7 @@ func (a *lazyAlpha) stopHelper() {
 	hp.cond.Broadcast()
 	hp.mu.Unlock()
 	if hp.task.Panicked() {
-		a.dec, a.pp, a.spare, a.plane = nil, nil, nil, nil
+		a.dec, a.pp, a.spare, a.buf = nil, nil, nil, nil
 	}
 	a.hp, a.async = nil, false
 	_ = hp.task.Wait() // re-raises a panic of the helper
