@@ -104,6 +104,9 @@ func checkNoLeak(t testing.TB) {
 		if n := workers.InUse(); n != 0 {
 			t.Errorf("%d helper slots still in use", n)
 		}
+		if n := workers.HandOffs(); n != 0 {
+			t.Errorf("%d UseThreads pipelines still registered", n)
+		}
 	})
 }
 
@@ -523,6 +526,9 @@ func TestThreadedHelperPanic(t *testing.T) {
 				}
 				if n := workers.InUse(); n != 0 {
 					t.Fatalf("%d helper slots in use after the panic", n)
+				}
+				if n := workers.HandOffs(); n != 0 {
+					t.Fatalf("%d UseThreads pipelines still registered after the panic", n)
 				}
 			}
 		}

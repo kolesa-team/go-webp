@@ -149,3 +149,27 @@ func TestSpawnGoexitIsReported(t *testing.T) {
 	task.Wait()
 	t.Fatal("Wait returned after runtime.Goexit")
 }
+
+func TestSpareProcs(t *testing.T) {
+	if n := HandOffs(); n != 0 {
+		t.Fatalf("HandOffs = %d at start, want 0", n)
+	}
+	if !SpareProcs(1) || !SpareProcs(4) {
+		t.Fatal("SpareProcs = false with no call in progress")
+	}
+	for range 2 {
+		BeginHandOffs()
+	}
+	if !SpareProcs(4) {
+		t.Fatal("SpareProcs(4) = false with 2 calls in progress")
+	}
+	if SpareProcs(3) {
+		t.Fatal("SpareProcs(3) = true with 2 calls in progress")
+	}
+	for range 2 {
+		EndHandOffs()
+	}
+	if n := HandOffs(); n != 0 {
+		t.Fatalf("HandOffs = %d after EndHandOffs, want 0", n)
+	}
+}
