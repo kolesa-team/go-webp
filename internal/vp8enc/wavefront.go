@@ -2,6 +2,7 @@ package vp8enc
 
 import (
 	"math"
+	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -105,6 +106,13 @@ var (
 	// wfRowPool holds the rows' progress counters.
 	wfRowPool bufpool.Pool[wfRow]
 
+	// activeEncodes counts the Encode calls in progress. A wavefront pass
+	// takes at most GOMAXPROCS/activeEncodes workers: a server that
+	// already codes about one picture per processor gains nothing from
+	// helpers, whose rows would then wait on each other's descheduled
+	// workers.
+	activeEncodes atomic.Int32
+
 	// forceWavefront (tests only) codes every picture of two rows or more
 	// as a wavefront, whatever its size.
 	forceWavefront bool
@@ -128,7 +136,8 @@ func (e *encoder) wavefrontWorkers() int {
 	if work < minWavefrontWork || int64(e.mbW)*cost < minWavefrontRowWork {
 		return 1
 	}
-	return max(1, min(maxWavefrontWorkers, e.mbH, e.mbW/minWavefrontGap, int(min(work/wavefrontWorkPerWorker, maxWavefrontWorkers))))
+	nw := min(maxWavefrontWorkers, e.mbH, e.mbW/minWavefrontGap, int(min(work/wavefrontWorkPerWorker, maxWavefrontWorkers)))
+	return max(1, min(nw, runtime.GOMAXPROCS(0)/max(1, int(activeEncodes.Load()))))
 }
 
 // wfWorker is one goroutine of a wavefront pass.
