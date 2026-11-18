@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // pollPoints returns the polls (1-based) at which the tests make the
@@ -150,11 +151,16 @@ func TestInterruptParallelStages(t *testing.T) {
 				}
 				cfg.ThreadLevel = true
 				caller := callerID()
-				var polls, onHelpers atomic.Int64
+				var polls, onHelpers, waits atomic.Int64
 				cfg.Interrupt = func() bool {
 					polls.Add(1)
 					if callerID() != caller {
 						onHelpers.Add(1)
+					} else if onHelpers.Load() == 0 && waits.Add(1) <= 200 {
+						// Let the helpers of a stage start and claim an
+						// item: on a loaded machine the caller may claim
+						// them all first.
+						time.Sleep(20 * time.Microsecond)
 					}
 					return false
 				}
