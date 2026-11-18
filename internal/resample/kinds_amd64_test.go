@@ -37,15 +37,24 @@ func TestKernelCoverage(t *testing.T) {
 // usual geometries get, so that the differential tests exercise them.
 func TestKernelSelection(t *testing.T) {
 	forEachLevel(t, func(t *testing.T) {
+		w8, w16 := uint8(kindShrink4), uint8(kindShrink4)
+		if x86Level >= cpuinfo.AVX2 {
+			w8, w16 = kindShrink4W8, kindShrink4W16
+		}
 		for _, c := range []struct {
 			sw, dw, ch int
 			kind       uint8
 		}{
-			{1024, 300, 4, kindShrink4},
-			{3000, 320, 4, kindShrink4},
+			{1024, 300, 4, w8},
+			{2560, 320, 4, w8},
+			{2561, 320, 4, w16},
+			{3000, 320, 4, w16},
+			{5120, 320, 4, w16},
+			{5121, 320, 4, kindShrink4},
 			{3000, 6, 4, kindShrink4},
-			{3000, 5, 4, kindGo}, // spans of more than maxShrink4Span pixels
-			{3, 1, 4, kindGo},    // narrower than one 16-byte load
+			{3000, 5, 4, kindGo},   // spans of more than maxShrink4Span pixels
+			{6, 3, 4, kindShrink4}, // too narrow for one 32-byte window
+			{3, 1, 4, kindGo},      // narrower than one 16-byte load
 			{675, 320, 1, kindShrink1P},
 			{338, 320, 1, kindShrink1P},
 			{1500, 320, 1, kindShrink1P},

@@ -567,6 +567,312 @@ q2done:
 	VZEROUPPER
 	RET
 
+// The windowed 4-channel AVX2 kernels: spans of at most 8 (W8) or 16
+// (W16) pixels, two destination pixels per iteration. A span is read as
+// one (W8) or two (W16) 32-byte windows from its start; VPSHUFB with the
+// indices at tr4m<> + 64*cnt transposes each 128-bit lane (4 pixels) to
+// channel-major order and zeroes the pixels past the span, then
+// VPMADDUBSW by ones adds pixel pairs per channel (16-bit). The two
+// pixels of a pair are reduced together: VPERM2I128 gathers their low and
+// their high lanes, VPADDW adds them (at most 8 pixels per word) and
+// VPMADDWD by ones the last pairs, leaving each pixel's four channel sums
+// in its own lane. The math of both pixels then runs in one ymm register
+// (words 0-3 pixel x, 4-7 pixel x+1); the carries in are the previous
+// pair's second carry out and this pair's first one.
+
+// ones8<> and ones16<> hold 1 in every byte and every 16-bit lane.
+DATA ones8<>+0x00(SB)/8, $0x0101010101010101
+DATA ones8<>+0x08(SB)/8, $0x0101010101010101
+DATA ones8<>+0x10(SB)/8, $0x0101010101010101
+DATA ones8<>+0x18(SB)/8, $0x0101010101010101
+GLOBL ones8<>(SB), RODATA|NOPTR, $32
+
+DATA ones16<>+0x00(SB)/8, $0x0001000100010001
+DATA ones16<>+0x08(SB)/8, $0x0001000100010001
+DATA ones16<>+0x10(SB)/8, $0x0001000100010001
+DATA ones16<>+0x18(SB)/8, $0x0001000100010001
+GLOBL ones16<>(SB), RODATA|NOPTR, $32
+
+// naIdx<> are the VPERMD indices broadcasting words 1 and 3 (the na of a
+// pair of column table entries) to the two lanes.
+DATA naIdx<>+0x00(SB)/8, $0x0000000100000001
+DATA naIdx<>+0x08(SB)/8, $0x0000000100000001
+DATA naIdx<>+0x10(SB)/8, $0x0000000300000003
+DATA naIdx<>+0x18(SB)/8, $0x0000000300000003
+GLOBL naIdx<>(SB), RODATA|NOPTR, $32
+
+// tr4m<> + 64*n: the VPSHUFB indices of the two windows of a span of n
+// pixels (generated: byte j of lane l of window w selects byte
+// 4*(j%4) + j/4 of the lane if pixel 8w + 4l + j%4 is below n, else 0x80).
+DATA tr4m<>+0x000(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x008(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x010(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x018(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x020(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x028(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x030(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x038(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x040(SB)/8, $0x8080800180808000
+DATA tr4m<>+0x048(SB)/8, $0x8080800380808002
+DATA tr4m<>+0x050(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x058(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x060(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x068(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x070(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x078(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x080(SB)/8, $0x8080050180800400
+DATA tr4m<>+0x088(SB)/8, $0x8080070380800602
+DATA tr4m<>+0x090(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x098(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x0a0(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x0a8(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x0b0(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x0b8(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x0c0(SB)/8, $0x8009050180080400
+DATA tr4m<>+0x0c8(SB)/8, $0x800b0703800a0602
+DATA tr4m<>+0x0d0(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x0d8(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x0e0(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x0e8(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x0f0(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x0f8(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x100(SB)/8, $0x0d0905010c080400
+DATA tr4m<>+0x108(SB)/8, $0x0f0b07030e0a0602
+DATA tr4m<>+0x110(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x118(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x120(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x128(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x130(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x138(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x140(SB)/8, $0x0d0905010c080400
+DATA tr4m<>+0x148(SB)/8, $0x0f0b07030e0a0602
+DATA tr4m<>+0x150(SB)/8, $0x8080800180808000
+DATA tr4m<>+0x158(SB)/8, $0x8080800380808002
+DATA tr4m<>+0x160(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x168(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x170(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x178(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x180(SB)/8, $0x0d0905010c080400
+DATA tr4m<>+0x188(SB)/8, $0x0f0b07030e0a0602
+DATA tr4m<>+0x190(SB)/8, $0x8080050180800400
+DATA tr4m<>+0x198(SB)/8, $0x8080070380800602
+DATA tr4m<>+0x1a0(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x1a8(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x1b0(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x1b8(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x1c0(SB)/8, $0x0d0905010c080400
+DATA tr4m<>+0x1c8(SB)/8, $0x0f0b07030e0a0602
+DATA tr4m<>+0x1d0(SB)/8, $0x8009050180080400
+DATA tr4m<>+0x1d8(SB)/8, $0x800b0703800a0602
+DATA tr4m<>+0x1e0(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x1e8(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x1f0(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x1f8(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x200(SB)/8, $0x0d0905010c080400
+DATA tr4m<>+0x208(SB)/8, $0x0f0b07030e0a0602
+DATA tr4m<>+0x210(SB)/8, $0x0d0905010c080400
+DATA tr4m<>+0x218(SB)/8, $0x0f0b07030e0a0602
+DATA tr4m<>+0x220(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x228(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x230(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x238(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x240(SB)/8, $0x0d0905010c080400
+DATA tr4m<>+0x248(SB)/8, $0x0f0b07030e0a0602
+DATA tr4m<>+0x250(SB)/8, $0x0d0905010c080400
+DATA tr4m<>+0x258(SB)/8, $0x0f0b07030e0a0602
+DATA tr4m<>+0x260(SB)/8, $0x8080800180808000
+DATA tr4m<>+0x268(SB)/8, $0x8080800380808002
+DATA tr4m<>+0x270(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x278(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x280(SB)/8, $0x0d0905010c080400
+DATA tr4m<>+0x288(SB)/8, $0x0f0b07030e0a0602
+DATA tr4m<>+0x290(SB)/8, $0x0d0905010c080400
+DATA tr4m<>+0x298(SB)/8, $0x0f0b07030e0a0602
+DATA tr4m<>+0x2a0(SB)/8, $0x8080050180800400
+DATA tr4m<>+0x2a8(SB)/8, $0x8080070380800602
+DATA tr4m<>+0x2b0(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x2b8(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x2c0(SB)/8, $0x0d0905010c080400
+DATA tr4m<>+0x2c8(SB)/8, $0x0f0b07030e0a0602
+DATA tr4m<>+0x2d0(SB)/8, $0x0d0905010c080400
+DATA tr4m<>+0x2d8(SB)/8, $0x0f0b07030e0a0602
+DATA tr4m<>+0x2e0(SB)/8, $0x8009050180080400
+DATA tr4m<>+0x2e8(SB)/8, $0x800b0703800a0602
+DATA tr4m<>+0x2f0(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x2f8(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x300(SB)/8, $0x0d0905010c080400
+DATA tr4m<>+0x308(SB)/8, $0x0f0b07030e0a0602
+DATA tr4m<>+0x310(SB)/8, $0x0d0905010c080400
+DATA tr4m<>+0x318(SB)/8, $0x0f0b07030e0a0602
+DATA tr4m<>+0x320(SB)/8, $0x0d0905010c080400
+DATA tr4m<>+0x328(SB)/8, $0x0f0b07030e0a0602
+DATA tr4m<>+0x330(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x338(SB)/8, $0x8080808080808080
+DATA tr4m<>+0x340(SB)/8, $0x0d0905010c080400
+DATA tr4m<>+0x348(SB)/8, $0x0f0b07030e0a0602
+DATA tr4m<>+0x350(SB)/8, $0x0d0905010c080400
+DATA tr4m<>+0x358(SB)/8, $0x0f0b07030e0a0602
+DATA tr4m<>+0x360(SB)/8, $0x0d0905010c080400
+DATA tr4m<>+0x368(SB)/8, $0x0f0b07030e0a0602
+DATA tr4m<>+0x370(SB)/8, $0x8080800180808000
+DATA tr4m<>+0x378(SB)/8, $0x8080800380808002
+DATA tr4m<>+0x380(SB)/8, $0x0d0905010c080400
+DATA tr4m<>+0x388(SB)/8, $0x0f0b07030e0a0602
+DATA tr4m<>+0x390(SB)/8, $0x0d0905010c080400
+DATA tr4m<>+0x398(SB)/8, $0x0f0b07030e0a0602
+DATA tr4m<>+0x3a0(SB)/8, $0x0d0905010c080400
+DATA tr4m<>+0x3a8(SB)/8, $0x0f0b07030e0a0602
+DATA tr4m<>+0x3b0(SB)/8, $0x8080050180800400
+DATA tr4m<>+0x3b8(SB)/8, $0x8080070380800602
+DATA tr4m<>+0x3c0(SB)/8, $0x0d0905010c080400
+DATA tr4m<>+0x3c8(SB)/8, $0x0f0b07030e0a0602
+DATA tr4m<>+0x3d0(SB)/8, $0x0d0905010c080400
+DATA tr4m<>+0x3d8(SB)/8, $0x0f0b07030e0a0602
+DATA tr4m<>+0x3e0(SB)/8, $0x0d0905010c080400
+DATA tr4m<>+0x3e8(SB)/8, $0x0f0b07030e0a0602
+DATA tr4m<>+0x3f0(SB)/8, $0x8009050180080400
+DATA tr4m<>+0x3f8(SB)/8, $0x800b0703800a0602
+DATA tr4m<>+0x400(SB)/8, $0x0d0905010c080400
+DATA tr4m<>+0x408(SB)/8, $0x0f0b07030e0a0602
+DATA tr4m<>+0x410(SB)/8, $0x0d0905010c080400
+DATA tr4m<>+0x418(SB)/8, $0x0f0b07030e0a0602
+DATA tr4m<>+0x420(SB)/8, $0x0d0905010c080400
+DATA tr4m<>+0x428(SB)/8, $0x0f0b07030e0a0602
+DATA tr4m<>+0x430(SB)/8, $0x0d0905010c080400
+DATA tr4m<>+0x438(SB)/8, $0x0f0b07030e0a0602
+GLOBL tr4m<>(SB), RODATA|NOPTR, $1088
+
+// SH4W_SUM8(N, Ya) sums the span of N (<= 8) pixels at SI into the
+// channel pair sums (16-bit) of Ya.
+#define SH4W_SUM8(N, Ya) \
+	MOVQ       N, R10                 \
+	SHLQ       $6, R10                \
+	VMOVDQU    (SI), Ya               \
+	VPSHUFB    (R11)(R10*1), Ya, Ya   \
+	VPMADDUBSW Y11, Ya, Ya
+
+// SH4W_SUM16(N, Ya, Yb) is SH4W_SUM8 for N <= 16 pixels.
+#define SH4W_SUM16(N, Ya, Yb) \
+	MOVQ       N, R10                 \
+	SHLQ       $6, R10                \
+	VMOVDQU    (SI), Ya               \
+	VPSHUFB    (R11)(R10*1), Ya, Ya   \
+	VMOVDQU    32(SI), Yb             \
+	VPSHUFB    32(R11)(R10*1), Yb, Yb \
+	VPMADDUBSW Y11, Ya, Ya            \
+	VPMADDUBSW Y11, Yb, Yb            \
+	VPADDW     Yb, Ya, Ya
+
+// SH4W_SETUP sets the constants up from AX (xSub) and R8 (fx).
+#define SH4W_SETUP \
+	VMOVQ        AX, X12          \
+	VPBROADCASTD X12, Y12         \
+	VMOVQ        R8, X13          \
+	VPBROADCASTD X13, Y13         \
+	VMOVDQU      rnd31<>(SB), Y14 \
+	VMOVDQU      naIdx<>(SB), Y9  \
+	VMOVDQU      ones16<>(SB), Y10 \
+	VMOVDQU      ones8<>(SB), Y11 \
+	LEAQ         tr4m<>(SB), R11  \
+	VPXOR        Y15, Y15, Y15
+
+// SH4W_PAIR completes a pair from the channel pair sums (Y0, Y2), the
+// last pixels (X4, X5) and na (Y6); skip is a fresh label.
+#define SH4W_PAIR(skip) \
+	VPERM2I128  $0x20, Y2, Y0, Y1  \
+	VPERM2I128  $0x31, Y2, Y0, Y3  \
+	VPADDW      Y3, Y1, Y0         \
+	VPMADDWD    Y10, Y0, Y0        \
+	VINSERTI128 $1, X5, Y4, Y4     \
+	VPMULLD     Y6, Y4, Y6         \
+	MULTFIX_AVX(Y6, Y13, Y7, Y8)   \
+	VPERM2I128  $0x21, Y7, Y15, Y8 \
+	VMOVDQA     Y7, Y15            \
+	VPADDD      Y8, Y0, Y0         \
+	VPMULLD     Y12, Y0, Y0        \
+	VPSUBD      Y6, Y0, Y0         \
+	VMOVDQU     Y0, (DI)           \
+	ADDQ        $32, DI            \
+	TESTQ       DX, DX             \
+	JZ          skip               \
+	VPADDD      (DX), Y0, Y0       \
+	VMOVDQU     Y0, (DX)           \
+	ADDQ        $32, DX            \
+skip:
+
+// func shrink4W8AVX2(frow, acc *uint32, src *byte, cols *uint32, pairs int, xSub, fx uint32)
+//
+// DI frow, DX acc (nil: no accumulation), SI src, BX cols, CX pairs left,
+// R8/R9 the two counts, R10 index offset, R11 tr4m. Y0-Y8 work registers,
+// Y9 naIdx, Y10 ones16, Y11 ones8, Y12 xSub, Y13 fx, Y14 rnd31, Y15
+// previous carries out.
+TEXT ·shrink4W8AVX2(SB), NOSPLIT, $0-48
+	MOVQ  frow+0(FP), DI
+	MOVQ  acc+8(FP), DX
+	MOVQ  src+16(FP), SI
+	MOVQ  cols+24(FP), BX
+	MOVQ  pairs+32(FP), CX
+	MOVL  xSub+40(FP), AX
+	MOVL  fx+44(FP), R8
+	SH4W_SETUP
+	TESTQ CX, CX
+	JZ    w8done
+
+w8loop:
+	MOVL      0(BX), R8
+	MOVL      8(BX), R9
+	VMOVDQU   (BX), X6
+	VPERMD    Y6, Y9, Y6
+	ADDQ      $16, BX
+	SH4W_SUM8(R8, Y0)
+	LEAQ      (SI)(R8*4), SI
+	VPMOVZXBD -4(SI), X4
+	SH4W_SUM8(R9, Y2)
+	LEAQ      (SI)(R9*4), SI
+	VPMOVZXBD -4(SI), X5
+	SH4W_PAIR(w8skip)
+	DECQ      CX
+	JNZ       w8loop
+
+w8done:
+	VZEROUPPER
+	RET
+
+// func shrink4W16AVX2(frow, acc *uint32, src *byte, cols *uint32, pairs int, xSub, fx uint32)
+//
+// shrink4W8AVX2 with two windows per span.
+TEXT ·shrink4W16AVX2(SB), NOSPLIT, $0-48
+	MOVQ  frow+0(FP), DI
+	MOVQ  acc+8(FP), DX
+	MOVQ  src+16(FP), SI
+	MOVQ  cols+24(FP), BX
+	MOVQ  pairs+32(FP), CX
+	MOVL  xSub+40(FP), AX
+	MOVL  fx+44(FP), R8
+	SH4W_SETUP
+	TESTQ CX, CX
+	JZ    w16done
+
+w16loop:
+	MOVL      0(BX), R8
+	MOVL      8(BX), R9
+	VMOVDQU   (BX), X6
+	VPERMD    Y6, Y9, Y6
+	ADDQ      $16, BX
+	SH4W_SUM16(R8, Y0, Y1)
+	LEAQ      (SI)(R8*4), SI
+	VPMOVZXBD -4(SI), X4
+	SH4W_SUM16(R9, Y2, Y3)
+	LEAQ      (SI)(R9*4), SI
+	VPMOVZXBD -4(SI), X5
+	SH4W_PAIR(w16skip)
+	DECQ      CX
+	JNZ       w16loop
+
+w16done:
+	VZEROUPPER
+	RET
+
 // func expandRow4SSE41(frow, acc *uint32, src *byte, cols *uint32, n int, xAdd uint32)
 //
 // WebPRescalerImportRowExpand_C for 4 channels and a source at least two

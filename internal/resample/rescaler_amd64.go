@@ -28,6 +28,8 @@ var x86Level = cpuinfo.Max
 const (
 	kindGo = iota
 	kindShrink4
+	kindShrink4W8
+	kindShrink4W16
 	kindShrink1
 	kindShrink1P
 	kindShrink1S
@@ -35,10 +37,13 @@ const (
 )
 
 const (
-	// maxShrink4Span is the longest span shrinkRow4SSE41/AVX2 handle:
-	// they sum each channel in 16-bit lanes, two pixels per lane and per
-	// 16 bytes.
+	// maxShrink4Span is the longest span shrinkRow4SSE41 handles: it sums
+	// each channel in 16-bit lanes, two pixels per lane and per 16 bytes.
 	maxShrink4Span = 511
+	// maxShrink4W8Span and maxShrink4W16Span are the longest spans of the
+	// windowed AVX2 kernels: one or two 32-byte windows per span.
+	maxShrink4W8Span  = 8
+	maxShrink4W16Span = 16
 	// maxShrink1PSpan and maxShrink1SSpan are the longest spans of the
 	// record kernels: two spans of 8 bytes (P) or one of 16 bytes (S)
 	// per 16-byte window.
@@ -109,7 +114,21 @@ func (r *Rescaler) initArch(tab []uint32) {
 	}
 	switch {
 	case r.numChannels == 4:
-		if nmax <= maxShrink4Span {
+		// The windowed kernels do pairs of destination pixels and read
+		// 8 or 16 pixels from each span start.
+		switch {
+		case lvl >= cpuinfo.AVX2 && nmax <= maxShrink4W8Span:
+			a.kind = kindShrink4W8
+			a.asmOuts, a.asmSrc = lead(8)
+		case lvl >= cpuinfo.AVX2 && nmax <= maxShrink4W16Span:
+			a.kind = kindShrink4W16
+			a.asmOuts, a.asmSrc = lead(16)
+		}
+		if a.asmOuts%2 != 0 {
+			a.asmOuts--
+			a.asmSrc -= int(cols[2*a.asmOuts])
+		}
+		if a.asmOuts == 0 && nmax <= maxShrink4Span {
 			a.kind = kindShrink4
 			a.asmOuts, a.asmSrc = lead(4)
 		}
@@ -226,7 +245,7 @@ func buildShrink1SRecords(rec []byte, cols []uint32, srcWidth int) {
 
 func (r *Rescaler) shrinkRow(src []byte, acc []uint32) {
 	switch r.arch.kind {
-	case kindShrink4:
+	case kindShrink4, kindShrink4W8, kindShrink4W16:
 		r.shrinkRow4(src, acc)
 	case kindShrink1, kindShrink1P, kindShrink1S:
 		r.shrinkRow1(src, acc)
@@ -259,11 +278,24 @@ func (r *Rescaler) shrinkRow4(src []byte, acc []uint32) {
 	n, s := r.arch.asmOuts, r.arch.asmSrc
 	xSub, fx := uint32(r.xSub), r.fxScale
 	// The last span the kernel handles starts at most at pixel
-	// srcWidth-4 (initArch), so its 16-byte load is inside src; all other
-	// reads are inside the spans, src[:4*s].
+	// srcWidth-4 (16-byte loads), srcWidth-8 (W8, 32-byte loads) or
+	// srcWidth-16 (W16, two 32-byte loads), see initArch; all other reads
+	// are inside the spans, src[:4*s].
 	src, frow, acc, ap := r.asmRows(src, acc)
 	cols := r.cols[:2*r.dstWidth]
-	shrinkRow4SSE41(&frow[0], ap, &src[0], &cols[0], n, xSub, fx)
+	switch r.arch.kind {
+	case kindShrink4W8, kindShrink4W16:
+		if n%2 != 0 {
+			panic("resample: odd pair count")
+		}
+		if r.arch.kind == kindShrink4W8 {
+			shrink4W8AVX2(&frow[0], ap, &src[0], &cols[0], n/2, xSub, fx)
+		} else {
+			shrink4W16AVX2(&frow[0], ap, &src[0], &cols[0], n/2, xSub, fx)
+		}
+	default:
+		shrinkRow4SSE41(&frow[0], ap, &src[0], &cols[0], n, xSub, fx)
+	}
 	if n == r.dstWidth {
 		return
 	}
@@ -335,6 +367,18 @@ func (r *Rescaler) shrinkRow1(src []byte, acc []uint32) {
 //
 //go:noescape
 func shrinkRow4SSE41(frow, acc *uint32, src *byte, cols *uint32, n int, xSub, fx uint32)
+
+// shrink4W8AVX2 and shrink4W16AVX2 are shrinkRow4SSE41 for pairs of
+// destination pixels [0, 2*pairs), reading 32 (W8) or 64 (W16) bytes from
+// each span start: every span must start at least 8 (W8) or 16 (W16)
+// pixels before the end of src and hold at most maxShrink4W8Span or
+// maxShrink4W16Span pixels.
+//
+//go:noescape
+func shrink4W8AVX2(frow, acc *uint32, src *byte, cols *uint32, pairs int, xSub, fx uint32)
+
+//go:noescape
+func shrink4W16AVX2(frow, acc *uint32, src *byte, cols *uint32, pairs int, xSub, fx uint32)
 
 // shrinkRow1SSE41 is shrinkRow4SSE41 for 1 channel and spans of any
 // length: every span must start at least 16 bytes before the end of src.
