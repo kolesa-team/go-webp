@@ -59,6 +59,22 @@ func TestEncodeLevelsMatchGo(t *testing.T) {
 	}
 }
 
+// BenchmarkEncodeLevels is BenchmarkEncode at every kernel level.
+func BenchmarkEncodeLevels(b *testing.B) {
+	img := loadTestImage(b, "source.jpg")
+	for _, m := range []int{0, 4, 6} {
+		cfg := DefaultConfig()
+		cfg.Method = m
+		benchLevels(b, "m"+string(rune('0'+m)), func() {
+			pic := FromNRGBA(img, false, false)
+			if _, err := Encode(pic, &cfg); err != nil {
+				b.Fatal(err)
+			}
+			pic.Release()
+		})
+	}
+}
+
 func FuzzEncodeLevelsMatchGo(f *testing.F) {
 	f.Add([]byte{17, 9, 75, 4, 50, 60, 1, 0, 1, 2, 3, 4, 5, 6, 7, 8})
 	f.Add([]byte{40, 40, 100, 6, 100, 0, 3, 1, 255, 0, 255, 0})

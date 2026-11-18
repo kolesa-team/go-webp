@@ -66,6 +66,21 @@ func predLuma4SSE41(p, s *byte)
 //go:noescape
 func zeroBinStatsSSE41(c *[16]int16, n int) (count0, maxBin int)
 
+//go:noescape
+func fTransformPairsAVX2(src, ref *byte, off *[8][2]uint16, n int, out *[16]int16)
+
+//go:noescape
+func quantizeBlocksAVX2(in, out *[16]int16, n int, m *matrix, info *uint16) uint32
+
+//go:noescape
+func tTransformPairsAVX2(a *byte, off *[8][2]uint16, n int, out *int32)
+
+//go:noescape
+func iTransformPairsAVX2(ref *byte, in *[16]int16, dst *byte, off *[2]uint16, n int) int
+
+//go:noescape
+func sse16xNAVX2(a, b *byte, rows int) int
+
 func zeroBinStats(coeffs [][16]int16) (int, int) {
 	if len(coeffs) > 16 {
 		panic("vp8enc: zeroBinStats: too many blocks")
@@ -126,13 +141,18 @@ func fTransformPairs(src, ref []byte, t *pairTable, out [][16]int16) {
 		fTransformPairsRef(src, ref, t, out)
 		return
 	}
+	if x86Level >= cpuinfo.AVX2 {
+		fTransformPairsAVX2(&src[0], &ref[0], &t.off, t.n, &out[0])
+		return
+	}
 	fTransformPairsSSE41(&src[0], &ref[0], &t.off, t.n, &out[0])
 }
 
 // iTransformPairs runs the kernel, which stops before a pair holding a
 // coefficient beyond its 16-bit range (|in| > 2047, see dsp_amd64.s);
 // such a pair, rare in practice, takes the Go code, then the kernel
-// resumes, so the pairs are still written in order.
+// resumes, so the pairs are still written in order. As in the reference,
+// ref and dst must not overlap (the kernels read ahead of their stores).
 func iTransformPairs(ref []byte, in [][16]int16, dst []byte, t *pairTable) {
 	if len(ref) < t.need[0] || len(dst) < t.need[1] || len(in) < 2*t.n {
 		panic("vp8enc: iTransformPairs: buffer too small")
@@ -141,8 +161,13 @@ func iTransformPairs(ref []byte, in [][16]int16, dst []byte, t *pairTable) {
 		iTransformPairsRef(ref, in, dst, t)
 		return
 	}
+	avx2 := x86Level >= cpuinfo.AVX2
 	for k := 0; k < t.n; k++ {
-		k += iTransformPairsSSE41(&ref[0], &in[2*k], &dst[0], &t.off[k], t.n-k)
+		if avx2 {
+			k += iTransformPairsAVX2(&ref[0], &in[2*k], &dst[0], &t.off[k], t.n-k)
+		} else {
+			k += iTransformPairsSSE41(&ref[0], &in[2*k], &dst[0], &t.off[k], t.n-k)
+		}
 		if k < t.n {
 			r, d := int(t.off[k][0]), int(t.off[k][1])
 			iTransform(ref[r:], &in[2*k], dst[d:])
@@ -163,6 +188,9 @@ func quantizeBlocks(in, out [][16]int16, m *matrix, info []uint16) uint32 {
 	if info != nil {
 		pinfo = &info[0]
 	}
+	if x86Level >= cpuinfo.AVX2 {
+		return quantizeBlocksAVX2(&in[0], &out[0], n, m, pinfo)
+	}
 	return quantizeBlocksSSE41(&in[0], &out[0], n, m, pinfo)
 }
 
@@ -174,9 +202,15 @@ func tTransformPairs(a []byte, t *pairTable, out []int32) {
 		tTransformPairsRef(a, t, out)
 		return
 	}
+	if x86Level >= cpuinfo.AVX2 {
+		tTransformPairsAVX2(&a[0], &t.off, t.n, &out[0])
+		return
+	}
 	tTransformPairsSSE41(&a[0], &t.off, t.n, &out[0])
 }
 
+// sse4x4Pairs has no AVX2 kernel: two pairs per 256-bit register measured
+// slower than the SSE4.1 kernel (the row loads dominate).
 func sse4x4Pairs(a, b []byte, t *pairTable, out []int32) {
 	if len(a) < t.need[0] || len(b) < t.need[1] || len(out) < 2*t.n {
 		panic("vp8enc: sse4x4Pairs: buffer too small")
@@ -195,6 +229,9 @@ func sse16x16(a, b []byte) int {
 	if x86Level < cpuinfo.SSE41 {
 		return sse16x16Ref(a, b)
 	}
+	if x86Level >= cpuinfo.AVX2 {
+		return sse16xNAVX2(&a[0], &b[0], 16)
+	}
 	return sse16xNSSE41(&a[0], &b[0], 16)
 }
 
@@ -204,6 +241,9 @@ func sse16x8(a, b []byte) int {
 	}
 	if x86Level < cpuinfo.SSE41 {
 		return sse16x8Ref(a, b)
+	}
+	if x86Level >= cpuinfo.AVX2 {
+		return sse16xNAVX2(&a[0], &b[0], 8)
 	}
 	return sse16xNSSE41(&a[0], &b[0], 8)
 }
