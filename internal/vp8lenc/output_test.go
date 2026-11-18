@@ -189,6 +189,7 @@ func TestImageInfo(t *testing.T) {
 // capacity for a RIFF padding byte), including streams larger than their
 // size estimate.
 func TestOutputCapacity(t *testing.T) {
+	skipUnderRace(t)
 	for _, ti := range syntheticImages() {
 		for _, cfg := range []Config{{Quality: 0, Method: 0}, {Quality: 75, Method: 4}, {Quality: 90, Method: 5}, {Quality: 100, Method: 6}} {
 			if cfg.Method == 6 && ti.img.Rect.Dx()*ti.img.Rect.Dy() > 1000 || cfg.Method == 5 && testing.Short() {

@@ -379,6 +379,7 @@ func TestManyConfigs(t *testing.T) {
 }
 
 func TestQualityMonotonic(t *testing.T) {
+	skipUnderRace(t)
 	img := loadTestImage(t, "logo.jpg")
 	prev := 0
 	for _, q := range []float32{0, 25, 50, 75, 100} {
@@ -393,6 +394,7 @@ func TestQualityMonotonic(t *testing.T) {
 }
 
 func TestTargetSize(t *testing.T) {
+	skipUnderRace(t)
 	img := loadTestImage(t, "logo.jpg")
 	cfg := DefaultConfig()
 	cfg.TargetSize = 20000

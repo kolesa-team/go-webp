@@ -103,6 +103,7 @@ func decodeVP8L(t *testing.T, payload []byte, w, h int) []byte {
 // can be sub-sampled (smooth gradients, uniform blocks), few-color images
 // (box LZ77 parse) and alpha planes, and checks that they decode exactly.
 func TestSubsampledRoundTrip(t *testing.T) {
+	skipUnderRace(t)
 	imgs := []testImage{
 		{"grad1000x1", newNRGBA(1000, 1, func(x, y int) color.NRGBA {
 			v := uint8(x * 255 / 999)

@@ -16,6 +16,7 @@ import (
 // the snapshot of the source, writes the same bytes as an Encoder that is
 // never released, for the source types with a pooled snapshot.
 func TestEncodeOneShotIdentical(t *testing.T) {
+	skipUnderRace(t)
 	jpg := loadJPEG(t, "source.jpg") // *image.YCbCr
 	rgba := image.NewRGBA(image.Rect(0, 0, 301, 217))
 	draw.Draw(rgba, rgba.Rect, jpg, image.Point{100, 200}, draw.Src)
