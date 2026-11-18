@@ -849,3 +849,242 @@ pop_slow1:
 pop_slow2:
 	SLOG2_SLOW
 	JMP pop_back2
+
+// ---------------------------------------------------------------------------
+// Hash chain search (libwebp VP8LHashChainFill with VectorMismatch_SSE2).
+
+// MISMATCH sets AX to the length of the common prefix of the uint32 at R12
+// and at R13, at most DX: 4 at a time (PCMPEQL, MOVMSKPS, BSF on the first
+// difference) while 4 more fit, then one at a time. Clobbers CX, X0, X1.
+#define MISMATCH(loop, found, tail, done) \
+	XORL     AX, AX;          \
+loop:                         \
+	LEAQ     4(AX), CX;       \
+	CMPQ     CX, DX;          \
+	JHI      tail;            \
+	MOVOU    (R12)(AX*4), X0; \
+	MOVOU    (R13)(AX*4), X1; \
+	PCMPEQL  X1, X0;          \
+	MOVMSKPS X0, CX;          \
+	XORL     $15, CX;         \
+	JNZ      found;           \
+	ADDQ     $4, AX;          \
+	JMP      loop;            \
+found:                        \
+	BSFL     CX, CX;          \
+	ADDQ     CX, AX;          \
+	JMP      done;            \
+tail:                         \
+	CMPQ     AX, DX;          \
+	JCC      done;            \
+	MOVL     (R12)(AX*4), CX; \
+	CMPL     CX, (R13)(AX*4); \
+	JNE      done;            \
+	INCQ     AX;              \
+	JMP      tail;            \
+done:
+
+// func hcRunSSE41(s *hcSearcher, hi, lo, stop int, marks *uint64, pf int) (last, next int)
+//
+// hcSearcher.runGo (see its comment): from base = hi down to stop, search
+// the best match at base (the distances xsize and 1 first unless
+// lowEffort, then the hash chain from chain[base], at most iterMax-1
+// links within the window, a candidate being compared in full only when
+// its pixel at the current best length matches), mark base, and write the
+// match into ol, extended to the left. Before each search, the first node
+// of the chain of the search pf positions below is prefetched (pixels and
+// link).
+// SI = argb, DI = chain, BX = base, R8 = bestLen, R9 = &argb[bestLen],
+// R10 = argb[base+bestLen], R11 = p, R12 = iter, R13 = minPos, DX = maxLen;
+// locals: the best distance, the length that ends the search, and R12 and
+// R13 while MISMATCH uses them.
+TEXT ·hcRunSSE41(SB), NOSPLIT, $32-64
+	MOVQ s+0(FP), AX
+	MOVQ hcSearcher_argb(AX), SI
+	MOVQ hcSearcher_chain(AX), DI
+	MOVQ hi+8(FP), BX
+	MOVQ $0, last+48(FP)
+
+hc_search:
+	CMPQ BX, stop+24(FP)
+	JLT  hc_finish
+	MOVQ BX, AX
+	SUBQ pf+40(FP), AX
+	JLT  hc_nopf
+	MOVLQSX    (DI)(AX*4), CX
+	TESTQ      CX, CX
+	JLT        hc_nopf
+	PREFETCHT0 (SI)(CX*4)
+	PREFETCHT0 (DI)(CX*4)
+
+hc_nopf:
+	MOVQ s+0(FP), AX
+	MOVQ hcSearcher_size(AX), DX
+	SUBQ BX, DX
+	DECQ DX                      // maxLen = min(size-1-base, maxLength)
+	CMPQ DX, $4095
+	JLE  hc_maxlen
+	MOVQ $4095, DX
+
+hc_maxlen:
+	MOVQ DX, CX
+	CMPQ CX, $256
+	JLE  hc_lmax
+	MOVQ $256, CX
+
+hc_lmax:
+	MOVQ    CX, lmax-32(SP)      // lengthMax = min(maxLen, 256)
+	MOVQ    hcSearcher_iterMax(AX), R12
+	MOVQ    BX, R13
+	SUBQ    hcSearcher_window(AX), R13
+	JGT     hc_minpos
+	XORL    R13, R13             // minPos = max(base-window, 0)
+
+hc_minpos:
+	MOVLQSX (DI)(BX*4), R11
+	XORL    R8, R8
+	MOVQ    $0, dist-24(SP)
+	MOVBLZX hcSearcher_lowEffort(AX), CX
+	TESTL   CX, CX
+	JNZ     hc_walkinit
+	MOVQ    hcSearcher_xsize(AX), CX
+	CMPQ    BX, CX
+	JLT     hc_d1
+	MOVQ    BX, AX
+	SUBQ    CX, AX
+	MOVL    (SI)(AX*4), AX
+	CMPL    AX, (SI)(BX*4)
+	JNE     hc_xsdone
+	MOVQ    R12, iter-8(SP)
+	MOVQ    R13, minpos-16(SP)
+	MOVQ    BX, R12
+	SUBQ    CX, R12
+	LEAQ    (SI)(R12*4), R12
+	LEAQ    (SI)(BX*4), R13
+	MISMATCH(hc_m1loop, hc_m1found, hc_m1tail, hc_m1done)
+	MOVQ    iter-8(SP), R12
+	MOVQ    minpos-16(SP), R13
+	TESTQ   AX, AX
+	JZ      hc_xsdone
+	MOVQ    AX, R8
+	MOVQ    s+0(FP), CX
+	MOVQ    hcSearcher_xsize(CX), CX
+	MOVQ    CX, dist-24(SP)
+
+hc_xsdone:
+	DECQ R12
+
+hc_d1:
+	LEAQ  (BX)(R8*1), AX
+	MOVL  -4(SI)(AX*4), CX
+	CMPL  CX, (SI)(AX*4)
+	JNE   hc_d1done
+	MOVQ  R12, iter-8(SP)
+	MOVQ  R13, minpos-16(SP)
+	LEAQ  -4(SI)(BX*4), R12
+	LEAQ  (SI)(BX*4), R13
+	MISMATCH(hc_m2loop, hc_m2found, hc_m2tail, hc_m2done)
+	MOVQ  iter-8(SP), R12
+	MOVQ  minpos-16(SP), R13
+	CMPQ  AX, R8
+	JLE   hc_d1done
+	MOVQ  AX, R8
+	MOVQ  $1, dist-24(SP)
+
+hc_d1done:
+	DECQ R12
+	CMPQ R8, $4095
+	JNE  hc_walkinit
+	LEAQ -1(R13), R11
+
+hc_walkinit:
+	LEAQ (BX)(R8*1), AX
+	MOVL (SI)(AX*4), R10
+	LEAQ (SI)(R8*4), R9
+
+hc_walk:
+	CMPQ R11, R13
+	JLT  hc_found
+	DECQ R12
+	JLE  hc_found
+	MOVL (R9)(R11*4), AX
+	CMPL AX, R10
+	JNE  hc_next
+	MOVQ R12, iter-8(SP)
+	MOVQ R13, minpos-16(SP)
+	LEAQ (SI)(R11*4), R12
+	LEAQ (SI)(BX*4), R13
+	MISMATCH(hc_m3loop, hc_m3found, hc_m3tail, hc_m3done)
+	MOVQ iter-8(SP), R12
+	MOVQ minpos-16(SP), R13
+	CMPQ AX, R8
+	JLE  hc_next
+	MOVQ AX, R8
+	MOVQ BX, CX
+	SUBQ R11, CX
+	MOVQ CX, dist-24(SP)
+	LEAQ (BX)(R8*1), CX
+	MOVL (SI)(CX*4), R10
+	LEAQ (SI)(R8*4), R9
+	CMPQ R8, lmax-32(SP)
+	JGE  hc_found
+
+hc_next:
+	MOVLQSX (DI)(R11*4), R11
+	JMP     hc_walk
+
+hc_found:
+	MOVQ  marks+32(FP), AX
+	TESTQ AX, AX
+	JZ    hc_nomark
+	MOVQ  BX, CX
+	ANDL  $63, CX
+	MOVL  $1, DX
+	SHLQ  CX, DX
+	MOVQ  BX, CX
+	SHRQ  $6, CX
+	ORQ   DX, (AX)(CX*8)
+
+hc_nomark:
+	MOVQ BX, last+48(FP)
+	MOVQ s+0(FP), AX
+	MOVQ hcSearcher_ol(AX), AX
+	MOVQ dist-24(SP), CX
+	MOVQ BX, DX                  // maxBase
+
+hc_ext: // ol[base] = dist<<12 | bestLen, then extend to the left
+	MOVQ  CX, R11
+	SHLQ  $12, R11
+	ORQ   R8, R11
+	MOVL  R11, (AX)(BX*4)
+	DECQ  BX
+	TESTQ CX, CX
+	JZ    hc_search
+	TESTQ BX, BX
+	JZ    hc_search
+	CMPQ  BX, lo+16(FP)
+	JLT   hc_search
+	CMPQ  BX, CX
+	JLT   hc_search
+	MOVQ  BX, R11
+	SUBQ  CX, R11
+	MOVL  (SI)(R11*4), R12
+	CMPL  R12, (SI)(BX*4)
+	JNE   hc_search
+	CMPQ  R8, $4095
+	JNE   hc_extinc
+	CMPQ  CX, $1
+	JEQ   hc_ext
+	LEAQ  4095(BX), R11
+	CMPQ  R11, DX
+	JLT   hc_search
+	JMP   hc_ext
+
+hc_extinc:
+	INCQ R8
+	MOVQ BX, DX
+	JMP  hc_ext
+
+hc_finish:
+	MOVQ BX, next+56(FP)
+	RET

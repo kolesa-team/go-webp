@@ -15,3 +15,7 @@ func combinedShannonEntropy(x, y *[256]int32, acc *accEntropy) float64 {
 }
 
 func combinedPopulationCost(a, b []uint32) float64 { return combinedPopulationCostGo(a, b) }
+
+func (s *hcSearcher) run(hi, lo, stop int, marks []uint64) (last, next int) {
+	return s.runGo(hi, lo, stop, marks)
+}

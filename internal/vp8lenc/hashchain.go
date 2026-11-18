@@ -188,7 +188,10 @@ type hcSearcher struct {
 // so the searches form a chain from size-2 down to 0 (see fillStripes).
 // (One loop for all uses: a call per search costs the sequential path
 // 7-19%.)
-func (s *hcSearcher) run(hi, lo, stop int, marks []uint64) (last, next int) {
+//
+// runGo is the Go reference of run (dsp_amd64.go, dsp_generic.go). It needs
+// 1 <= stop and hi <= size-2.
+func (s *hcSearcher) runGo(hi, lo, stop int, marks []uint64) (last, next int) {
 	argb, chain, ol := s.argb, s.chain, s.ol
 	xsize, size, window, iterMax, lowEffort := s.xsize, s.size, s.window, s.iterMax, s.lowEffort
 	base := hi

@@ -15,3 +15,10 @@ func setLevel(l cpuinfo.Level) (restore func()) {
 	x86Level = l
 	return func() { x86Level = old }
 }
+
+// setPrefetch sets the prefetch distance of the hash chain kernel.
+func setPrefetch(pf int) (restore func()) {
+	old := hcPrefetch
+	hcPrefetch = pf
+	return func() { hcPrefetch = old }
+}
