@@ -13,7 +13,9 @@ import (
 // The level is picked at run time: x86Level (the machine's best level;
 // tests lower it to run every level against the Go kernels). A rescaler
 // records the level it was initialized with, so that its kernels and its
-// record tables always agree.
+// record tables always agree. The AVX512 level runs the AVX2 kernels: zmm
+// forms of the windowed 4-channel shrink (four destination pixels per
+// step) measured 6-7% slower than AVX2 on Zen 4.
 //
 // The Go wrappers below check every length the assembly relies on; the
 // column-table invariants they depend on (spans of at least one pixel that
@@ -610,7 +612,9 @@ func premultiplyRow(row []byte) {
 }
 
 // unpremultiplySSE41 is UnpremultiplyRGBA on n bytes, n > 0 and a
-// multiple of 16, with the scales of table (unpremulScale).
+// multiple of 16, with the scales of table (unpremulScale). It serves the
+// AVX2 level too: it only runs on output rows (under 2% of a scaled
+// lossless decode on Zen 4), so a wider form would not show.
 //
 //go:noescape
 func unpremultiplySSE41(row *byte, n int, table *[256]uint32)
