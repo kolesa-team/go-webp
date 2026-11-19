@@ -13,8 +13,8 @@ import "math/bits"
 // single-block Go code of dsp.go; they are always compiled so that the
 // tests can compare an assembly implementation against them. The entry
 // points without the suffix (fTransformPairs, quantizeBlocks, ...) are
-// bound to assembly in dsp_arm64.go and to these references in
-// dsp_generic.go.
+// bound to assembly in dsp_arm64.go and dsp_amd64.go (by kernel level) and
+// to these references in dsp_generic.go.
 
 // pairTable lists pairs of horizontally adjacent 4x4 blocks. Pair k is made
 // of blocks 2k and 2k+1; off[k][0] and off[k][1] are the byte offsets of

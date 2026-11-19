@@ -7,8 +7,9 @@ import (
 )
 
 // Differential tests of the batched DSP entry points (assembly on arm64,
-// the reference loops elsewhere) against the reference implementations of
-// dsp_batch.go, which are built on the single-block Go code of dsp.go.
+// every kernel level on amd64, the reference loops elsewhere) against the
+// reference implementations of dsp_batch.go, which are built on the
+// single-block Go code of dsp.go.
 
 var vecTables = []struct {
 	name string
