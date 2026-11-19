@@ -53,6 +53,24 @@ func TestImportKernelsSpanLimits(t *testing.T) {
 	})
 }
 
+// TestImportKernelsHugeSpans runs 1-channel shrinks whose spans are long
+// enough (over 2^32/255 pixels) for the 32-bit span sums of the Go kernels
+// to wrap; the assembly sums 64-bit and must wrap the same way.
+func TestImportKernelsHugeSpans(t *testing.T) {
+	if testing.Short() {
+		t.Skip("34 MB source rows")
+	}
+	forEachLevel(t, func(t *testing.T) {
+		rnd := rand.New(rand.NewSource(27))
+		const sw = 2*(1<<32/255) + 4099
+		white := bytes.Repeat([]byte{255}, sw)
+		for _, dw := range []int{1, 2, 3} {
+			compareImport(t, rnd, sw, dw, 1, white, nil)
+			checkImport(t, rnd, sw, dw, 1, nil, nil)
+		}
+	})
+}
+
 // TestImportKernelsUnaligned runs the import kernels on source rows that
 // start at every offset within 16 bytes, with work buffers that start at
 // every word offset within 16 bytes.
