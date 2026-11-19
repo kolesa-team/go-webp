@@ -10,7 +10,8 @@ jobs:
       fail-fast: false
       matrix:
         # ubuntu-24.04-arm is native linux/arm64 (the NEON code paths);
-        # ubuntu-latest and windows-latest are amd64, macos-latest is arm64.
+        # ubuntu-latest and windows-latest are amd64 (the SSE4.1/AVX2/AVX-512
+        # code paths, up to the runner CPU's level), macos-latest is arm64.
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
         go: ["1.27", "stable"]
     runs-on: ${{ matrix.os }}
@@ -19,6 +20,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go }}
+      # The amd64 kernels are picked at run time by CPU level; the tests
+      # run every level up to the runner's, so log which one that is.
+      - name: Log the detected x86 SIMD level
+        if: runner.arch == 'X64'
+        run: go test -count=1 -v -run TestLevelsConsistent ./internal/cpuinfo
       - name: Check formatting
         if: runner.os == 'Linux'
         run: |
@@ -58,9 +64,10 @@ jobs:
           else
             go test ./...
           fi
-      # The arm64 assembly kernels are compared with the pure Go code they
-      # replace by the tests above; this runs the whole suite on the pure Go
-      # code path as well (what other architectures use).
+      # The assembly kernels (arm64 NEON, amd64 SSE4.1/AVX2/AVX-512) are
+      # compared with the pure Go code they replace by the tests above; this
+      # runs the whole suite on the pure Go code path as well (what other
+      # architectures use).
       - name: Test the pure Go code path (-tags purego)
         run: go test -tags purego ./...
       - name: Test on 32-bit (linux/386)
@@ -80,10 +87,10 @@ jobs:
         # is a margin for slow runners.
         run: go test -race -short -timeout 30m ./...
       # Memory accesses made by assembly are invisible to the race detector:
-      # on arm64 also race-check the pure Go kernels, which write the same
-      # buffers.
+      # on arm64 and amd64 also race-check the pure Go kernels, which write
+      # the same buffers.
       - name: Test with the race detector (-tags purego)
-        if: runner.os != 'Windows' && runner.arch == 'ARM64'
+        if: runner.os != 'Windows'
         env:
           CGO_ENABLED: "1"
         run: go test -race -short -timeout 30m -tags purego ./...
@@ -100,6 +107,15 @@ jobs:
           done
           # asmdecl checks of the arm64 assembly from an amd64 runner.
           GOOS=linux GOARCH=arm64 go vet ./...
+      - name: Vet amd64 from arm64
+        # asmdecl checks of the amd64 assembly (and its purego fallbacks)
+        # from the arm64 runner, so both assembly sets are vetted on both.
+        if: runner.os == 'Linux' && runner.arch == 'ARM64'
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          GOOS=linux GOARCH=amd64 go vet ./...
+          GOOS=linux GOARCH=amd64 go vet -tags purego ./...
       - name: Check that decodeBit is inlined into the token loop
         # The lossy decoder's speed depends on the boolean decoder being
         # inlined into getCoeffs (internal/vp8/parse.go); a change that
@@ -152,7 +168,7 @@ jobs:
 
   interop-arm64:
     # The same conformance tests on native linux/arm64, where the NEON
-    # kernels run (amd64, above, runs the pure Go code).
+    # kernels run (amd64, above, runs the SSE4.1/AVX2/AVX-512 kernels).
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
