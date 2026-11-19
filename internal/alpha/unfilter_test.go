@@ -3,12 +3,16 @@ package alpha
 import (
 	"bytes"
 	"math/rand"
+	"runtime"
 	"testing"
+
+	"github.com/kolesa-team/go-webp/v2/internal/cpuinfo"
 )
 
 // Differential tests of the unfilter kernels (unfilter_*.go) against their
 // Go references. On arm64 without the purego tag they check the NEON
-// assembly; elsewhere both sides are the same Go code.
+// assembly, on amd64 the kernels of every SIMD level (forEachLevel);
+// elsewhere both sides are the same Go code.
 
 const guardByte = 0xa5
 
@@ -62,7 +66,9 @@ func unfilterCheck(t *testing.T, pred byte, prev, in []byte) {
 	}
 }
 
-func TestUnfilterKernels(t *testing.T) {
+func TestUnfilterKernels(t *testing.T) { forEachLevel(t, testUnfilterKernels) }
+
+func testUnfilterKernels(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
 	for iter := 0; iter < 50000; iter++ {
 		n := rng.Intn(100)
@@ -79,7 +85,9 @@ func TestUnfilterKernels(t *testing.T) {
 
 // TestUnfilterRowKernels checks UnfilterRow, which picks the kernels, on
 // whole planes against a per-pixel model of libwebp's unfilters.
-func TestUnfilterRowKernels(t *testing.T) {
+func TestUnfilterRowKernels(t *testing.T) { forEachLevel(t, testUnfilterRowKernels) }
+
+func testUnfilterRowKernels(t *testing.T) {
 	rng := rand.New(rand.NewSource(2))
 	for iter := 0; iter < 300; iter++ {
 		w, h := 1+rng.Intn(300), 1+rng.Intn(5)
@@ -115,33 +123,42 @@ func FuzzUnfilterKernels(f *testing.F) {
 	f.Add([]byte("0123456789abcdefghijklmnopqrstuvwxyz"), byte(7))
 	f.Fuzz(func(t *testing.T, data []byte, pred byte) {
 		n := len(data) / 2
-		unfilterCheck(t, pred, data[n:], data[:n])
+		atEachLevel(func() { unfilterCheck(t, pred, data[n:], data[:n]) })
 	})
 }
 
 // BenchmarkUnfilterKernels times the kernels against their Go references
-// on rows of 3000 bytes.
+// on rows of 3000 bytes: <kernel>/go is the reference, <kernel>/asm the
+// wrapper on arm64, and <kernel>/<level> the wrapper at each SIMD level on
+// amd64.
 func BenchmarkUnfilterKernels(b *testing.B) {
 	const n = 3000
 	rng := rand.New(rand.NewSource(1))
 	in, prev, out := make([]byte, n), make([]byte, n), make([]byte, n)
 	rng.Read(in)
 	rng.Read(prev)
-	for _, k := range []struct {
-		name string
-		f    func()
-	}{
-		{"horizontal/go", func() { unfilterHorizontalGo(1, in, out) }},
-		{"horizontal/asm", func() { unfilterHorizontal(1, in, out) }},
-		{"vertical/go", func() { unfilterVerticalGo(prev, in, out) }},
-		{"vertical/asm", func() { unfilterVertical(prev, in, out) }},
-		{"gradient/go", func() { gradientUnfilter(prev, in, out) }},
-	} {
-		b.Run(k.name, func(b *testing.B) {
+	run := func(name string, f func()) {
+		b.Run(name, func(b *testing.B) {
 			b.SetBytes(n)
 			for i := 0; i < b.N; i++ {
-				k.f()
+				f()
 			}
 		})
 	}
+	asm := func(name string, f func()) {
+		if runtime.GOARCH != "amd64" {
+			run(name+"/asm", f)
+			return
+		}
+		for _, l := range cpuinfo.Levels()[1:] {
+			restore := setLevel(l)
+			run(name+"/"+l.String(), f)
+			restore()
+		}
+	}
+	run("horizontal/go", func() { unfilterHorizontalGo(1, in, out) })
+	asm("horizontal", func() { unfilterHorizontal(1, in, out) })
+	run("vertical/go", func() { unfilterVerticalGo(prev, in, out) })
+	asm("vertical", func() { unfilterVertical(prev, in, out) })
+	run("gradient/go", func() { gradientUnfilter(prev, in, out) })
 }

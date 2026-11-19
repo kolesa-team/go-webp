@@ -2,7 +2,9 @@ package vp8l
 
 import (
 	"errors"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/kolesa-team/go-webp/v2/internal/workers"
 )
@@ -23,18 +25,55 @@ import (
 // pending rows are handed over before stopping (finishAsync).
 //
 // libwebp ignores use_threads for lossless images; the helper only starts
-// for images of at least asyncMinPixels pixels and when the process-wide
-// helper budget (internal/workers) has a free slot.
+// when it can pay for itself and the process-wide helper budget
+// (internal/workers) has a free slot.
+//
+// A hand-off costs the producer a channel send and, the helper being idle
+// between jobs, a wake-up: on Linux (EPYC 8024P) the helper starts a job
+// about 60 microseconds after the send, on darwin (Apple M) 15-25. The
+// pipeline saves at most the helper's share of the work, which with the
+// assembly kernels is small: about 0.15 ns per pixel for palette images
+// (the 3000x2000 logo: 0.8 ms of 3.7, -12% with the helper on one L3 of
+// the EPYC, -26% on darwin), 1 ns for photos (-6..-9%, -7..-14% on
+// darwin), and almost nothing for pictures made of long LZ77 copies of
+// one color (+7..+18% with the helper for such 0.25-1 MP pictures, on
+// both systems). So the producer first emits asyncProbePixels pixels
+// itself, timing the emission, and starts the helper only if the rest of
+// the picture projects to at least asyncMinWork of emission work
+// (probeDone): those pictures project to 25-140 us, the smallest gain
+// measured (a 2048x1024 part of the logo, -5% on Linux) to 220 us.
+//
+// And on Linux the helper must share the last-level cache with the
+// producer (asyncSharedLLC): the rows it reads and writes were last
+// touched by the producer (the level-0 window, the output zeroed by its
+// allocation), and with the whole EPYC, two 16 MB L3 of 4 cores each, the
+// 3000x2000 logo decoded 10% slower with the helper, with 42% more CPU
+// time (while on one L3 it decodes 12-24% faster).
 var (
 	// asyncMinPixels is the smallest image (in needed pixels) decoded in
 	// two stages. A variable for tests.
 	asyncMinPixels = 256 * 1024
+	// asyncProbePixels is the number of pixels the producer emits, timed,
+	// before the helper may start; 0 starts it at once. A variable for
+	// tests.
+	asyncProbePixels = 32 * 1024
+	// asyncMinWork is the least emission work, projected from the probe
+	// for the rest of the picture, for which the helper starts. A
+	// variable for tests.
+	asyncMinWork = 200 * time.Microsecond
+	// asyncSharedLLC reports whether the CPUs this process may run on
+	// share one last-level cache (sharedLLC, evaluated once). A variable
+	// for tests.
+	asyncSharedLLC = sync.OnceValue(sharedLLC)
 	// asyncJobPixels, when > 0, overrides the job size (jobPixels). A
 	// variable for tests.
 	asyncJobPixels = 0
 	// asyncTestHook, if set, runs on the producer before each job is
 	// handed over (tests: producer panics).
 	asyncTestHook func(y0, y1 int)
+	// asyncProbeHook, if set, receives the projection of each probe
+	// (tests).
+	asyncProbeHook func(projected time.Duration)
 )
 
 // jobPixels returns the number of level-0 pixels per job for an image of
@@ -52,6 +91,55 @@ func jobPixels(total, dataLen int) int {
 	bits1024 := int(min(int64(dataLen)*8*1024/int64(max(total, 1)), 1<<20)) // bits per 1024 px
 	j := targetNs * 1024 / (1024 + 2*bits1024)
 	return max(min(j, total/16), 1)
+}
+
+// asyncProbe times the emission of the first rows of a picture that may be
+// decoded in two stages (see probeDone).
+type asyncProbe struct {
+	active bool
+	pixels int           // pixels emitted while probing
+	time   time.Duration // time spent emitting them
+}
+
+// asyncWanted reports whether a two-stage decode may be started: the
+// option, an RGBA output, a big enough picture, and a helper sharing the
+// producer's last-level cache.
+func (d *decoder) asyncWanted() bool {
+	return d.useThreads && d.out == outRGBA && d.width*d.needRows >= asyncMinPixels && asyncSharedLLC()
+}
+
+// probeStart returns the time at which the producer starts emitting rows
+// while probing, or the zero time.
+func (d *decoder) probeStart() time.Time {
+	if !d.probe.active {
+		return time.Time{}
+	}
+	return time.Now()
+}
+
+// probeDone ends the timing begun at t0 (probeStart) of the emission of
+// the rows up to d.lastRow, from y0. Once asyncProbePixels pixels are
+// timed, it starts the helper if the emission of the rest projects to at
+// least asyncMinWork.
+func (d *decoder) probeDone(t0 time.Time, y0 int) {
+	if t0.IsZero() {
+		return
+	}
+	p := &d.probe
+	p.pixels += (d.lastRow - y0) * d.width
+	p.time += time.Since(t0)
+	if p.pixels < asyncProbePixels {
+		return
+	}
+	p.active = false
+	rest := (d.needRows - d.lastRow) * d.width
+	projected := time.Duration(int64(p.time) * int64(rest) / int64(max(p.pixels, 1)))
+	if asyncProbeHook != nil {
+		asyncProbeHook(projected)
+	}
+	if rest > 0 && projected >= asyncMinWork {
+		d.startAsync()
+	}
 }
 
 // maxAsyncJobs bounds the jobs handed to the helper and not yet
@@ -93,7 +181,7 @@ type asyncEmit struct {
 // image is big enough and the worker budget allows. It returns false when
 // the decode must run sequentially.
 func (d *decoder) startAsync() bool {
-	if !d.useThreads || d.out != outRGBA || d.width*d.needRows < asyncMinPixels {
+	if !d.asyncWanted() {
 		return false
 	}
 	a := &asyncEmit{

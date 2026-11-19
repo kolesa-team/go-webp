@@ -9,7 +9,9 @@ import (
 // TestUnfilterKernelsOffsets runs both unfilter kernels on rows whose in,
 // out and prev slices start at every offset modulo 16, for every length up
 // to 100, with bytes at the 0/255 wrap, and every pred value at one length.
-func TestUnfilterKernelsOffsets(t *testing.T) {
+func TestUnfilterKernelsOffsets(t *testing.T) { forEachLevel(t, testUnfilterKernelsOffsets) }
+
+func testUnfilterKernelsOffsets(t *testing.T) {
 	rng := rand.New(rand.NewSource(3))
 	edge := []byte{0, 1, 0x7f, 0x80, 0xfe, 0xff}
 	fill := func(b []byte) {
