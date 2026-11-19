@@ -20,3 +20,13 @@ func eachReconLevel(kernelsOnly bool, f func(name string)) {
 		f(l.String())
 	}
 }
+
+// withReconLevel runs f with reconLevel set to l and restores it, so that
+// whole-decoder tests can switch the reconstruction kernels together with
+// the row converters and the loop filters.
+func withReconLevel(l cpuinfo.Level, f func()) {
+	saved := reconLevel
+	defer func() { reconLevel = saved }()
+	reconLevel = l
+	f()
+}
