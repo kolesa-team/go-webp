@@ -25,6 +25,24 @@ func forEachLevel(t *testing.T, f func(t *testing.T)) {
 	}
 }
 
+// forEachLevelIters is forEachLevel for the differential tests of kernels
+// that exist at the levels own: f runs n iterations at those levels and
+// n/10 at the others (the levels above run the same kernels, and the Go
+// level compares the reference with itself).
+func forEachLevelIters(t *testing.T, n int, own []cpuinfo.Level, f func(t *testing.T, iters int)) {
+	t.Helper()
+	for _, l := range testLevels() {
+		iters := max(n/10, 1)
+		if slices.Contains(own, l) {
+			iters = n
+		}
+		t.Run(l.String(), func(t *testing.T) {
+			defer setLevel(l)()
+			f(t, iters)
+		})
+	}
+}
+
 // atEveryLevel calls f at every level of testLevels.
 func atEveryLevel(f func(l cpuinfo.Level)) {
 	for _, l := range testLevels() {

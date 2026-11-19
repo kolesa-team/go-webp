@@ -67,7 +67,7 @@ func TestCombinedShannonEntropyLevels(t *testing.T) {
 	}
 	rng := rand.New(rand.NewSource(5))
 	var x, y [256]int32
-	forEachLevel(t, func(t *testing.T) {
+	forEachLevelIters(t, n, []cpuinfo.Level{cpuinfo.SSE41}, func(t *testing.T, n int) {
 		for i := 0; i < n; i++ {
 			randHisto(rng, x[:])
 			randHisto(rng, y[:])
@@ -183,7 +183,7 @@ func TestCombinedPopulationCostLevels(t *testing.T) {
 	}
 	rng := rand.New(rand.NewSource(8))
 	sizes := []int{0, 1, 2, 15, 16, 17, 18, 31, 32, 33, 40, 47, 48, 49, 256, 280, 281, 282, 284, 288, 296, 312, 344, 408, 536, 792, 1304}
-	forEachLevel(t, func(t *testing.T) {
+	forEachLevelIters(t, iters, []cpuinfo.Level{cpuinfo.SSE41}, func(t *testing.T, iters int) {
 		for i := 0; i < iters; i++ {
 			n := sizes[i%len(sizes)]
 			if i%3 == 0 {
@@ -290,13 +290,14 @@ func BenchmarkCombinedShannonEntropy(b *testing.B) {
 	}
 }
 
-// junkAcc fills a with random values, which init must overwrite.
-func junkAcc(rng *rand.Rand, a *accEntropy) {
+// junkAcc fills a with values derived from seed, which init must
+// overwrite.
+func junkAcc(seed int, a *accEntropy) {
 	for i := range a.s {
-		a.s[i] = rng.NormFloat64()
+		a.s[i] = float64(seed+i) * 0.37
 	}
-	a.total = rng.NormFloat64()
-	a.sum = rng.Uint32()
+	a.total = float64(seed) * 1.5
+	a.sum = uint32(seed) * 2654435761
 }
 
 // accDiff returns a description of the first difference between a and b
@@ -324,11 +325,15 @@ func TestAccEntropyInitLevels(t *testing.T) {
 	rng := rand.New(rand.NewSource(12))
 	var h [256]int32
 	var got, want accEntropy
-	forEachLevel(t, func(t *testing.T) {
+	forEachLevelIters(t, n, []cpuinfo.Level{cpuinfo.SSE41}, func(t *testing.T, n int) {
 		for i := 0; i < n; i++ {
 			randHisto(rng, h[:])
-			junkAcc(rng, &got)
-			junkAcc(rng, &want)
+			if i%8 == 0 {
+				// (Otherwise got holds the previous result: a bin the
+				// kernel did not write would differ from want.)
+				junkAcc(i, &got)
+				junkAcc(i+1, &want)
+			}
 			want.initGo(&h)
 			got.init(&h)
 			if d := accDiff(&got, &want); d != "" {
@@ -339,9 +344,11 @@ func TestAccEntropyInitLevels(t *testing.T) {
 }
 
 // TestAccEntropyInitSlog2 checks the kernel's v*log2(v) for every v below
-// 2^24 (every 251st above the SSE4.1 level, which runs the same kernel) and
-// random larger ones, isolated in bin v&255 of an otherwise zero histogram:
-// the bin's term and the total are then exactly slog2(v).
+// 2^16, every 7th below 2^24 (every 251st and 1757th above the SSE4.1
+// level, which runs the same kernel; TestSlog2Exhaustive checks every v
+// of the shared SLOG2 code) and random larger ones, isolated in bin v&255
+// of an otherwise zero histogram: the bin's term and the total are then
+// exactly slog2(v).
 func TestAccEntropyInitSlog2(t *testing.T) {
 	if testing.Short() {
 		t.Skip("short")
@@ -369,10 +376,13 @@ func TestAccEntropyInitSlog2(t *testing.T) {
 					t.Fatalf("v %d: s %v total %v sum %d, want %v", v, a.s[i], a.total, a.sum, slog2(v))
 				}
 			}
-			for v := uint32(1); v < 1<<24; v += step {
+			for v := uint32(1); v < 1<<16; v += step {
 				check(v)
 			}
-			for k := 0; k < 1<<20; k += int(step) {
+			for v := uint32(1 << 16); v < 1<<24; v += 7 * step {
+				check(v)
+			}
+			for k := 0; k < 1<<18; k += int(step) {
 				check(rng.Uint32() | 1<<24)
 			}
 			check(1<<32 - 1)
@@ -407,7 +417,7 @@ func TestPopulationCostLevels(t *testing.T) {
 	}
 	rng := rand.New(rand.NewSource(14))
 	sizes := []int{0, 1, 2, 15, 16, 17, 18, 31, 32, 33, 40, 47, 48, 49, 256, 280, 281, 282, 284, 288, 296, 312, 344, 408, 536, 792, 1304, 1305, 2000}
-	forEachLevel(t, func(t *testing.T) {
+	forEachLevelIters(t, iters, []cpuinfo.Level{cpuinfo.SSE41}, func(t *testing.T, iters int) {
 		for i := 0; i < iters; i++ {
 			n := sizes[i%len(sizes)]
 			if i%3 == 0 {

@@ -149,16 +149,25 @@ func TestSubtractGreenLevels(t *testing.T) {
 				subGreenBoth(t, randPixels(rng, n), off)
 			}
 		}
-		if testing.Short() {
-			return
-		}
-		// Every (green, red, blue) byte triple, with random alphas.
-		p := make([]uint32, 1<<24)
-		for i := range p {
-			p[i] = uint32(i) | uint32(rng.Intn(256))<<24
-		}
-		subGreenBoth(t, p, 3)
 	})
+	if testing.Short() {
+		return
+	}
+	// Every (green, red, blue) byte triple, with random alphas, at the
+	// levels with kernels of their own.
+	p := make([]uint32, 1<<24)
+	for i := range p {
+		p[i] = uint32(i) | uint32(rng.Intn(256))<<24
+	}
+	for _, l := range kernelLevels() {
+		if l == cpuinfo.Go {
+			continue
+		}
+		t.Run("triples/"+l.String(), func(t *testing.T) {
+			defer setLevel(l)()
+			subGreenBoth(t, p, 3)
+		})
+	}
 }
 
 func FuzzSubtractGreen(f *testing.F) {

@@ -50,7 +50,7 @@ func TestLz77ReachLevels(t *testing.T) {
 	if testing.Short() {
 		iters = 20000
 	}
-	forEachLevel(t, func(t *testing.T) {
+	forEachLevelIters(t, iters, []cpuinfo.Level{cpuinfo.SSE41}, func(t *testing.T, iters int) {
 		for k := 0; k < iters; k++ {
 			size := 1 + rng.Intn(600)
 			ol := randOl(rng, size)
