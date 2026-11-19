@@ -7,13 +7,14 @@ import (
 	"golang.org/x/sys/cpu"
 )
 
-// x86 implementations of the batched DSP entry points of dsp_batch.go,
-// written in dsp_amd64.s: SSE4.1 kernels (128-bit, legacy encoding) and,
-// where the 256-bit width pays off, AVX2 ones. The wrappers below check
-// every bound before calling the assembly, which then reads and writes
-// exactly the bytes the reference implementation touches. All kernels are
-// bit-exact with the Go reference code, so the encoder output does not
-// depend on the build or on the CPU.
+// x86 implementations of the batched DSP entry points of dsp_batch.go:
+// SSE4.1 kernels (128-bit, legacy encoding) in dsp_amd64.s and, where the
+// 256-bit width pays off, AVX2 ones in dsp_avx2_amd64.s (the residual cost
+// kernel is in cost_amd64.s). The wrappers below check every bound before
+// calling the assembly, which then reads and writes exactly the bytes the
+// reference implementation touches. All kernels are bit-exact with the Go
+// reference code, so the encoder output does not depend on the build or
+// on the CPU.
 
 // x86MaxLevel is the highest kernel level this machine runs: cpuinfo.Max,
 // except that the kernels also use POPCNT (present on every CPU with
