@@ -2,12 +2,13 @@
 
 // AVX-512 VBMI kernels of the color-indexing transform with 256-entry
 // palettes: lookups of index bytes into RGBA words (lookupRGBA) and alpha
-// bytes (lookupBytes). libwebp has no x86 SIMD version of these
-// (MapARGB_C, MapAlpha_C); the Go references lookupRGBAGo (idx8.go) and
-// lookupBytesGo (transform.go) are the specification. The functions
-// process exact counts, the tails with masked loads and stores (which do
-// not fault on the masked-off bytes), and end with VZEROUPPER. They need
-// AVX512-F/BW (x86-64-v4) and AVX512-VBMI (VPERMB, VPERMI2B).
+// bytes (lookupBytes), and an AVX2 gather of RGBA words. libwebp has no
+// x86 SIMD version of these (MapARGB_C, MapAlpha_C); the Go references
+// lookupRGBAGo (idx8.go) and lookupBytesGo (transform.go) are the
+// specification. The VBMI functions process exact counts, the tails with
+// masked loads and stores (which do not fault on the masked-off bytes);
+// they need AVX512-F/BW (x86-64-v4) and AVX512-VBMI (VPERMB, VPERMI2B).
+// All end with VZEROUPPER.
 
 #include "textflag.h"
 
@@ -221,5 +222,50 @@ lbtail:
 	VMOVDQU8   Z0, K2, (DI)
 
 lbdone:
+	VZEROUPPER
+	RET
+
+// func lookupRGBAAVX2(pal *[256]uint32, src, dst *byte, n int)
+//
+// Writes the RGBA words pal[src[i]] to dst for i < n, n a multiple of 8
+// (the wrapper does the rest in Go): VPMOVZXBD widens 8 index bytes to
+// dwords and VPGATHERDD loads their palette words (every index is below
+// 256, inside the palette). The gather clears its mask register, which is
+// set again from Y15 (all ones) before each one.
+//
+// AX pal, SI src, DI dst, CX pixels left; Y0, Y1 indices, Y2, Y3 masks,
+// Y4, Y5 RGBA words.
+TEXT ·lookupRGBAAVX2(SB), NOSPLIT, $0-32
+	MOVQ     pal+0(FP), AX
+	MOVQ     src+8(FP), SI
+	MOVQ     dst+16(FP), DI
+	MOVQ     n+24(FP), CX
+	VPCMPEQD Y15, Y15, Y15
+
+lg16:
+	CMPQ       CX, $16
+	JB         lg8
+	VPMOVZXBD  (SI), Y0
+	VPMOVZXBD  8(SI), Y1
+	VMOVDQA    Y15, Y2
+	VMOVDQA    Y15, Y3
+	VPGATHERDD Y2, (AX)(Y0*4), Y4
+	VPGATHERDD Y3, (AX)(Y1*4), Y5
+	VMOVDQU    Y4, (DI)
+	VMOVDQU    Y5, 32(DI)
+	ADDQ       $16, SI
+	ADDQ       $64, DI
+	SUBQ       $16, CX
+	JMP        lg16
+
+lg8:
+	CMPQ       CX, $8
+	JB         lgdone
+	VPMOVZXBD  (SI), Y0
+	VMOVDQA    Y15, Y2
+	VPGATHERDD Y2, (AX)(Y0*4), Y4
+	VMOVDQU    Y4, (DI)
+
+lgdone:
 	VZEROUPPER
 	RET

@@ -49,6 +49,9 @@ func predictRowSSE41(in, out, up, modes *uint32, x, width, bits int) int
 func lookupRGBAVBMI(pal *[256]uint32, src, dst *byte, n int)
 
 //go:noescape
+func lookupRGBAAVX2(pal *[256]uint32, src, dst *byte, n int)
+
+//go:noescape
 func lookupBytesVBMI(pal *[256]byte, in, out *byte, n int)
 
 //go:noescape
@@ -132,12 +135,18 @@ func lookupBytes(pal *[256]byte, in, out []byte) {
 const lookupRGBAMinVBMI = 64
 
 // lookupRGBA writes the RGBA words pal[src[i]] to dst (as many pixels as
-// fit).
+// fit). The AVX2 gather does groups of 8 pixels, the Go reference the
+// rest.
 func lookupRGBA(pal *[256]uint32, src, dst []byte) {
 	n := min(len(src), len(dst)/4)
-	if n >= lookupRGBAMinVBMI && x86Level >= cpuinfo.AVX512 && x86VBMI {
+	switch {
+	case n >= lookupRGBAMinVBMI && x86Level >= cpuinfo.AVX512 && x86VBMI:
 		lookupRGBAVBMI(pal, &src[0], &dst[0], n)
 		return
+	case n >= 8 && x86Level >= cpuinfo.AVX2:
+		m := n &^ 7
+		lookupRGBAAVX2(pal, &src[0], &dst[0], m)
+		src, dst = src[m:n], dst[4*m:]
 	}
 	lookupRGBAGo(pal, src, dst)
 }
