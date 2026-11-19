@@ -27,6 +27,9 @@ func TestKernelCoverage(t *testing.T) {
 		hits[rs.arch.kind]++
 	}
 	for k := uint8(kindGo); k <= kindExpand4; k++ {
+		if (k == kindShrink4W8 || k == kindShrink4W16) && cpuinfo.Max < cpuinfo.AVX2 {
+			continue // AVX2 kernels
+		}
 		if hits[k] < 100 {
 			t.Errorf("kernel %d: %d hits", k, hits[k])
 		}
