@@ -1,12 +1,13 @@
 //go:build amd64 && !purego
 
-// SSE4.1 and AVX2 kernels of the inverse predictor transform. Algorithms
-// adapted from libwebp (BSD-3-Clause), src/dsp/lossless_sse2.c
-// (PredictorAdd0_SSE2 to PredictorAdd12_SSE2) and lossless_avx2.c; the Go
-// reference predictRowGo (transform.go) is the specification.
+// SSE4.1 kernel of the inverse predictor transform, used at the AVX2 and
+// AVX-512 levels too (the serial modes gain nothing from wider vectors).
+// Algorithms adapted from libwebp (BSD-3-Clause), src/dsp/lossless_sse2.c
+// (PredictorAdd0_SSE2 to PredictorAdd12_SSE2); the Go reference
+// predictRowGo (transform.go) is the specification.
 //
 // Pixels are ARGB words, added per byte modulo 256 (PADDB). Every loop
-// processes exact pixel counts: 8 (AVX2), 4, then one pixel at a time in
+// processes exact pixel counts: 8 (mode 1), 4, then one pixel at a time in
 // the low 32 bits of a vector register, so nothing is read or written
 // outside in[x:width], out[x-1:width] and up[x-1:width+1].
 //
