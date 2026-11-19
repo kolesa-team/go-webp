@@ -18,8 +18,9 @@ import (
 // identityHashes holds the SHA-256 (first 16 hex digits) of each case's
 // output as produced at b6b0954 (pure Go, before the NEON kernels);
 // TestEncodeIdentity checks them in every build (go test, go test -tags
-// purego, other architectures). Set VP8ENC_PRINT_HASHES=1 to print the
-// current hashes in the format of the table.
+// purego, other architectures) and at every kernel level of the machine.
+// Set VP8ENC_PRINT_HASHES=1 to print the current hashes in the format of
+// the table.
 
 type identityCase struct {
 	name  string
@@ -110,30 +111,32 @@ func TestEncodeIdentity(t *testing.T) {
 		t.Skip("short")
 	}
 	cache := map[string]*image.NRGBA{}
-	got := map[string]string{}
-	for _, c := range identityCases() {
-		got[c.name] = shortHash(encodeIdentityCase(t, c, cache))
-	}
-	if os.Getenv("VP8ENC_PRINT_HASHES") != "" {
-		names := make([]string, 0, len(got))
-		for n := range got {
-			names = append(names, n)
+	forEachLevel(t, func(t *testing.T) {
+		got := map[string]string{}
+		for _, c := range identityCases() {
+			got[c.name] = shortHash(encodeIdentityCase(t, c, cache))
 		}
-		sort.Strings(names)
-		for _, n := range names {
-			fmt.Printf("\t%q: %q,\n", n, got[n])
+		if os.Getenv("VP8ENC_PRINT_HASHES") != "" {
+			names := make([]string, 0, len(got))
+			for n := range got {
+				names = append(names, n)
+			}
+			sort.Strings(names)
+			for _, n := range names {
+				fmt.Printf("\t%q: %q,\n", n, got[n])
+			}
 		}
-	}
-	for name, h := range got {
-		want, ok := identityHashes[name]
-		if !ok {
-			t.Errorf("%s: no reference hash (got %s)", name, h)
-			continue
+		for name, h := range got {
+			want, ok := identityHashes[name]
+			if !ok {
+				t.Errorf("%s: no reference hash (got %s)", name, h)
+				continue
+			}
+			if h != want {
+				t.Errorf("%s: output hash %s, want %s", name, h, want)
+			}
 		}
-		if h != want {
-			t.Errorf("%s: output hash %s, want %s", name, h, want)
-		}
-	}
+	})
 }
 
 var identityHashes = map[string]string{
