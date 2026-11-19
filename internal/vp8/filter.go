@@ -1,5 +1,7 @@
 package vp8
 
+import "github.com/kolesa-team/go-webp/v2/internal/cpuinfo"
+
 // Algorithm adapted from libwebp (BSD-3-Clause): dsp/dec.c (simple and
 // complex in-loop filters).
 //
@@ -7,6 +9,10 @@ package vp8
 // pixels across the edge are one stride apart, the loop walks along a row)
 // and "H" filters a vertical edge (pixels across the edge are adjacent, the
 // loop walks down a column).
+
+// filterLevel selects the x86 SIMD level of filterMB (filter_amd64.go);
+// tests lower it to cover every level. Other builds ignore it.
+var filterLevel = cpuinfo.Max
 
 func abs(x int) int { return max(x, -x) }
 
@@ -247,8 +253,8 @@ const (
 
 // filterMBGo applies the in-loop filter to the macroblock at column mbX of
 // the current cache row (libwebp's DoFilter). This is the portable
-// reference; filterMB (filter_arm64.go, filter_generic.go) is the entry
-// point used by the decoder.
+// reference; filterMB (filter_arm64.go, filter_amd64.go, filter_generic.go)
+// is the entry point used by the decoder.
 func (d *decoder) filterMBGo(mbX, mbY int, f fInfo) {
 	limit := int(f.limit)
 	if limit == 0 {
@@ -308,4 +314,22 @@ func (d *decoder) filterMBGo(mbX, mbY int, f fInfo) {
 		loop24V(cu, uvo+4*uvs, uvs, 8, ti2, il, hevT)
 		loop24V(cv, uvo+4*uvs, uvs, 8, ti2, il, hevT)
 	}
+}
+
+// blockInBounds reports whether the n x n block at offset o of a plane of
+// size bytes with the given stride lies inside the plane, together with
+// the k rows above it (filterEdgeTop) and the k columns to its left
+// (filterEdgeLeft) when flags select those edges.
+func blockInBounds(size, o, stride, n, k, flags int) bool {
+	if o < 0 || stride < n {
+		return false
+	}
+	lo := o
+	if flags&filterEdgeTop != 0 {
+		lo -= k * stride
+	}
+	if flags&filterEdgeLeft != 0 {
+		lo = min(lo, o-k)
+	}
+	return lo >= 0 && o+(n-1)*stride+n <= size
 }

@@ -68,21 +68,3 @@ func (d *decoder) filterMB(mbX, mbY int, f fInfo) {
 	}
 	filterMBComplexNEON(&cy[yo], &cu[uvo], &cv[uvo], ys, uvs, limit+4, limit, int(f.ilevel), int(f.hevThresh), flags)
 }
-
-// blockInBounds reports whether the n x n block at offset o of a plane of
-// size bytes with the given stride lies inside the plane, together with
-// the k rows above it (filterEdgeTop) and the k columns to its left
-// (filterEdgeLeft) when flags select those edges.
-func blockInBounds(size, o, stride, n, k, flags int) bool {
-	if o < 0 || stride < n {
-		return false
-	}
-	lo := o
-	if flags&filterEdgeTop != 0 {
-		lo -= k * stride
-	}
-	if flags&filterEdgeLeft != 0 {
-		lo = min(lo, o-k)
-	}
-	return lo >= 0 && o+(n-1)*stride+n <= size
-}

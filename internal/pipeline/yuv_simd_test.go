@@ -4,10 +4,25 @@ import (
 	"bytes"
 	"math/rand/v2"
 	"testing"
+
+	"github.com/kolesa-team/go-webp/v2/internal/cpuinfo"
 )
 
-// Differential tests of yuvToRGBARow (NEON on arm64) against the portable
-// reference yuvToRGBARowGo.
+// Differential tests of yuvToRGBARow (NEON on arm64, SSE4.1/AVX2 on amd64
+// at every level the machine supports) against the portable reference
+// yuvToRGBARowGo.
+
+// withYUVLevels runs fn as a subtest once per SIMD level this machine
+// supports, with yuvLevel set to it (on non-x86 machines only "go" exists
+// and fn runs once on the platform's kernel).
+func withYUVLevels(t *testing.T, fn func(t *testing.T)) {
+	saved := yuvLevel
+	defer func() { yuvLevel = saved }()
+	for _, l := range cpuinfo.Levels() {
+		yuvLevel = l
+		t.Run(l.String(), fn)
+	}
+}
 
 // yuvRefPixel is libwebp's VP8YuvToRgb written out independently.
 func yuvRefPixel(y, u, v int) (r, g, b byte) {
@@ -21,8 +36,12 @@ func yuvRefPixel(y, u, v int) (r, g, b byte) {
 // TestYUVToRGBARowExhaustive converts all 2^24 (y, u, v) triples: row
 // (u, v>>4) holds the 16 v values x 256 luma values; a second pass shifts
 // the rows by 8 pixels so every triple also lands in the other half of a
-// 16-pixel NEON block.
+// 16-pixel NEON block (and both halves of a 32-pixel AVX2 block).
 func TestYUVToRGBARowExhaustive(t *testing.T) {
+	withYUVLevels(t, testYUVToRGBARowExhaustive)
+}
+
+func testYUVToRGBARowExhaustive(t *testing.T) {
 	const w = 16 * 256
 	for _, shift := range []int{0, 8} {
 		ys, us, vs := make([]byte, w+shift), make([]byte, w+shift), make([]byte, w+shift)
@@ -51,6 +70,10 @@ func TestYUVToRGBARowExhaustive(t *testing.T) {
 }
 
 func TestYUVToRGBARowMatchesGo(t *testing.T) {
+	withYUVLevels(t, testYUVToRGBARowMatchesGo)
+}
+
+func testYUVToRGBARowMatchesGo(t *testing.T) {
 	r := rand.New(rand.NewPCG(21, 22))
 	widths := []int{}
 	for w := 1; w <= 64; w++ {
@@ -79,7 +102,7 @@ func TestYUVToRGBARowMatchesGo(t *testing.T) {
 			got := buf[off : off+4*w]
 			yuvToRGBARow(ys, us, vs, as, got)
 			if !bytes.Equal(got, want) {
-				t.Fatalf("w=%d alpha=%v: rows differ", w, as != nil)
+				t.Fatalf("%v w=%d alpha=%v: rows differ", yuvLevel, w, as != nil)
 			}
 			for k, b := range append(buf[:off:off], buf[off+4*w:]...) {
 				if b != 0xa5 {
@@ -88,6 +111,40 @@ func TestYUVToRGBARowMatchesGo(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestYUVToRGBARowGuardPages runs the converter on rows that end right
+// before (or start right after) an inaccessible page: an out-of-bounds
+// access faults.
+func TestYUVToRGBARowGuardPages(t *testing.T) {
+	withYUVLevels(t, func(t *testing.T) {
+		r := rand.New(rand.NewPCG(25, 26))
+		for _, w := range []int{15, 16, 17, 31, 32, 33, 47, 48, 63, 64, 65, 100, 1023, 1024} {
+			for _, atEnd := range []bool{true, false} {
+				for _, alpha := range []bool{false, true} {
+					g := func() []byte {
+						b := guardedBytes(t, w, atEnd)
+						for i := range b {
+							b[i] = byte(r.IntN(256))
+						}
+						return b
+					}
+					ys, us, vs := g(), g(), g()
+					var as []byte
+					if alpha {
+						as = g()
+					}
+					want := make([]byte, 4*w)
+					yuvToRGBARowGo(ys, us, vs, as, want)
+					got := guardedBytes(t, 4*w, atEnd)
+					yuvToRGBARow(ys, us, vs, as, got)
+					if !bytes.Equal(got, want) {
+						t.Fatalf("w=%d atEnd=%v alpha=%v: rows differ", w, atEnd, alpha)
+					}
+				}
+			}
+		}
+	})
 }
 
 func FuzzYUVToRGBARow(f *testing.F) {
@@ -112,11 +169,17 @@ func FuzzYUVToRGBARow(f *testing.F) {
 		if alpha {
 			as = mk()
 		}
-		want, got := make([]byte, 4*w), make([]byte, 4*w)
+		want := make([]byte, 4*w)
 		yuvToRGBARowGo(ys, us, vs, as, want)
-		yuvToRGBARow(ys, us, vs, as, got)
-		if !bytes.Equal(got, want) {
-			t.Fatalf("w=%d alpha=%v: rows differ", w, alpha)
+		saved := yuvLevel
+		defer func() { yuvLevel = saved }()
+		for _, l := range cpuinfo.Levels() {
+			yuvLevel = l
+			got := make([]byte, 4*w)
+			yuvToRGBARow(ys, us, vs, as, got)
+			if !bytes.Equal(got, want) {
+				t.Fatalf("%v w=%d alpha=%v: rows differ", l, w, alpha)
+			}
 		}
 	})
 }
@@ -128,12 +191,17 @@ func BenchmarkYUVToRGBARow(b *testing.B) {
 	for i := range ys {
 		ys[i], us[i], vs[i] = byte(r.IntN(256)), byte(r.IntN(256)), byte(r.IntN(256))
 	}
-	b.Run("kernel", func(b *testing.B) {
-		b.SetBytes(w)
-		for b.Loop() {
-			yuvToRGBARow(ys, us, vs, nil, out)
-		}
-	})
+	saved := yuvLevel
+	defer func() { yuvLevel = saved }()
+	for _, l := range cpuinfo.Levels() {
+		yuvLevel = l
+		b.Run("kernel/"+l.String(), func(b *testing.B) {
+			b.SetBytes(w)
+			for b.Loop() {
+				yuvToRGBARow(ys, us, vs, nil, out)
+			}
+		})
+	}
 	b.Run("go", func(b *testing.B) {
 		b.SetBytes(w)
 		for b.Loop() {

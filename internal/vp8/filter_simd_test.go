@@ -7,8 +7,9 @@ import (
 	"testing"
 )
 
-// Differential tests of filterMB (NEON on arm64) against the portable
-// reference filterMBGo on random macroblock caches.
+// Differential tests of filterMB (NEON on arm64, SSE4.1/AVX2 on amd64 at
+// every level the machine supports) against the portable reference
+// filterMBGo on random macroblock caches.
 
 // filterCache is a decoder whose row cache holds mbW macroblocks, laid out
 // like initFrame does it.
@@ -81,8 +82,8 @@ func checkFilterMB(t testing.TB, d *decoder, mbX, mbY int, f fInfo) {
 		{"V", got.cacheV, ref.cacheV, d.cacheUVStride, d.extraRows / 2},
 	} {
 		if i := firstByteDiff(p.a, p.b); i >= 0 {
-			t.Fatalf("type=%d mb=(%d,%d) %+v: plane %s differs at row %d col %d: got %d, want %d",
-				d.filterType, mbX, mbY, f, p.name, i/p.stride-p.baseRows, i%p.stride, p.a[i], p.b[i])
+			t.Fatalf("%v type=%d mb=(%d,%d) %+v: plane %s differs at row %d col %d: got %d, want %d",
+				filterLevel, d.filterType, mbX, mbY, f, p.name, i/p.stride-p.baseRows, i%p.stride, p.a[i], p.b[i])
 		}
 	}
 }
@@ -91,6 +92,10 @@ func checkFilterMB(t testing.TB, d *decoder, mbX, mbY int, f fInfo) {
 // interior limit 0..71 plus a few large ones, hev thresholds 0..3 and
 // random) with random edge selections and pixel data.
 func TestFilterMBMatchesGo(t *testing.T) {
+	withLevels(t, &filterLevel, testFilterMBMatchesGo)
+}
+
+func testFilterMBMatchesGo(t *testing.T) {
 	r := rand.New(rand.NewPCG(11, 12))
 	step := 1
 	if testing.Short() {
@@ -139,6 +144,10 @@ func TestFilterMBMatchesGo(t *testing.T) {
 // strengths (precomputeFilterStrengths' ranges) in sequence on the same
 // cache, as the decoder does.
 func TestFilterMBRandom(t *testing.T) {
+	withLevels(t, &filterLevel, testFilterMBRandom)
+}
+
+func testFilterMBRandom(t *testing.T) {
 	r := rand.New(rand.NewPCG(13, 14))
 	n := 200000
 	if testing.Short() {
@@ -170,7 +179,7 @@ func TestFilterMBRandom(t *testing.T) {
 			ref.filterMBGo(mbX, mbY, f)
 			got.filterMB(mbX, mbY, f)
 			if !bytes.Equal(ref.cacheY, got.cacheY) || !bytes.Equal(ref.cacheU, got.cacheU) || !bytes.Equal(ref.cacheV, got.cacheV) {
-				t.Fatalf("type=%d step %d mb=(%d,%d) %+v: caches differ", ft, i, mbX, mbY, f)
+				t.Fatalf("%v type=%d step %d mb=(%d,%d) %+v: caches differ", filterLevel, ft, i, mbX, mbY, f)
 			}
 		}
 	}
@@ -207,6 +216,10 @@ func walkFilterPlane(r *rand.Rand, b []byte, stride int, steps []int) {
 // at 0, small, VP8's maximum and 255, on pixels whose neighbour
 // differences concentrate at those thresholds.
 func TestFilterMBThresholdWalk(t *testing.T) {
+	withLevels(t, &filterLevel, testFilterMBThresholdWalk)
+}
+
+func testFilterMBThresholdWalk(t *testing.T) {
 	r := rand.New(rand.NewPCG(19, 20))
 	n := 100000
 	if testing.Short() {
@@ -239,10 +252,14 @@ func TestFilterMBThresholdWalk(t *testing.T) {
 	}
 }
 
-// TestFilterKernelGuardPages runs the NEON kernels (through filterMB) on
+// TestFilterKernelGuardPages runs the SIMD kernels (through filterMB) on
 // planes cut to exactly the bytes a macroblock's edges may touch, placed
 // against an inaccessible page at either end.
 func TestFilterKernelGuardPages(t *testing.T) {
+	withLevels(t, &filterLevel, testFilterKernelGuardPages)
+}
+
+func testFilterKernelGuardPages(t *testing.T) {
 	r := rand.New(rand.NewPCG(15, 16))
 	for _, ft := range []int{1, 2} {
 		k := 4
@@ -327,12 +344,12 @@ func FuzzFilterMB(f *testing.F) {
 			}
 		}
 		fi := fInfo{limit: limit, ilevel: ilevel, hevThresh: hev, inner: sel & 1}
-		checkFilterMB(t, d, int(sel>>1)&1, int(sel>>2)&1, fi)
+		forLevels(&filterLevel, func(string) { checkFilterMB(t, d, int(sel>>1)&1, int(sel>>2)&1, fi) })
 	})
 }
 
-// Kernel benchmarks: one macroblock with all edges, the dispatched filter
-// (NEON on arm64) and the Go reference.
+// Kernel benchmarks: four macroblocks with all edges, the dispatched filter
+// (NEON on arm64, every level on amd64) and the Go reference.
 
 func benchFilterMB(b *testing.B, ft int, fn func(d *decoder, mbX, mbY int, f fInfo)) {
 	d := newFilterCache(ft, 4)
@@ -351,7 +368,9 @@ func benchFilterMB(b *testing.B, ft int, fn func(d *decoder, mbX, mbY int, f fIn
 func BenchmarkFilterMB(b *testing.B) {
 	for _, ft := range []int{1, 2} {
 		b.Run(fmt.Sprintf("type%d/kernel", ft), func(b *testing.B) {
-			benchFilterMB(b, ft, (*decoder).filterMB)
+			benchLevels(b, &filterLevel, func(b *testing.B) {
+				benchFilterMB(b, ft, (*decoder).filterMB)
+			})
 		})
 		b.Run(fmt.Sprintf("type%d/go", ft), func(b *testing.B) {
 			benchFilterMB(b, ft, (*decoder).filterMBGo)

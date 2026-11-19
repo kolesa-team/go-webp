@@ -52,7 +52,19 @@ func loadVP8(t testing.TB, name string) []byte {
 	return ri.vp8
 }
 
+// TestConformanceGolden compares the decoded fixtures with libwebp's output
+// (testdata/golden.txt) at every SIMD level of the row converters and the
+// loop filters (switched together; one run on non-x86 machines).
 func TestConformanceGolden(t *testing.T) {
+	saved := filterLevel
+	defer func() { filterLevel = saved }()
+	withLevels(t, &yuvLevel, func(t *testing.T) {
+		filterLevel = yuvLevel
+		testConformanceGolden(t)
+	})
+}
+
+func testConformanceGolden(t *testing.T) {
 	f, err := os.Open("testdata/golden.txt")
 	if err != nil {
 		t.Fatal(err)
