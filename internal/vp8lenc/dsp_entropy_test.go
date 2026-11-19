@@ -82,7 +82,9 @@ func TestCombinedShannonEntropyLevels(t *testing.T) {
 
 // TestSlog2Exhaustive checks the kernels' v*log2(v) for every v below 2^24
 // and random larger ones, isolated: with a zero acc and a single non-zero
-// bin x[i] = 1, y[i] = v-1, the result is exactly -slog2(v).
+// bin x[i] = 1, y[i] = v-1, the result is exactly -slog2(v). The levels
+// above SSE4.1 run the same kernel: they only check every 251st v (and the
+// Go level would compare the reference with itself).
 func TestSlog2Exhaustive(t *testing.T) {
 	if testing.Short() {
 		t.Skip("short")
@@ -90,25 +92,41 @@ func TestSlog2Exhaustive(t *testing.T) {
 	var x, y [256]int32
 	var acc accEntropy
 	rng := rand.New(rand.NewSource(6))
-	forEachLevel(t, func(t *testing.T) {
-		check := func(v uint32, i int) {
-			x[i], y[i] = 1, int32(v-1)
-			got := combinedShannonEntropy(&x, &y, &acc)
-			want := combinedShannonEntropyGo(&x, &y, &acc)
-			x[i], y[i] = 0, 0
-			if math.Float64bits(got) != math.Float64bits(want) {
-				t.Fatalf("v %d: got %v, want %v", v, got, want)
-			}
+	for _, l := range testLevels() {
+		if l == cpuinfo.Go {
+			continue
 		}
-		for v := uint32(1); v < 1<<24; v++ {
-			check(v, int(v&255))
+		step := uint32(1)
+		if l != cpuinfo.SSE41 {
+			step = 251
 		}
-		for k := 0; k < 1<<20; k++ {
-			check(rng.Uint32()|1<<24, k&255)
+		t.Run(l.String(), func(t *testing.T) {
+			defer setLevel(l)()
+			slog2Levels(t, &x, &y, &acc, rng, step)
+		})
+	}
+}
+
+// slog2Levels is TestSlog2Exhaustive at the current level, for every
+// step-th v.
+func slog2Levels(t *testing.T, x, y *[256]int32, acc *accEntropy, rng *rand.Rand, step uint32) {
+	check := func(v uint32, i int) {
+		x[i], y[i] = 1, int32(v-1)
+		got := combinedShannonEntropy(x, y, acc)
+		want := combinedShannonEntropyGo(x, y, acc)
+		x[i], y[i] = 0, 0
+		if math.Float64bits(got) != math.Float64bits(want) {
+			t.Fatalf("v %d: got %v, want %v", v, got, want)
 		}
-		check(1<<32-1, 7)
-		check(0, 9) // x+y wraps to 0
-	})
+	}
+	for v := uint32(1); v < 1<<24; v += step {
+		check(v, int(v&255))
+	}
+	for k := 0; k < 1<<20; k += int(step) {
+		check(rng.Uint32()|1<<24, k&255)
+	}
+	check(1<<32-1, 7)
+	check(0, 9) // x+y wraps to 0
 }
 
 func FuzzCombinedShannonEntropy(f *testing.F) {

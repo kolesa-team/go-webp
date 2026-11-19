@@ -191,8 +191,11 @@ func TestEncodeIdentity(t *testing.T) {
 	}
 	checkIdentity(t, "sequential", got)
 
-	// Every kernel level (dsp_amd64.go) gives the same bytes.
-	for _, l := range testLevels()[:len(testLevels())-1] {
+	// Every kernel level (dsp_amd64.go) gives the same bytes. (The last
+	// level of kernelLevels runs the kernels of the default level, checked
+	// above.)
+	kl := kernelLevels()
+	for _, l := range kl[:len(kl)-1] {
 		restore := setLevel(l)
 		got := map[string]string{}
 		for _, c := range cases {

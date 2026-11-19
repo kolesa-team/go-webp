@@ -20,6 +20,10 @@ import (
 // by the tests to run every level against the Go reference.
 var x86Level = cpuinfo.Max
 
+// maxKernelLevel is the highest level with kernels of its own: the levels
+// above it run its kernels.
+const maxKernelLevel = cpuinfo.AVX2
+
 //go:noescape
 func predictRowSSE41(mode int, cur, up, out *uint32, n int)
 
