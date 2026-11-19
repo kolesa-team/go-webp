@@ -1539,3 +1539,105 @@ cc_tail:
 
 cc_done:
 	RET
+
+// ---------------------------------------------------------------------------
+// func lz77ReachSSE41(ol *uint32, i, jMax, n int) (l int)
+//
+// lz77ReachGo for jMax-i >= 4, 0 < n < 2^30, jMax < 2^30 (libwebp
+// BackwardReferencesLz77 runs the same loop in C): the result is j-i for
+// the first j in (i, jMax] with the largest min(reach(j), n), reach(j)
+// being j+lj for lj = ol[j]&0xfff >= 4, else j+1 (the Go loop stops at
+// the first j reaching n, the first one with the largest capped reach;
+// otherwise it keeps the first strict maximum). 4 positions per block:
+// the capped reaches (PCMPGTL/PAND/PANDN/POR select lj or 1, PADDL adds j,
+// PMINUD caps), their maximum (PSHUFD/PMAXUD) compared with the best so
+// far, and only when it is larger the first lane equal to it (PCMPEQL,
+// MOVMSKPS, BSF). The last partial block is the block ending at jMax: its
+// lanes already seen are at most the best, so they cannot match.
+// SI = ol, R8 = i, R9 = jMax, R10 = n, BX = block start, R11 = best capped
+// reach, DX = its position, R12 = jMax-3, R13 = 1 in the last block,
+// X3 = the positions of the block, X2 = 4s, X4 = n, X5 = 1s, X6 = 3s,
+// X7 = 0xfff, X9 = (0, 1, 2, 3).
+TEXT ·lz77ReachSSE41(SB), NOSPLIT, $0-40
+	MOVQ   ol+0(FP), SI
+	MOVQ   i+8(FP), R8
+	MOVQ   jMax+16(FP), R9
+	MOVQ   n+24(FP), R10
+	MOVL   $0xfff, AX
+	MOVQ   AX, X7
+	PSHUFD $0, X7, X7
+	MOVL   $3, AX
+	MOVQ   AX, X6
+	PSHUFD $0, X6, X6
+	MOVL   $1, AX
+	MOVQ   AX, X5
+	PSHUFD $0, X5, X5
+	MOVQ   R10, X4
+	PSHUFD $0, X4, X4
+	MOVL   $4, AX
+	MOVQ   AX, X2
+	PSHUFD $0, X2, X2
+	MOVQ   $0x0000000100000000, AX
+	MOVQ   AX, X9
+	MOVQ   $0x0000000300000002, AX
+	PINSRQ $1, AX, X9
+	LEAQ   1(R8), BX
+	MOVQ   BX, X3
+	PSHUFD $0, X3, X3
+	PADDL  X9, X3
+	XORL   R11, R11
+	MOVQ   BX, DX
+	LEAQ   -3(R9), R12
+	XORL   R13, R13
+
+lzr_loop:
+	CMPQ BX, R12
+	JGT  lzr_last
+
+lzr_block:
+	MOVOU    (SI)(BX*4), X0
+	PAND     X7, X0
+	MOVO     X0, X1
+	PCMPGTL  X6, X1
+	PAND     X1, X0
+	PANDN    X5, X1
+	POR      X1, X0
+	PADDL    X3, X0
+	PMINUD   X4, X0
+	PSHUFD   $0x4e, X0, X1
+	PMAXUD   X0, X1
+	PSHUFD   $0xb1, X1, X8
+	PMAXUD   X8, X1
+	MOVQ     X1, AX
+	MOVL     AX, AX
+	CMPQ     AX, R11
+	JLE      lzr_next
+	PCMPEQL  X1, X0
+	MOVMSKPS X0, CX
+	BSFL     CX, CX
+	LEAQ     (BX)(CX*1), DX
+	MOVQ     AX, R11
+	CMPQ     R11, R10
+	JGE      lzr_done
+
+lzr_next:
+	TESTQ R13, R13
+	JNZ   lzr_done
+	ADDQ  $4, BX
+	PADDL X2, X3
+	JMP   lzr_loop
+
+lzr_last:
+	CMPQ   BX, R9
+	JGT    lzr_done
+	MOVQ   R12, BX
+	MOVQ   BX, X3
+	PSHUFD $0, X3, X3
+	PADDL  X9, X3
+	MOVL   $1, R13
+	JMP    lzr_block
+
+lzr_done:
+	SUBQ R8, DX
+	MOVQ DX, l+32(FP)
+	RET

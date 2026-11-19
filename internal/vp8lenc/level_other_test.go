@@ -15,3 +15,5 @@ func setLevel(cpuinfo.Level) (restore func()) { return func() {} }
 func setPrefetch(int) (restore func()) { return func() {} }
 
 func setAddRefsMin(int) (restore func()) { return func() {} }
+
+func setLz77ReachMin(int) (restore func()) { return func() {} }

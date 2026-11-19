@@ -296,3 +296,20 @@ func TestCCHistoGuard(t *testing.T) {
 		}
 	})
 }
+
+func TestLz77ReachGuard(t *testing.T) {
+	defer setLz77ReachMin(4)()
+	rng := rand.New(rand.NewSource(13))
+	forEachLevel(t, func(t *testing.T) {
+		for _, n := range []int{5, 6, 7, 8, 9, 13, 100} {
+			for _, atEnd := range []bool{false, true} {
+				ol := guardedU32(t, n, atEnd)
+				copy(ol, randOl(rng, n))
+				want := lz77ReachGo(slices.Clone(ol), 0, n-1, n, 3)
+				if got := lz77Reach(ol, 0, n-1, n, 3); got != want {
+					t.Fatalf("n %d atEnd %v: got %d, want %d", n, atEnd, got, want)
+				}
+			}
+		}
+	})
+}

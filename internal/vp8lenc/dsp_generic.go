@@ -55,3 +55,5 @@ func ccHistoRed(histo *[256]int32, r, g []int8, c []int32, m int8) { ccHistoRedG
 func ccHistoBlue(histo *[256]int32, b, g, r []int8, c []int32, mg, mr int8) {
 	ccHistoBlueGo(histo, b, g, r, c, mg, mr)
 }
+
+func lz77Reach(ol []uint32, i, jMax, n, l int) int { return lz77ReachGo(ol, i, jMax, n, l) }

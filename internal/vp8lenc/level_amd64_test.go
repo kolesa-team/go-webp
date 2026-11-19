@@ -42,3 +42,10 @@ func setAddRefsMin(n int) (restore func()) {
 	addRefsMin = n
 	return func() { addRefsMin = old }
 }
+
+// setLz77ReachMin sets the smallest range of the lz77Reach kernel.
+func setLz77ReachMin(m int) (restore func()) {
+	old := lz77ReachMin
+	lz77ReachMin = m
+	return func() { lz77ReachMin = old }
+}

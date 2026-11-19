@@ -280,3 +280,23 @@ func ccHistoBlue(histo *[256]int32, b, g, r []int8, c []int32, mg, mr int8) {
 	}
 	ccHistoBlueGo(histo, b, g, r, c, mg, mr)
 }
+
+//go:noescape
+func lz77ReachSSE41(ol *uint32, i, jMax, n int) (l int)
+
+// lz77ReachMin is the smallest jMax-i for which lz77Reach runs its kernel
+// (at least 4; a variable for the tests).
+var lz77ReachMin = 8
+
+// lz77Reach is lz77ReachGo: the kernel computes the reaches 4 positions at
+// a time, capped at n (the Go loop stops at the first position reaching
+// n, which is then the first one with the maximal capped reach), and
+// looks for the first position of a block maximum only when it beats the
+// best reach so far.
+func lz77Reach(ol []uint32, i, jMax, n, l int) int {
+	if x86Level >= cpuinfo.SSE41 && jMax-i >= lz77ReachMin && i >= 0 && n > 0 && n < 1<<30 && jMax < 1<<30 {
+		_ = ol[jMax]
+		return lz77ReachSSE41(&ol[0], i, jMax, n)
+	}
+	return lz77ReachGo(ol, i, jMax, n, l)
+}
