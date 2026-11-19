@@ -20,9 +20,58 @@ import (
 // by the tests to run every level against the Go reference.
 var x86Level = cpuinfo.Max
 
+// The kernels that walk a whole image or parse are called on chunks of it,
+// each through a Go function that is not inlined (the *Chunk functions):
+// an assembly kernel cannot be preempted, so a stop-the-world of the
+// process (each garbage collection has two) waits until the goroutine
+// reaches a preemption point, and every other goroutine with it. The
+// kernels have none (no stack check), and a Go loop that spends nearly all
+// its time in them is not preempted either (the asynchronous preemption
+// signal practically never lands in its few instructions); the stack check
+// of the Go function around each chunk is one. Whole-image calls made that
+// wait 0.5 s at level 6 and 50 ms at level 0 on a 5 MP photo, against well
+// under 1 ms for the Go code; one chunk takes about 0.1 ms or less on
+// ordinary images, and the extra calls cost nothing measurable. (Variables
+// for the tests.)
+var (
+	// hcChunk is the most positions one hcRunSSE41 call searches.
+	hcChunk = 1024
+	// refsChunk is the most references one call of rleSSE41, addRefsSSE41,
+	// addTileRefsSSE41 or writeImageDataSSE41 takes.
+	refsChunk = 4096
+	// cacheChunk is the most references one cacheCountsSSE41 call counts
+	// (a copy inserts up to 4096 pixels into every cache).
+	cacheChunk = 256
+	// pixChunk is the most pixels one subtractGreen kernel call transforms
+	// (a multiple of 8).
+	pixChunk = 1 << 16
+)
+
 // maxKernelLevel is the highest level with kernels of its own: the levels
 // above it run its kernels.
 const maxKernelLevel = cpuinfo.AVX2
+
+// hcRunChunk is hcRunSSE41 behind a preemption point (see hcChunk).
+//
+//go:noinline
+func hcRunChunk(s *hcSearcher, hi, lo, stop int, marks *uint64) (last, next int) {
+	return hcRunSSE41(s, hi, lo, stop, marks, hcPrefetch)
+}
+
+// cacheCountsChunk is cacheCountsSSE41 behind a preemption point (see
+// hcChunk).
+//
+//go:noinline
+func cacheCountsChunk(argb *uint32, npix int, refs *pixOrCopy, nrefs, maxBits int, h *cacheHistos) int {
+	return cacheCountsSSE41(argb, npix, refs, nrefs, maxBits, h)
+}
+
+// rleChunk is rleSSE41 behind a preemption point (see hcChunk).
+//
+//go:noinline
+func rleChunk(argb *uint32, n, xsize, i int, refs *pixOrCopy, room int) (count, next int) {
+	return rleSSE41(argb, n, xsize, i, refs, room)
+}
 
 //go:noescape
 func predictRowSSE41(mode int, cur, up, out *uint32, n int)
@@ -90,7 +139,13 @@ func (s *hcSearcher) run(hi, lo, stop int, marks []uint64) (last, next int) {
 			_ = marks[hi>>6]
 			m = &marks[0]
 		}
-		return hcRunSSE41(s, hi, lo, stop, m, hcPrefetch)
+		// The searches from hi down to stop, at most hcChunk per call (each
+		// call searches at least its first position).
+		next = hi
+		for next >= stop {
+			last, next = hcRunChunk(s, next, lo, max(stop, next-hcChunk+1), m)
+		}
+		return last, next
 	}
 	return s.runGo(hi, lo, stop, marks)
 }
@@ -141,8 +196,17 @@ func bestCacheBits(argb []uint32, quality int, refs []pixOrCopy, maxBits int, sc
 		off += 1 << uint(i)
 	}
 	_ = buf[off-1]
-	if cacheCountsSSE41(&argb[0], len(argb), &refs[0], len(refs), maxBits, &h) < 0 {
-		return bestCacheBitsGo(argb, quality, refs, maxBits, sc)
+	// The references, cacheChunk per call; each call starts at the pixel of
+	// its first reference (none left: that reference does not fit argb).
+	for k, pos := 0, 0; k < len(refs); k += cacheChunk {
+		c := -1
+		if pos < len(argb) {
+			c = cacheCountsChunk(&argb[pos], len(argb)-pos, &refs[k], min(len(refs)-k, cacheChunk), maxBits, &h)
+		}
+		if c < 0 {
+			return bestCacheBitsGo(argb, quality, refs, maxBits, sc)
+		}
+		pos += c
 	}
 	best := 0
 	bestCost := math.MaxFloat64
@@ -180,7 +244,7 @@ func backwardRefsRle(xsize, n int, argb []uint32, refs []pixOrCopy) []pixOrCopy 
 			refs = growRefs(refs, n)
 		}
 		room := refs[len(refs):cap(refs)]
-		k, next := rleSSE41(&argb[0], n, xsize, i, &room[0], len(room))
+		k, next := rleChunk(&argb[0], n, xsize, i, &room[0], min(len(room), refsChunk))
 		refs = refs[:len(refs)+k]
 		i = next
 	}

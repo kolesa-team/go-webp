@@ -591,9 +591,10 @@ wr_done:
 	RET
 
 // ---------------------------------------------------------------------------
-// func addTileRefsSSE41(data *uint32, stride, litLen int, refs *pixOrCopy, n, xsize, hb, hx, ntiles int) (done, x, y int)
+// func addTileRefsSSE41(data *uint32, stride, litLen int, refs *pixOrCopy, n, xsize, hb, hx, ntiles, x0, y0 int) (done, x, y int)
 //
-// The loop of addTileRefsGo over the n references: each one is added to
+// The loop of addTileRefsFrom over the n references, the first one at
+// (x0, y0) (0 <= x0 < xsize): each one is added to
 // the histogram of its tile (data + ix*stride, ix = (y>>hb)*hx + x>>hb),
 // as in addRefsSSE41, then (x, y) moves past it. The alpha increments of
 // consecutive literals usually hit the same bin (opaque images): they are
@@ -605,7 +606,7 @@ wr_done:
 // SI = reference, DI = data, R8 = tile histogram, BX = litLen, R9 = x,
 // R11 = y; locals: the end of refs, the pending count during a division,
 // xsize, the length of a copy, 4*stride.
-TEXT ·addTileRefsSSE41(SB), NOSPLIT, $40-96
+TEXT ·addTileRefsSSE41(SB), NOSPLIT, $40-112
 	MOVQ data+0(FP), DI
 	MOVQ stride+8(FP), AX
 	SHLQ $2, AX
@@ -617,8 +618,8 @@ TEXT ·addTileRefsSSE41(SB), NOSPLIT, $40-96
 	MOVQ AX, end-8(SP)
 	MOVQ xsize+40(FP), AX
 	MOVQ AX, xs-24(SP)
-	XORL R9, R9
-	XORL R11, R11
+	MOVQ x0+72(FP), R9
+	MOVQ y0+80(FP), R11
 	MOVQ DI, R10
 	XORL DX, DX
 
@@ -708,7 +709,7 @@ at_done:
 	ADDL DX, (R10)
 	SUBQ refs+24(FP), SI
 	SHRQ $3, SI
-	MOVQ SI, done+72(FP)
-	MOVQ R9, x+80(FP)
-	MOVQ R11, y+88(FP)
+	MOVQ SI, done+88(FP)
+	MOVQ R9, x+96(FP)
+	MOVQ R11, y+104(FP)
 	RET

@@ -257,3 +257,38 @@ func BenchmarkPredictRow(b *testing.B) {
 		}
 	}
 }
+
+// TestKernelChunks runs the differential tests of the kernels that walk a
+// whole image or parse in chunks (one assembly call per chunk, see hcChunk
+// in dsp_amd64.go) with chunks of 1 and 3, so that every call boundary
+// falls inside the data.
+func TestKernelChunks(t *testing.T) {
+	if len(kernelLevels()) == 1 {
+		t.Skip("no kernels on this machine")
+	}
+	tests := []struct {
+		name string
+		f    func(*testing.T)
+	}{
+		{"HashChainRunLevels", TestHashChainRunLevels},
+		{"HashChainRunStripes", TestHashChainRunStripes},
+		{"BackwardRefsRleLevels", TestBackwardRefsRleLevels},
+		{"BestCacheBitsLevels", TestBestCacheBitsLevels},
+		{"BestCacheBitsBadRefs", TestBestCacheBitsBadRefs},
+		{"SubtractGreenLevels", TestSubtractGreenLevels},
+		{"AddRefsLevels", TestAddRefsLevels},
+		{"AddRefsBadRefs", TestAddRefsBadRefs},
+		{"AddTileRefsLevels", TestAddTileRefsLevels},
+		{"AddTileRefsBadRefs", TestAddTileRefsBadRefs},
+		{"WriteImageDataLevels", TestWriteImageDataLevels},
+		{"WriteImageDataBadRefs", TestWriteImageDataBadRefs},
+	}
+	for _, c := range []int{1, 3} {
+		for _, tc := range tests {
+			t.Run(fmt.Sprintf("%s/chunk%d", tc.name, c), func(t *testing.T) {
+				defer setChunks(c)()
+				tc.f(t)
+			})
+		}
+	}
+}

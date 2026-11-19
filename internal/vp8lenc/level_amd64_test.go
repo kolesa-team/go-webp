@@ -43,6 +43,14 @@ func setAddRefsMin(n int) (restore func()) {
 	return func() { addRefsMin = old }
 }
 
+// setChunks sets the chunks of the whole-image kernels to n (pixChunk to n
+// rounded up to a multiple of 8).
+func setChunks(n int) (restore func()) {
+	h, r, c, p := hcChunk, refsChunk, cacheChunk, pixChunk
+	hcChunk, refsChunk, cacheChunk, pixChunk = n, n, n, (n+7)&^7
+	return func() { hcChunk, refsChunk, cacheChunk, pixChunk = h, r, c, p }
+}
+
 // setLz77ReachMin sets the smallest range of the lz77Reach kernel.
 func setLz77ReachMin(m int) (restore func()) {
 	old := lz77ReachMin

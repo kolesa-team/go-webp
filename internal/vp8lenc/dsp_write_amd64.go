@@ -48,21 +48,41 @@ func subtractGreenAVX2(p *uint32, n int)
 // block cannot overlap pixels already transformed.)
 func subtractGreen(p []uint32) {
 	n := len(p)
+	// (pixChunk pixels per call at most, see hcChunk.)
+	m, avx2 := 0, false
 	switch {
 	case x86Level >= cpuinfo.AVX2 && n >= 8:
-		m := n &^ 7
-		subtractGreenAVX2(&p[0], m)
-		p = p[m:]
+		m, avx2 = n&^7, true
 	case x86Level >= cpuinfo.SSE41 && n >= 4:
-		m := n &^ 3
-		subtractGreenSSE41(&p[0], m)
-		p = p[m:]
+		m = n &^ 3
 	}
-	subtractGreenGo(p)
+	for i := 0; i < m; i += pixChunk {
+		subtractGreenChunk(&p[i], min(m-i, pixChunk), avx2)
+	}
+	subtractGreenGo(p[m:])
+}
+
+// subtractGreenChunk is the AVX2 kernel (n a multiple of 8) or the SSE4.1
+// one (n a multiple of 4) behind a preemption point (see hcChunk).
+//
+//go:noinline
+func subtractGreenChunk(p *uint32, n int, avx2 bool) {
+	if avx2 {
+		subtractGreenAVX2(p, n)
+	} else {
+		subtractGreenSSE41(p, n)
+	}
 }
 
 //go:noescape
 func addRefsSSE41(q *uint32, stride, litLen int, refs *pixOrCopy, n, xsize int, raw bool) (done int)
+
+// addRefsChunk is addRefsSSE41 behind a preemption point (see hcChunk).
+//
+//go:noinline
+func addRefsChunk(q *uint32, stride, litLen int, refs *pixOrCopy, n, xsize int, raw bool) (done int) {
+	return addRefsSSE41(q, stride, litLen, refs, n, xsize, raw)
+}
 
 // addRefsMin is the smallest parse the addRefs kernel takes (below, clearing
 // and adding up its 4 partial histograms costs more than it saves; a
@@ -104,7 +124,16 @@ func (s *histoSet) addRefsAsm(h *histo, refs []pixOrCopy, xsize int, raw bool) b
 	}
 	q := s.quad[:4*n]
 	clear(q)
-	k := addRefsSSE41(&q[0], n, L, &refs[0], len(refs), xsize, raw)
+	// refsChunk references per call at most (see hcChunk).
+	k := 0
+	for k < len(refs) {
+		m := min(len(refs)-k, refsChunk)
+		d := addRefsChunk(&q[0], n, L, &refs[k], m, xsize, raw)
+		k += d
+		if d < m {
+			break
+		}
+	}
 	q0, q1, q2, q3 := q[:n], q[n:2*n], q[2*n:3*n], q[3*n:4*n]
 	for i := range d {
 		d[i] += q0[i] + q1[i] + q2[i] + q3[i]
@@ -121,7 +150,15 @@ func (s *histoSet) addRefsAsm(h *histo, refs []pixOrCopy, xsize int, raw bool) b
 }
 
 //go:noescape
-func addTileRefsSSE41(data *uint32, stride, litLen int, refs *pixOrCopy, n, xsize, hb, hx, ntiles int) (done, x, y int)
+func addTileRefsSSE41(data *uint32, stride, litLen int, refs *pixOrCopy, n, xsize, hb, hx, ntiles, x0, y0 int) (done, x, y int)
+
+// addTileRefsChunk is addTileRefsSSE41 behind a preemption point (see
+// hcChunk).
+//
+//go:noinline
+func addTileRefsChunk(data *uint32, stride, litLen int, refs *pixOrCopy, n, xsize, hb, hx, ntiles, x0, y0 int) (done, x, y int) {
+	return addTileRefsSSE41(data, stride, litLen, refs, n, xsize, hb, hx, ntiles, x0, y0)
+}
 
 // addTileRefs is addTileRefsGo: the kernel adds the references to the
 // histograms of their tiles as addRefsGo does, with the alpha increments
@@ -144,10 +181,18 @@ func (s *histoSet) addTileRefs(refs []pixOrCopy, xsize, histoBits, hx int) {
 			return
 		}
 	}
-	k, x, y := addTileRefsSSE41(&s.data[0], n, L, &refs[0], len(refs), xsize, histoBits, hx, nt)
-	if k < len(refs) {
-		// refs[k] is out of range: the Go code panics on it.
-		s.addTileRefsFrom(refs[k:], xsize, histoBits, hx, x, y)
+	// refsChunk references per call at most (see hcChunk), each call
+	// starting at the position (x, y) where the previous one ended.
+	x, y := 0, 0
+	for k := 0; k < len(refs); {
+		m := min(len(refs)-k, refsChunk)
+		d, nx, ny := addTileRefsChunk(&s.data[0], n, L, &refs[k], m, xsize, histoBits, hx, nt, x, y)
+		k, x, y = k+d, nx, ny
+		if d < m {
+			// refs[k] is out of range: the Go code panics on it.
+			s.addTileRefsFrom(refs[k:], xsize, histoBits, hx, x, y)
+			return
+		}
 	}
 }
 
@@ -174,6 +219,14 @@ type imgWriter struct {
 
 //go:noescape
 func writeImageDataSSE41(st *imgWriter, refs *pixOrCopy, n int) (done int)
+
+// writeImageDataChunk is writeImageDataSSE41 behind a preemption point
+// (see hcChunk).
+//
+//go:noinline
+func writeImageDataChunk(st *imgWriter, refs *pixOrCopy, n int) (done int) {
+	return writeImageDataSSE41(st, refs, n)
+}
 
 // writeImageData is writeImageDataGo: the kernel writes the bits of the
 // references with the same putBits sequence, but without bound checks and
@@ -227,7 +280,7 @@ func writeImageData(bw *bitWriter, w int, refs []pixOrCopy, histoBits int, symbo
 		}
 		b := bw.buf[:cap(bw.buf)]
 		st.buf, st.pos, st.limit = &b[0], len(bw.buf), len(b)-16
-		k := writeImageDataSSE41(&st, &refs[0], len(refs))
+		k := writeImageDataChunk(&st, &refs[0], min(len(refs), refsChunk))
 		bw.buf = bw.buf[:st.pos]
 		refs = refs[k:]
 		if st.err != 0 {
