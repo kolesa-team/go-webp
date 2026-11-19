@@ -349,6 +349,112 @@ func testUpsampleConvertExhaustive(t *testing.T) {
 	}
 }
 
+// deBruijnPairs returns a cyclic de Bruijn sequence B(256, 2): 65536 bytes
+// in which every byte pair (s[i], s[(i+1)&0xffff]) occurs exactly once.
+func deBruijnPairs() []byte {
+	s := make([]byte, 0, 1<<16)
+	var a [3]int
+	var db func(t, p int)
+	db = func(t, p int) {
+		if t > 2 {
+			if 2%p == 0 {
+				for j := 1; j <= p; j++ {
+					s = append(s, byte(a[j]))
+				}
+			}
+			return
+		}
+		a[t] = a[t-p]
+		db(t+1, p)
+		for j := a[t-p] + 1; j < 256; j++ {
+			a[t] = j
+			db(t+1, t)
+		}
+	}
+	db(1, 1)
+	return s
+}
+
+// TestUpsampleChromaQuads feeds the fancy upsampler chroma quadruples
+// (top[i], top[i+1], cur[i], cur[i+1]) systematically: the top U row is a
+// de Bruijn sequence holding every byte pair once and the current U row
+// the same sequence rotated by k, so that every top pair meets the pair k
+// positions further on; the 65536 rotations together hold all 2^32
+// quadruples (checkUpsampleQuads with every rotation is the exhaustive
+// check; the test takes a sample). V gets the reversed sequence with other
+// rotations. Each rotation is converted with constant luma rows 0, 128 and
+// 255: over the three of them RGB is injective in (u, v), so a wrong
+// upsampled sample always changes the output.
+func TestUpsampleChromaQuads(t *testing.T) {
+	r := rand.New(rand.NewPCG(41, 42))
+	shifts := []int{0, 1, 2, 255, 256, 257, 0x8000, 0xffff}
+	n := 40
+	if testing.Short() {
+		n = 4
+	}
+	for range n {
+		shifts = append(shifts, r.IntN(1<<16))
+	}
+	withLevels(t, &yuvLevel, func(t *testing.T) { checkUpsampleQuads(t, shifts) })
+}
+
+func checkUpsampleQuads(t testing.TB, shifts []int) {
+	t.Helper()
+	s := deBruijnPairs()
+	var seen [1 << 16]bool
+	for i := range s {
+		seen[int(s[i])<<8|int(s[(i+1)&0xffff])] = true
+	}
+	for p, ok := range seen {
+		if len(s) != 1<<16 || !ok {
+			t.Fatalf("deBruijnPairs: %d bytes, pair %04x missing", len(s), p)
+		}
+	}
+	rs := make([]byte, len(s))
+	for i := range s {
+		rs[i] = s[len(s)-1-i]
+	}
+	const uvW = 1<<16 + 1
+	const w = 2*uvW - 1 // odd: the kernels convert every pixel but the first
+	rot := func(dst, src []byte, k int) {
+		for i := range dst {
+			dst[i] = src[(i+k)&0xffff]
+		}
+	}
+	topU, topV, curU, curV := make([]byte, uvW), make([]byte, uvW), make([]byte, uvW), make([]byte, uvW)
+	rot(topU, s, 0)
+	rot(topV, rs, 0)
+	ys, botA := make([]byte, w), make([]byte, w)
+	for i := range botA {
+		botA[i] = byte(i * 13)
+	}
+	wantT, wantB, gotT, gotB := make([]byte, 4*w), make([]byte, 4*w), make([]byte, 4*w), make([]byte, 4*w)
+	uvT, uvB := make([]uint32, w), make([]uint32, w)
+	for _, k := range shifts {
+		rot(curU, s, k)
+		rot(curV, rs, 3*k+1)
+		for _, y := range []byte{0, 128, 255} {
+			for i := range ys {
+				ys[i] = y
+			}
+			upsamplePairGo(ys, ys, topU, topV, curU, curV, wantT, wantB, nil, botA, uvT, uvB, w)
+			upsamplePair(ys, ys, topU, topV, curU, curV, gotT, gotB, nil, botA, uvT, uvB, w)
+			for _, r := range []struct {
+				name      string
+				got, want []byte
+			}{{"top", gotT, wantT}, {"bottom", gotB, wantB}} {
+				if i := firstByteDiff(r.got, r.want); i >= 0 {
+					x := i / 4
+					j := max(x-1, 0) / 2
+					t.Fatalf("%v rotation %d luma %d: %s pixel %d = %x, want %x (U quad %d,%d,%d,%d, V quad %d,%d,%d,%d)",
+						yuvLevel, k, y, r.name, x, r.got[4*x:4*x+4], r.want[4*x:4*x+4],
+						topU[j], topU[j+1], curU[j], curU[j+1], topV[j], topV[j+1], curV[j], curV[j+1])
+				}
+			}
+		}
+	}
+}
+
 // TestYUVGuardPages runs the converters on rows that end right before (or
 // start right after) an inaccessible page: an out-of-bounds access faults.
 func TestYUVGuardPages(t *testing.T) {
