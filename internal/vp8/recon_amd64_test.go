@@ -95,6 +95,44 @@ func chromaKernelOK(coeffs *[384]int16, codes uint32) bool {
 		rowInRange(coeffs, []int{18, 19, 22, 23}, []uint32{cu, cu, cv, cv})
 }
 
+// TestReconKernelsRealStreams runs the kernels directly on every macroblock
+// of the lossy fixtures: encoder output stays within the bound of the 16-bit
+// transform, so the kernels must never decline it (a decline costs a second,
+// reference reconstruction of the macroblock) and must match the reference.
+func TestReconKernelsRealStreams(t *testing.T) {
+	sets := reconKernelSets()
+	if len(sets) == 0 {
+		t.Skip("no SIMD kernels on this machine")
+	}
+	names := []string{"m4_q75.webp", "webp-logo-lossy.webp", "100x150_lossy.webp",
+		"grad_250x199_o9.webp", "mix_250x199_o4.webp", "noise_129x65_o7.webp", "mix_64x48_p1.webp"}
+	for _, name := range names {
+		states := harvestRecon(t, name)
+		for _, s := range sets {
+			for i := range states {
+				st := &states[i]
+				blk := &st.blk
+				want := st.b
+				reconBlockRef(&want, st.mbX, st.mbY, blk)
+				got := st.b
+				var ok bool
+				if blk.isI4x4 {
+					ok = s.i4(&got, &blk.coeffs, blk.nonZeroY, &blk.imodes)
+				} else {
+					ok = s.i16(&got, &blk.coeffs, blk.nonZeroY, checkMode(st.mbX, st.mbY, blk.imodes[0]))
+				}
+				codes := uvPlaneCodes(blk.nonZeroUV) | uvPlaneCodes(blk.nonZeroUV>>8)<<8
+				if !ok || !s.uv(&got, &blk.coeffs, codes, checkMode(st.mbX, st.mbY, blk.uvmode)) {
+					t.Fatalf("%s %s: mb (%d,%d) declined", name, s.level, st.mbX, st.mbY)
+				}
+				if !diffBuffers(t, fmt.Sprintf("%s %s mb (%d,%d)", name, s.level, st.mbX, st.mbY), &got, &want) {
+					t.FailNow()
+				}
+			}
+		}
+	}
+}
+
 // boundCoeff returns a coefficient that is mostly within the 16-bit bound,
 // with the bound itself and values just past it now and then.
 func boundCoeff(r *rand.Rand) int16 {
