@@ -86,7 +86,8 @@ func idx8Streams(t *testing.T) map[string][]byte {
 
 // TestIdx8MatchesWide checks that decoding palette images as index bytes
 // gives the same output as the 32-bit path, with every kind of sink, with a
-// switch to 32 bits at various positions, and in a two-stage decode.
+// switch to 32 bits at various positions, and in a two-stage decode (with
+// -short, started after a probe only for one switch position).
 func TestIdx8MatchesWide(t *testing.T) {
 	checkNoLeak(t)
 	defer workers.SetLimitForTest(workers.SetLimitForTest(2))
@@ -102,6 +103,9 @@ func TestIdx8MatchesWide(t *testing.T) {
 			})
 			for _, at := range []int{0, 1, w - 1, 16*w + 3, w * h / 3, w*h - 1} {
 				for _, m := range threadModes {
+					if m.probe > 0 && testing.Short() && at != w*h/3 {
+						continue
+					}
 					withIdx8(true, at, func() {
 						withAsync(w*5+1, m.probe, func(*int) {
 							s, out := sc.make(w, h)
