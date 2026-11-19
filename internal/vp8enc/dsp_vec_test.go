@@ -1091,3 +1091,119 @@ func TestQuantizeBlocksLimits(t *testing.T) {
 		}
 	})
 }
+
+// randomPairTable returns a pair table of n pairs at random offsets inside
+// a 16-row buffer: any column, so rows start at every alignment.
+func randomPairTable(rng *rand.Rand, n int) pairTable {
+	offs := make([][2]uint16, n)
+	for k := range offs {
+		for i := range offs[k] {
+			offs[k][i] = uint16(rng.Intn(13)*bps + rng.Intn(25))
+		}
+	}
+	return newPairTable(offs...)
+}
+
+// TestPairKernelsAllCounts runs the pair kernels on tables of every pair
+// count (the AVX2 kernels take two pairs at a time and end an odd count
+// with one), at random offsets, and the inverse transform with every
+// subset of pairs holding a coefficient beyond its 16-bit path (|in| >
+// 2047), so that the kernels stop and resume at every position.
+func TestPairKernelsAllCounts(t *testing.T) {
+	forEachLevel(t, func(t *testing.T) {
+		rng := rand.New(rand.NewSource(23))
+		a := make([]byte, 16*bps)
+		b := make([]byte, 16*bps)
+		dst := make([]byte, 16*bps)
+		wdst := make([]byte, 16*bps)
+		var blocks, wblocks [16][16]int16
+		var res, wres [16]int32
+		for n := 1; n <= 8; n++ {
+			for iter := 0; iter < vecIters(t, 3000); iter++ {
+				tab := randomPairTable(rng, n)
+				fillPixels(rng, a)
+				fillPixels(rng, b)
+				fTransformPairs(a, b, &tab, blocks[:])
+				fTransformPairsRef(a, b, &tab, wblocks[:])
+				if blocks != wblocks {
+					t.Fatalf("fTransform n=%d %v: got %v, want %v", n, tab.off[:n], blocks[:2*n], wblocks[:2*n])
+				}
+				tTransformPairs(a, &tab, res[:])
+				tTransformPairsRef(a, &tab, wres[:])
+				if res != wres {
+					t.Fatalf("tTransform n=%d %v: got %v, want %v", n, tab.off[:n], res[:2*n], wres[:2*n])
+				}
+				sse4x4Pairs(a, b, &tab, res[:])
+				sse4x4PairsRef(a, b, &tab, wres[:])
+				if res != wres {
+					t.Fatalf("sse4x4 n=%d %v: got %v, want %v", n, tab.off[:n], res[:2*n], wres[:2*n])
+				}
+			}
+			reps := 4
+			if testing.Short() {
+				reps = 1
+			}
+			for mask := 0; mask < reps<<n; mask++ {
+				tab := randomPairTable(rng, n)
+				for k := 0; k < n; k++ {
+					for blk := 2 * k; blk < 2*k+2; blk++ {
+						for i := range blocks[blk] {
+							blocks[blk][i] = int16(rng.Intn(4095) - 2047)
+						}
+					}
+					if mask>>k&1 != 0 {
+						v := [5]int16{2048, -2048, 4000, -32768, 32767}[rng.Intn(5)]
+						blocks[2*k+rng.Intn(2)][rng.Intn(16)] = v
+					}
+				}
+				fillPixels(rng, a)
+				fillPixels(rng, dst)
+				copy(wdst, dst)
+				wblocks = blocks
+				iTransformPairs(a, blocks[:], dst, &tab)
+				iTransformPairsRef(a, wblocks[:], wdst, &tab)
+				if string(dst) != string(wdst) {
+					t.Fatalf("iTransform n=%d large pairs %#x %v: results differ", n, mask&(1<<n-1), tab.off[:n])
+				}
+			}
+		}
+	})
+}
+
+// TestResidualCostShapes runs residualCost on every (first, last, ctx0)
+// and coefficient type, with levels at the edges of the cost tables (67
+// and 68: the clamp of the variable part; 2047 and 2048: the wrap of
+// levelFixedCosts; 32768: |-32768|) and, now and then, non-zero levels
+// after last (ignored by the cost).
+func TestResidualCostShapes(t *testing.T) {
+	forEachLevel(t, func(t *testing.T) {
+		rng := rand.New(rand.NewSource(24))
+		mags := []int{1, 2, 3, 66, 67, 68, 2047, 2048, 2049, 4095, 32767, 32768}
+		var c [16]int16
+		for round := 0; round < vecIters(t, 300); round++ {
+			_, p := randomResiduals(rng, 1, mags)
+			for first := 0; first <= 1; first++ {
+				for last := -1; last <= 15; last++ {
+					for i := range c {
+						c[i] = 0
+						if i == last || (i < last || rng.Intn(8) == 0) && rng.Intn(2) == 0 {
+							v := mags[rng.Intn(len(mags))]
+							if rng.Intn(2) == 0 {
+								v = -v
+							}
+							c[i] = int16(v)
+						}
+					}
+					for ctype := 0; ctype < numTypes; ctype++ {
+						res := residual{first: first, last: last, ctype: ctype, coeffs: &c}
+						for ctx := 0; ctx < numCtx; ctx++ {
+							if got, want := p.residualCost(ctx, &res), p.residualCostRef(ctx, &res); got != want {
+								t.Fatalf("first %d last %d type %d ctx %d %v: cost %d, want %d", first, last, ctype, ctx, c, got, want)
+							}
+						}
+					}
+				}
+			}
+		}
+	})
+}
