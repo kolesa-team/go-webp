@@ -1093,6 +1093,94 @@ func TestQuantizeBlocksLimits(t *testing.T) {
 	})
 }
 
+// TestQuantizeBlocksAllValues quantizes every int16 value in every
+// coefficient position with every matrix the encoder can build (each
+// quality index of the three coefficient types, as setupMatrices does; the
+// DC and AC entries are taken from the same index here, but each lane only
+// sees its own entry), 32 blocks per call so that the non-zero mask uses
+// all its bits. The reference runs once per batch, the kernels at every
+// level.
+func TestQuantizeBlocksAllValues(t *testing.T) {
+	ms := testMatrices(rand.New(rand.NewSource(25)))[:128*3]
+	step := 1
+	if testing.Short() {
+		step = 61
+	}
+	var src, in, inRef, out, outRef [32][16]int16
+	var info, infoRef [32]uint16
+	for mi := range ms {
+		m := &ms[mi]
+		for v := 0; v < 1<<16; v += 32 * step {
+			for b := range src {
+				for j := range src[b] {
+					src[b][j] = int16(v + b*step + j*4099)
+				}
+			}
+			inRef = src
+			nzRef := quantizeBlocksRef(inRef[:], outRef[:], m, infoRef[:])
+			eachLevel(func(level string) {
+				in = src
+				nz := quantizeBlocks(in[:], out[:], m, info[:])
+				if nz != nzRef || in != inRef || out != outRef || info != infoRef {
+					t.Fatalf("%s: quality index %d type %d, v %d: results differ", level, mi/3, mi%3, v)
+				}
+			})
+		}
+	}
+}
+
+// TestTransformBasisSweep runs the inverse transform on every single
+// non-zero coefficient (each position, every value of the 16-bit path of
+// the kernels and some past its bound; position 0 is the DC-only shortcut
+// of the Go code, which the kernels compute with the full transform) and
+// the forward transform on every single non-zero difference, over random
+// and extreme reference pixels.
+func TestTransformBasisSweep(t *testing.T) {
+	forEachLevel(t, func(t *testing.T) {
+		rng := rand.New(rand.NewSource(26))
+		ref := make([]byte, 4*bps)
+		got := make([]byte, 4*bps)
+		want := make([]byte, 4*bps)
+		tab := newPairTable([2]uint16{0, 0})
+		step := 1
+		if testing.Short() {
+			step = 7
+		}
+		for pos := 0; pos < 16; pos++ {
+			for v := -2100; v <= 2100; v += step {
+				var in [2][16]int16
+				in[0][pos] = int16(v)
+				in[1][15-pos] = int16(-v)
+				win := in
+				fillPixels(rng, ref)
+				fillPixels(rng, got)
+				copy(want, got)
+				iTransformPairs(ref, in[:], got, &tab)
+				iTransformPairsRef(ref, win[:], want, &tab)
+				if string(got) != string(want) {
+					t.Fatalf("iTransform coefficient %d = %d: got %v, want %v", pos, v, got, want)
+				}
+			}
+		}
+		src := make([]byte, 4*bps)
+		var out, wout [2][16]int16
+		for pos := 0; pos < 32; pos++ {
+			p := pos>>3*bps + pos&7
+			for d := -255; d <= 255; d++ {
+				fillPixels(rng, ref)
+				copy(src, ref)
+				ref[p] = byte(max(-d, 0))
+				src[p] = byte(max(-d, 0) + d)
+				fTransformPairs(src, ref, &tab, out[:])
+				fTransformPairsRef(src, ref, &tab, wout[:])
+				if out != wout {
+					t.Fatalf("fTransform difference %d at pixel %d: got %v, want %v", d, p, out, wout)
+				}
+			}
+		}
+	})
+}
+
 // randomPairTable returns a pair table of n pairs at random offsets inside
 // a 16-row buffer: any column, so rows start at every alignment.
 func randomPairTable(rng *rand.Rand, n int) pairTable {
