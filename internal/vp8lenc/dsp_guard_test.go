@@ -4,6 +4,7 @@ package vp8lenc
 
 import (
 	"bytes"
+	"math"
 	"math/rand"
 	"os"
 	"slices"
@@ -309,6 +310,147 @@ func TestLz77ReachGuard(t *testing.T) {
 				if got := lz77Reach(ol, 0, n-1, n, 3); got != want {
 					t.Fatalf("n %d atEnd %v: got %d, want %d", n, atEnd, got, want)
 				}
+			}
+		}
+	})
+}
+
+// guardedU64 returns n uint64 of guarded memory (see guardedU32).
+func guardedU64(tb testing.TB, n int, atEnd bool) []uint64 {
+	u := guardedU32(tb, 2*n, atEnd)
+	return unsafe.Slice((*uint64)(unsafe.Pointer(&u[0])), n)
+}
+
+// guardedPixels returns a guarded copy of p, with runs, repeated rows and
+// matches reaching the last pixel (the match length loads stop at size-1).
+func guardedPixels(tb testing.TB, rng *rand.Rand, n, xsize int, atEnd bool) []uint32 {
+	p := guardedU32(tb, n, atEnd)
+	copy(p, randHashImage(rng, n, xsize))
+	if rng.Intn(2) == 0 {
+		// A run up to the end: maximal matches at distances 1 and xsize.
+		c := p[n-1]
+		for i := n - 1 - rng.Intn(n); i < n; i++ {
+			p[i] = c
+		}
+	}
+	return p
+}
+
+// TestHashChainRunGuard runs the search on guarded pixels, chain and ol
+// (and marks, as fillStripes passes them).
+func TestHashChainRunGuard(t *testing.T) {
+	rng := rand.New(rand.NewSource(14))
+	forEachLevel(t, func(t *testing.T) {
+		for _, n := range []int{3, 4, 5, 6, 7, 8, 9, 13, 17, 64, 65, 100, 1000, 5000} {
+			for _, atEnd := range []bool{false, true} {
+				for _, q := range []int{0, 50, 100} {
+					low := rng.Intn(3) == 0
+					xsize := 1 + rng.Intn(min(n, 40))
+					argb := guardedPixels(t, rng, n, xsize, atEnd)
+					window := windowSizeForHashChain(q, xsize)
+					search := func(argb []uint32, ol []uint32, marks []uint64, useGo bool) (int, int) {
+						s := hcSearcher{argb: argb, ol: ol, chain: ol, xsize: xsize, size: n,
+							iterMax: maxItersForQuality(q), window: window, lowEffort: low}
+						buildChain(argb, ol)
+						ol[0], ol[n-1] = 0, 0
+						if useGo {
+							return s.runGo(n-2, 0, 1, marks)
+						}
+						return s.run(n-2, 0, 1, marks)
+					}
+					want := make([]uint32, n)
+					wmarks := make([]uint64, (n+63)/64)
+					wl, wn := search(slices.Clone(argb), want, wmarks, true)
+					ol := guardedU32(t, n, atEnd)
+					marks := guardedU64(t, (n+63)/64, atEnd)
+					clear(marks)
+					gl, gn := search(argb, ol, marks, false)
+					if gl != wl || gn != wn || !slices.Equal(ol, want) || !slices.Equal(marks, wmarks) {
+						t.Fatalf("n %d atEnd %v q %d low %v xsize %d: searches differ", n, atEnd, q, low, xsize)
+					}
+				}
+			}
+		}
+	})
+}
+
+// TestBackwardRefsRleGuard parses guarded pixels into a guarded reference
+// buffer (which fills up, so the parse also continues in a grown one).
+func TestBackwardRefsRleGuard(t *testing.T) {
+	rng := rand.New(rand.NewSource(15))
+	forEachLevel(t, func(t *testing.T) {
+		for _, n := range []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 17, 100, 1000, 5000} {
+			for _, atEnd := range []bool{false, true} {
+				xsize := 1 + rng.Intn(min(n, 40))
+				argb := guardedPixels(t, rng, n, xsize, atEnd)
+				for _, c := range []int{1, 7, n} {
+					want := backwardRefsRleGo(xsize, n, slices.Clone(argb), make([]pixOrCopy, 0, c))
+					refs := guardedRefs(t, make([]pixOrCopy, c), atEnd)[:0]
+					got := backwardRefsRle(xsize, n, argb, refs)
+					if !slices.Equal(got, want) {
+						t.Fatalf("n %d atEnd %v xsize %d cap %d: parses differ", n, atEnd, xsize, c)
+					}
+				}
+			}
+		}
+	})
+}
+
+// TestBestCacheBitsGuard counts guarded references of guarded pixels, the
+// last reference ending at the last pixel.
+func TestBestCacheBitsGuard(t *testing.T) {
+	rng := rand.New(rand.NewSource(16))
+	sc := getScratch(0)
+	defer putScratch(sc)
+	forEachLevel(t, func(t *testing.T) {
+		for _, n := range []int{1, 2, 5, 17, 100, 1000, 5000} {
+			for _, atEnd := range []bool{false, true} {
+				argb := guardedPixels(t, rng, n, 1+rng.Intn(min(n, 40)), atEnd)
+				if rng.Intn(2) == 0 {
+					for k := range argb {
+						argb[k] &= 0x01030507
+					}
+				}
+				refs := guardedRefs(t, randRefs(rng, n, rng.Intn(2) == 0), atEnd)
+				for _, maxBits := range []int{1, 4, maxColorCacheBits} {
+					want := bestCacheBitsGo(slices.Clone(argb), 75, slices.Clone(refs), maxBits, sc)
+					if got := bestCacheBits(argb, 75, refs, maxBits, sc); got != want {
+						t.Fatalf("n %d atEnd %v maxBits %d: got %d, want %d", n, atEnd, maxBits, got, want)
+					}
+				}
+			}
+		}
+	})
+}
+
+// TestCombinedEntropyGuard runs combinedPopulationCost on two guarded
+// operands and combinedShannonEntropy on guarded histograms.
+func TestCombinedEntropyGuard(t *testing.T) {
+	rng := rand.New(rand.NewSource(17))
+	words := int(unsafe.Sizeof(accEntropy{}) / 4)
+	forEachLevel(t, func(t *testing.T) {
+		for _, n := range []int{17, 18, 31, 32, 33, 40, 256, 280, 281, 1304, 4000} {
+			for _, atEnd := range []bool{false, true} {
+				a, b := guardedU32(t, n, atEnd), guardedU32(t, n, atEnd)
+				copy(a, randStreaky(rng, n))
+				copy(b, randStreaky(rng, n))
+				want := combinedPopulationCostGo(slices.Clone(a), slices.Clone(b))
+				if got := combinedPopulationCost(a, b); math.Float64bits(got) != math.Float64bits(want) {
+					t.Fatalf("n %d atEnd %v: got %v, want %v", n, atEnd, got, want)
+				}
+			}
+		}
+		for _, atEnd := range []bool{false, true} {
+			xu, yu := guardedU32(t, 256, atEnd), guardedU32(t, 256, atEnd)
+			x, y := (*[256]int32)(unsafe.Pointer(&xu[0])), (*[256]int32)(unsafe.Pointer(&yu[0]))
+			randHisto(rng, x[:])
+			randHisto(rng, y[:])
+			acc := (*accEntropy)(unsafe.Pointer(&guardedU32(t, words, atEnd)[0]))
+			acc.initGo(y)
+			xc, yc, ac := *x, *y, *acc
+			want := combinedShannonEntropyGo(&xc, &yc, &ac)
+			if got := combinedShannonEntropy(x, y, acc); math.Float64bits(got) != math.Float64bits(want) {
+				t.Fatalf("atEnd %v: got %v, want %v", atEnd, got, want)
 			}
 		}
 	})
