@@ -122,6 +122,16 @@ func subPixels(a, b uint32) uint32 {
 	return (ag & 0xff00ff00) | (rb & 0x00ff00ff)
 }
 
+// subtractGreenGo applies the subtract-green transform to p in place: green
+// is subtracted (mod 256) from red and blue. It is the Go reference of
+// subtractGreen (dsp_amd64.go, dsp_generic.go).
+func subtractGreenGo(p []uint32) {
+	for i, px := range p {
+		g := (px >> 8) & 0xff
+		p[i] = px&0xff00ff00 | (((px >> 16) - g) & 0xff << 16) | ((px - g) & 0xff)
+	}
+}
+
 // colorCacheHash returns the color cache key of argb for the given bits.
 func colorCacheHash(argb uint32, shift uint) uint32 {
 	return (argb * 0x1e35a7bd) >> shift

@@ -133,3 +133,71 @@ func BenchmarkHashChainStripes(b *testing.B) {
 		})
 	}
 }
+
+// buildChainRef is buildChain with a table of -1 for no position (as
+// libwebp), allocated per call.
+func buildChainRef(argb []uint32, chain []uint32) {
+	size := len(argb)
+	first := make([]int32, hashSize)
+	for i := range first {
+		first[i] = -1
+	}
+	argbComp := argb[0] == argb[1]
+	pos := 0
+	for pos < size-2 {
+		argbCompNext := argb[pos+1] == argb[pos+2]
+		if argbComp && argbCompNext {
+			length := 1
+			c := argb[pos]
+			for pos+length+2 < size && argb[pos+length+2] == c {
+				length++
+			}
+			if length > maxLength {
+				for k := 0; k < length-maxLength; k++ {
+					chain[pos+k] = 0xffffffff
+				}
+				pos += length - maxLength
+				length = maxLength
+			}
+			for length > 0 {
+				h := pixPairHash(c, uint32(length))
+				length--
+				chain[pos] = uint32(first[h])
+				first[h] = int32(pos)
+				pos++
+			}
+			argbComp = false
+		} else {
+			h := pixPairHash(argb[pos], argb[pos+1])
+			chain[pos] = uint32(first[h])
+			first[h] = int32(pos)
+			pos++
+			argbComp = argbCompNext
+		}
+	}
+	chain[pos] = uint32(first[pixPairHash(argb[pos], argb[pos+1])])
+}
+
+// TestBuildChain compares buildChain (whose pooled table is reused from
+// call to call) with buildChainRef.
+func TestBuildChain(t *testing.T) {
+	rng := rand.New(rand.NewSource(12))
+	iters := 300
+	if testing.Short() {
+		iters = 60
+	}
+	for i := 0; i < iters; i++ {
+		n := 2 + rng.Intn(3000)
+		if i%10 == 0 {
+			n = 2 + rng.Intn(100000)
+		}
+		xsize := 1 + rng.Intn(min(n, 512))
+		argb := randHashImage(rng, n, xsize)
+		got, want := make([]uint32, n), make([]uint32, n)
+		buildChain(argb, got)
+		buildChainRef(argb, want)
+		if !slices.Equal(got, want) {
+			t.Fatalf("n %d xsize %d: chains differ", n, xsize)
+		}
+	}
+}

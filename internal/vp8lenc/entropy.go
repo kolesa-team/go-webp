@@ -110,9 +110,11 @@ func bitsEntropy(pop []uint32) float64 {
 	return e.refine()
 }
 
-// populationCost estimates the number of bits to code pop with a Huffman
-// code, including the cost of storing the code itself.
-func populationCost(pop []uint32) float64 {
+// populationCostGo estimates the number of bits to code pop with a Huffman
+// code, including the cost of storing the code itself. It is the Go
+// reference of populationCost (dsp_amd64.go, dsp_generic.go), and
+// combinedPopulationCostGo with a zero second operand.
+func populationCostGo(pop []uint32) float64 {
 	var e bitEntropy
 	var s streaks
 	n := len(pop)
@@ -153,8 +155,10 @@ func populationCost(pop []uint32) float64 {
 	return e.refine() + s.finalHuffmanCost()
 }
 
-// combinedPopulationCost is populationCost(a+b) without materializing a+b.
-func combinedPopulationCost(a, b []uint32) float64 {
+// combinedPopulationCostGo is populationCost(a+b) without materializing
+// a+b. It is the Go reference of combinedPopulationCost (dsp_amd64.go,
+// dsp_generic.go).
+func combinedPopulationCostGo(a, b []uint32) float64 {
 	var e bitEntropy
 	var s streaks
 	n := len(a)
@@ -215,7 +219,9 @@ type accEntropy struct {
 	sum   uint32
 }
 
-func (a *accEntropy) init(h *[256]int32) {
+// initGo sets a to the entropy terms of h. It is the Go reference of init
+// (dsp_amd64.go, dsp_generic.go).
+func (a *accEntropy) initGo(h *[256]int32) {
 	a.total = 0
 	a.sum = 0
 	for i, v := range h {
@@ -226,9 +232,11 @@ func (a *accEntropy) init(h *[256]int32) {
 	}
 }
 
-// combinedShannonEntropy returns the entropy of X plus the entropy of X+Y
-// (libwebp VP8LCombinedShannonEntropy), where Y is described by acc.
-func combinedShannonEntropy(x, y *[256]int32, acc *accEntropy) float64 {
+// combinedShannonEntropyGo returns the entropy of X plus the entropy of X+Y
+// (libwebp VP8LCombinedShannonEntropy), where Y is described by acc. It is
+// the Go reference of combinedShannonEntropy (dsp_amd64.go,
+// dsp_generic.go).
+func combinedShannonEntropyGo(x, y *[256]int32, acc *accEntropy) float64 {
 	r := -acc.total
 	var sumX uint32
 	for i := 0; i < 256; i++ {

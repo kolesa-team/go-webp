@@ -69,10 +69,11 @@ func clampedAddSubtractHalf(c0, c1, c2 uint32) uint32 {
 	return a<<24 | r<<16 | g<<8 | b
 }
 
-// predictRow writes residuals for x in [x0,x1) of a row with y >= 1 and
+// predictRowGo writes residuals for x in [x0,x1) of a row with y >= 1 and
 // x0 >= 1. cur is the current row, up the row above extended by one pixel
-// (up[width] is the first pixel of cur).
-func predictRow(mode int, cur, up []uint32, x0, x1 int, out []uint32) {
+// (up[width] is the first pixel of cur). out must not overlap cur or up.
+// It is the Go reference of predictRow (dsp_amd64.go, dsp_generic.go).
+func predictRowGo(mode int, cur, up []uint32, x0, x1 int, out []uint32) {
 	_ = up[x1]
 	_ = cur[x1-1]
 	out = out[:x1-x0]

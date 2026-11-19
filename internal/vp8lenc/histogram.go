@@ -36,6 +36,9 @@ type histoSet struct {
 	stride int
 	data   []uint32
 	h      []histo
+	// quad holds the 4 partial histograms of the addRefs kernel
+	// (dsp_write_amd64.go; unused elsewhere).
+	quad []uint32
 }
 
 func literalLen(cacheBits int) int {
@@ -92,11 +95,12 @@ func (s *histoSet) addRef(d []uint32, r pixOrCopy, xsize int) {
 	}
 }
 
-// addRefsRawDist is addRefs with the distances coded as linear distances
-// instead of plane codes. libwebp compares candidate parses with such
-// histograms (VP8LHistogramCreate in GetBackwardReferences, before
-// BackwardReferences2DLocality), which favours short linear distances.
-func (s *histoSet) addRefsRawDist(h *histo, refs []pixOrCopy) {
+// addRefsRawDistGo is addRefsGo with the distances coded as linear
+// distances instead of plane codes. libwebp compares candidate parses with
+// such histograms (VP8LHistogramCreate in GetBackwardReferences, before
+// BackwardReferences2DLocality), which favours short linear distances. It
+// is the Go reference of addRefsRawDist (dsp_amd64.go, dsp_generic.go).
+func (s *histoSet) addRefsRawDistGo(h *histo, refs []pixOrCopy) {
 	d := h.d
 	L := s.litLen
 	for _, r := range refs {
@@ -109,10 +113,33 @@ func (s *histoSet) addRefsRawDist(h *histo, refs []pixOrCopy) {
 	}
 }
 
-func (s *histoSet) addRefs(h *histo, refs []pixOrCopy, xsize int) {
+// addRefsGo adds the references refs of an image xsize pixels wide to h.
+// It is the Go reference of addRefs (dsp_amd64.go, dsp_generic.go).
+func (s *histoSet) addRefsGo(h *histo, refs []pixOrCopy, xsize int) {
 	d := h.d
 	for _, r := range refs {
 		s.addRef(d, r, xsize)
+	}
+}
+
+// addTileRefsGo adds each reference of refs, a parse of an image xsize
+// pixels wide, to the histogram of its tile (tiles of 1<<histoBits pixels
+// squared, hx per row; histogram i of s is tile i). It is the Go reference
+// of addTileRefs (dsp_write_amd64.go, dsp_generic.go).
+func (s *histoSet) addTileRefsGo(refs []pixOrCopy, xsize, histoBits, hx int) {
+	s.addTileRefsFrom(refs, xsize, histoBits, hx, 0, 0)
+}
+
+// addTileRefsFrom is addTileRefsGo for references starting at (x, y).
+func (s *histoSet) addTileRefsFrom(refs []pixOrCopy, xsize, histoBits, hx, x, y int) {
+	for _, r := range refs {
+		ix := (y>>uint(histoBits))*hx + (x >> uint(histoBits))
+		s.addRef(s.h[ix].d, r, xsize)
+		x += r.length()
+		for x >= xsize {
+			x -= xsize
+			y++
+		}
 	}
 }
 
@@ -423,16 +450,7 @@ func (c *clusterer) buildHistoImage(xsize, ysize int, refs []pixOrCopy, quality 
 	c.cacheBits = cacheBits
 	c.orig.init(nt, cacheBits)
 	// Build per-tile histograms.
-	x, y := 0, 0
-	for _, r := range refs {
-		ix := (y>>uint(histoBits))*hx + (x >> uint(histoBits))
-		c.orig.addRef(c.orig.h[ix].d, r, xsize)
-		x += r.length()
-		for x >= xsize {
-			x -= xsize
-			y++
-		}
-	}
+	c.orig.addTileRefs(refs, xsize, histoBits, hx)
 	if cap(c.symbols) < nt {
 		c.symbols = make([]uint16, nt)
 	}

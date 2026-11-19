@@ -125,10 +125,11 @@ func (hc *hashChain) fillPar(argb []uint32, xsize, ysize, quality int, lowEffort
 func buildChain(argb []uint32, chain []uint32) {
 	size := len(argb)
 	tp := hashTablePool.Get().(*[]int32)
+	// first[h] is 1 + the last position with hash h (0: none), so that the
+	// table is reset by clear, a memclr (a -1 fill loop took 9% of a level
+	// 0 encode of a 875x348 graphic).
 	first := *tp
-	for i := range first {
-		first[i] = -1
-	}
+	clear(first)
 	argbComp := argb[0] == argb[1]
 	pos := 0
 	for pos < size-2 {
@@ -150,20 +151,20 @@ func buildChain(argb []uint32, chain []uint32) {
 			for length > 0 {
 				h := pixPairHash(c, uint32(length))
 				length--
-				chain[pos] = uint32(first[h])
-				first[h] = int32(pos)
+				chain[pos] = uint32(first[h] - 1)
+				first[h] = int32(pos + 1)
 				pos++
 			}
 			argbComp = false
 		} else {
 			h := pixPairHash(argb[pos], argb[pos+1])
-			chain[pos] = uint32(first[h])
-			first[h] = int32(pos)
+			chain[pos] = uint32(first[h] - 1)
+			first[h] = int32(pos + 1)
 			pos++
 			argbComp = argbCompNext
 		}
 	}
-	chain[pos] = uint32(first[pixPairHash(argb[pos], argb[pos+1])])
+	chain[pos] = uint32(first[pixPairHash(argb[pos], argb[pos+1])] - 1)
 	hashTablePool.Put(tp)
 }
 
@@ -188,7 +189,10 @@ type hcSearcher struct {
 // so the searches form a chain from size-2 down to 0 (see fillStripes).
 // (One loop for all uses: a call per search costs the sequential path
 // 7-19%.)
-func (s *hcSearcher) run(hi, lo, stop int, marks []uint64) (last, next int) {
+//
+// runGo is the Go reference of run (dsp_amd64.go, dsp_generic.go). It needs
+// 1 <= stop and hi <= size-2.
+func (s *hcSearcher) runGo(hi, lo, stop int, marks []uint64) (last, next int) {
 	argb, chain, ol := s.argb, s.chain, s.ol
 	xsize, size, window, iterMax, lowEffort := s.xsize, s.size, s.window, s.iterMax, s.lowEffort
 	base := hi

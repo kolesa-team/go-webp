@@ -191,6 +191,20 @@ func TestEncodeIdentity(t *testing.T) {
 	}
 	checkIdentity(t, "sequential", got)
 
+	// Every kernel level (dsp_amd64.go) gives the same bytes. (The last
+	// level of kernelLevels runs the kernels of the default level, checked
+	// above.)
+	kl := kernelLevels()
+	for _, l := range kl[:len(kl)-1] {
+		restore := setLevel(l)
+		got := map[string]string{}
+		for _, c := range cases {
+			got[c.name] = shortHash(encodeIdentityCase(t, c, imgs))
+		}
+		restore()
+		checkIdentity(t, "sequential at level "+l.String(), got)
+	}
+
 	defer forceParallel()()
 	for _, b := range []struct {
 		limit int

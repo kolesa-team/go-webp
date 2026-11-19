@@ -155,16 +155,35 @@ func predictionCostCrossColor(acc, counts *[256]int32, ae *accEntropy) float64 {
 	return combinedShannonEntropy(counts, acc, ae) + predictionCostSpatial(counts, 3, 2.4)
 }
 
-func (t *tilePixels) costRed(g2r int, prevX, prevY multipliers, acc *[256]int32, ae *accEntropy, histo *[256]int32) float64 {
-	*histo = [256]int32{}
-	m := int8(g2r)
-	r := t.pr
-	g := t.pg[:len(r)]
-	c := t.pc[:len(r)]
+// ccHistoRedGo adds to histo the counts c of the red values r transformed
+// with the green-to-red multiplier m (g holds their greens). It is the Go
+// reference of ccHistoRed (dsp_amd64.go, dsp_generic.go).
+func ccHistoRedGo(histo *[256]int32, r, g []int8, c []int32, m int8) {
+	g = g[:len(r)]
+	c = c[:len(r)]
 	for i, rv := range r {
 		nr := int32(rv) - colorTransformDelta(m, g[i])
 		histo[uint8(nr)] += c[i]
 	}
+}
+
+// ccHistoBlueGo adds to histo the counts c of the blue values b transformed
+// with the green-to-blue and red-to-blue multipliers mg and mr (g and r
+// hold their greens and reds). It is the Go reference of ccHistoBlue
+// (dsp_amd64.go, dsp_generic.go).
+func ccHistoBlueGo(histo *[256]int32, b, g, r []int8, c []int32, mg, mr int8) {
+	g = g[:len(b)]
+	r = r[:len(b)]
+	c = c[:len(b)]
+	for i, bv := range b {
+		nb := int32(bv) - colorTransformDelta(mg, g[i]) - colorTransformDelta(mr, r[i])
+		histo[uint8(nb)] += c[i]
+	}
+}
+
+func (t *tilePixels) costRed(g2r int, prevX, prevY multipliers, acc *[256]int32, ae *accEntropy, histo *[256]int32) float64 {
+	*histo = [256]int32{}
+	ccHistoRed(histo, t.pr, t.pg, t.pc, int8(g2r))
 	d := predictionCostCrossColor(acc, histo, ae)
 	if uint8(g2r) == prevX.greenToRed {
 		d -= 3
@@ -180,16 +199,7 @@ func (t *tilePixels) costRed(g2r int, prevX, prevY multipliers, acc *[256]int32,
 
 func (t *tilePixels) costBlue(g2b, r2b int, prevX, prevY multipliers, acc *[256]int32, ae *accEntropy, histo *[256]int32) float64 {
 	*histo = [256]int32{}
-	mg := int8(g2b)
-	mr := int8(r2b)
-	b := t.tb
-	g := t.tg[:len(b)]
-	r := t.tr[:len(b)]
-	c := t.tc[:len(b)]
-	for i, bv := range b {
-		nb := int32(bv) - colorTransformDelta(mg, g[i]) - colorTransformDelta(mr, r[i])
-		histo[uint8(nb)] += c[i]
-	}
+	ccHistoBlue(histo, t.tb, t.tg, t.tr, t.tc, int8(g2b), int8(r2b))
 	d := predictionCostCrossColor(acc, histo, ae)
 	if uint8(g2b) == prevX.greenToBlue {
 		d -= 3

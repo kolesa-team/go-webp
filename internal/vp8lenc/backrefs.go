@@ -100,6 +100,31 @@ func growRefs(refs []pixOrCopy, limit int) []pixOrCopy {
 	return r
 }
 
+// lz77ReachGo returns the length of the copy at i of backwardRefsLz77,
+// for a match of length l at i reaching at least jMax (jMax < n): libwebp
+// keeps the part of the match up to the position j in (i, jMax] from
+// which the longest match (or a literal) reaches farthest, the first such
+// j, and stops at the first j reaching n (l is kept when jMax <= i). It
+// is the Go reference of lz77Reach (dsp_amd64.go, dsp_generic.go).
+func lz77ReachGo(ol []uint32, i, jMax, n, l int) int {
+	maxReach := 0
+	for j := i + 1; j <= jMax; j++ {
+		lj := int(ol[j] & (1<<maxLengthBits - 1))
+		reach := j + 1
+		if lj >= minLength {
+			reach = j + lj
+		}
+		if reach > maxReach {
+			l = j - i
+			maxReach = reach
+			if maxReach >= n {
+				break
+			}
+		}
+	}
+	return l
+}
+
 // backwardRefsLz77 computes greedy LZ77 references with one-step lookahead.
 func backwardRefsLz77(n int, argb []uint32, hc *hashChain, refs []pixOrCopy) []pixOrCopy {
 	refs = refs[:0]
@@ -109,25 +134,7 @@ func backwardRefsLz77(n int, argb []uint32, hc *hashChain, refs []pixOrCopy) []p
 		l := int(v & (1<<maxLengthBits - 1))
 		off := v >> maxLengthBits
 		if l >= minLength {
-			jMax := i + l
-			if jMax >= n {
-				jMax = n - 1
-			}
-			maxReach := 0
-			for j := i + 1; j <= jMax; j++ {
-				lj := int(ol[j] & (1<<maxLengthBits - 1))
-				reach := j + 1
-				if lj >= minLength {
-					reach = j + lj
-				}
-				if reach > maxReach {
-					l = j - i
-					maxReach = reach
-					if maxReach >= n {
-						break
-					}
-				}
-			}
+			l = lz77Reach(ol, i, min(i+l, n-1), n, l)
 		} else {
 			l = 1
 		}
@@ -202,8 +209,9 @@ func rleEntries(argb []uint32, w, lo, hi int) int {
 	return k
 }
 
-// backwardRefsRle computes references using only distance 1 and xsize.
-func backwardRefsRle(xsize, n int, argb []uint32, refs []pixOrCopy) []pixOrCopy {
+// backwardRefsRleGo computes references using only distance 1 and xsize.
+// It is the Go reference of backwardRefsRle (dsp_amd64.go, dsp_generic.go).
+func backwardRefsRleGo(xsize, n int, argb []uint32, refs []pixOrCopy) []pixOrCopy {
 	refs = refs[:0]
 	argb = argb[:n]
 	if cap(refs) == 0 {
@@ -277,9 +285,10 @@ func applyColorCache(argb []uint32, cacheBits int, refs []pixOrCopy, cache []uin
 	}
 }
 
-// bestCacheBits returns the color cache size minimizing the estimated
-// entropy of refs (which must contain no cache references).
-func bestCacheBits(argb []uint32, quality int, refs []pixOrCopy, maxBits int, sc *scratch) int {
+// bestCacheBitsGo returns the color cache size minimizing the estimated
+// entropy of refs (which must contain no cache references). It is the Go
+// reference of bestCacheBits (dsp_amd64.go, dsp_generic.go).
+func bestCacheBitsGo(argb []uint32, quality int, refs []pixOrCopy, maxBits int, sc *scratch) int {
 	if quality <= 25 || maxBits == 0 {
 		return 0
 	}
