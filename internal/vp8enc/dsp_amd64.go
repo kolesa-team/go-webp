@@ -28,6 +28,12 @@ var x86MaxLevel = func() cpuinfo.Level {
 // x86Level selects the kernels: below cpuinfo.SSE41 the Go reference, then
 // the SSE4.1 kernels, and from cpuinfo.AVX2 the AVX2 kernels where there is
 // one. Tests lower it to run every level against the Go reference.
+//
+// There are no AVX-512 kernels: AVX-512 machines run the AVX2 ones. The
+// best candidate, quantizeBlocks with VPERMW for the zigzag order and a
+// mask register for the non-zero summary, was 12% faster than the AVX2
+// kernel but only 0.4% faster on a whole method 4 encode (AMD EPYC 8024P),
+// and the other kernels are bound by their loads, not by the vector width.
 var x86Level = x86MaxLevel
 
 // vecKernels tells the mode search to call the batched entry points (one
