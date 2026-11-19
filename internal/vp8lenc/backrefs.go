@@ -100,7 +100,6 @@ func growRefs(refs []pixOrCopy, limit int) []pixOrCopy {
 	return r
 }
 
-// backwardRefsLz77 computes greedy LZ77 references with one-step lookahead.
 // lz77ReachGo returns the length of the copy at i of backwardRefsLz77,
 // for a match of length l at i reaching at least jMax (jMax < n): libwebp
 // keeps the part of the match up to the position j in (i, jMax] from
@@ -126,6 +125,7 @@ func lz77ReachGo(ol []uint32, i, jMax, n, l int) int {
 	return l
 }
 
+// backwardRefsLz77 computes greedy LZ77 references with one-step lookahead.
 func backwardRefsLz77(n int, argb []uint32, hc *hashChain, refs []pixOrCopy) []pixOrCopy {
 	refs = refs[:0]
 	ol := hc.ol[:n]
