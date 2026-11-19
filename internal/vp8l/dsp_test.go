@@ -392,6 +392,96 @@ func testPredictSelectTies(t *testing.T) {
 	}
 }
 
+// deBruijn2 returns a de Bruijn sequence B(k, 2), extended by its first
+// symbol: every pair (s[i-1], s[i]) of symbols below k occurs exactly once.
+func deBruijn2(k int) []int {
+	a := make([]int, 3)
+	var seq []int
+	var db func(t, p int)
+	db = func(t, p int) {
+		if t > 2 {
+			if 2%p == 0 {
+				seq = append(seq, a[1:p+1]...)
+			}
+			return
+		}
+		a[t] = a[t-p]
+		db(t+1, p)
+		for j := a[t-p] + 1; j < k; j++ {
+			a[t] = j
+			db(t+1, t)
+		}
+	}
+	db(1, 1)
+	return append(seq, seq[0])
+}
+
+// TestPredictClampedExhaustive checks modes 12 and 13 for every left, top
+// and top-left value of each channel: the top row is a de Bruijn sequence
+// (every top, top-left pair) and the residuals steer the left pixel through
+// all 256 values over 256 rows.
+func TestPredictClampedExhaustive(t *testing.T) { forEachLevel(t, testPredictClampedExhaustive) }
+
+func testPredictClampedExhaustive(t *testing.T) {
+	seq := deBruijn2(256)
+	width := len(seq) // pixels 1 to width-1 see every pair
+	up := make([]uint32, width+1)
+	for x, v := range seq {
+		// The same pairs in every channel, at different left values.
+		up[x] = uint32(v) * 0x01010101
+	}
+	in, out, want := make([]uint32, width), make([]uint32, width), make([]uint32, width)
+	const bits = 9
+	modes := make([]uint32, subSampleSize(width, bits))
+	for _, mode := range []uint32{12, 13} {
+		for i := range modes {
+			modes[i] = mode << 8
+		}
+		rows := 256
+		if testing.Short() {
+			rows = 16
+		}
+		for r := 0; r < rows; r++ {
+			// left(x) is the left pixel of pixel x: channel c of it is
+			// 7x + r + 85c (mod 256), every value for each x over the rows.
+			left := func(x int) uint32 {
+				var p uint32
+				for c := 0; c < 4; c++ {
+					p |= uint32((7*x+r+85*c)&0xff) << (8 * c)
+				}
+				return p
+			}
+			for x := 1; x < width; x++ {
+				l, tp, tl, next := left(x), up[x], up[x-1], left(x+1)
+				var res uint32
+				for c := 0; c < 32; c += 8 {
+					lc, tc, tlc := int32(l>>c&0xff), int32(tp>>c&0xff), int32(tl>>c&0xff)
+					var pred int32
+					if mode == 12 {
+						pred = clampByte(lc + tc - tlc)
+					} else {
+						a := (lc + tc) >> 1
+						pred = clampByte(a + (a-tlc)/2)
+					}
+					res |= uint32((int32(next>>c&0xff)-pred)&0xff) << c
+				}
+				in[x] = res
+			}
+			out[0], want[0] = left(1), left(1)
+			predictRowGo(modes, in, want, up, bits)
+			predictRow(modes, in, out, up, bits)
+			for x := 1; x < width; x++ {
+				if want[x] != left(x+1) {
+					t.Fatalf("mode %d row %d: Go reference %08x at %d, want %08x", mode, r, want[x], x, left(x+1))
+				}
+				if out[x] != want[x] {
+					t.Fatalf("mode %d row %d: %08x at %d, want %08x", mode, r, out[x], x, want[x])
+				}
+			}
+		}
+	}
+}
+
 // bundledCheck expands the packed row src with bits (1-3) and a palette
 // of random colors into an 8-bit and an RGBA destination of dn pixels, and
 // compares with the Go references.

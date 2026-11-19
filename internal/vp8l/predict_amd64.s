@@ -2,7 +2,7 @@
 
 // SSE4.1 and AVX2 kernels of the inverse predictor transform. Algorithms
 // adapted from libwebp (BSD-3-Clause), src/dsp/lossless_sse2.c
-// (PredictorAdd0_SSE2 to PredictorAdd11_SSE2) and lossless_avx2.c; the Go
+// (PredictorAdd0_SSE2 to PredictorAdd12_SSE2) and lossless_avx2.c; the Go
 // reference predictRowGo (transform.go) is the specification.
 //
 // Pixels are ARGB words, added per byte modulo 256 (PADDB). Every loop
@@ -64,8 +64,8 @@ GLOBL prOne<>(SB), RODATA|NOPTR, $16
 // (x >= 1; out[0:x] done), the tile of 1<<bits pixels at x using the mode
 // in bits 8-11 of modes[x>>bits]. up is the previous output row extended
 // by out[0] (width+1 pixels). in may alias out. It returns width, or the
-// first pixel of a tile in mode 12 or 13, which the caller does in Go.
-// libwebp: VP8LPredictorsAdd_SSE2, modes 0-11.
+// first pixel of a tile in mode 13, which the caller does in Go.
+// libwebp: VP8LPredictorsAdd_SSE2, modes 0-12.
 //
 //   0, 14, 15  in + 0xff000000                vector
 //   1          L: prefix sums of 4 pixels      vector, serial carry
@@ -75,6 +75,8 @@ GLOBL prOne<>(SB), RODATA|NOPTR, $16
 //   10         in + avg(avg(L, TL), avg(T, TR))
 //              one pixel at a time on complements (see above)
 //   11         Select: one pixel at a time (see pr11)
+//   12         ClampedAddSubtractFull: one pixel at a time, with
+//              saturating byte operations (see pr12)
 //
 // AX in, BX out, R10 up, DX modes, R8 x (start of the next tile), R9 width,
 // CX bits; per tile SI &in[x], DI &out[x], R11 &up[x], R12 a second top
@@ -104,8 +106,6 @@ prtile:
 	SHLQ    CX, R13
 	CMPQ    R13, R9
 	CMOVQGT R9, R13              // end of the tile
-	CMPQ    R12, $12
-	JEQ     prgo
 	CMPQ    R12, $13
 	JEQ     prgo
 	LEAQ    (AX)(R8*4), SI
@@ -117,6 +117,8 @@ prtile:
 	JEQ     pr1
 	CMPQ    R12, $11
 	JEQ     pr11
+	CMPQ    R12, $12
+	JEQ     pr12
 	CMPQ    R12, $2
 	JEQ     pr2
 	CMPQ    R12, $7
@@ -513,3 +515,52 @@ pr11l:
 	DECQ     R13
 	JNZ      pr11l
 	JMP      prtile
+
+	// Mode 12, ClampedAddSubtractFull: per channel
+	// L' = clamp(L + T - TL) + res (libwebp PredictorAdd12_SSE2, which
+	// widens L to 16 bits). Here in bytes: with dpos = T -sat TL and
+	// dneg = TL -sat T (one of them 0), clamp(L + T - TL) =
+	// (L +sat dpos) -sat dneg, so the serial chain of a pixel is PADDUSB,
+	// PSUBUSB and PADDB; T, TL and the residual are loaded per pixel
+	// (MOVL), off that chain. Only the low lane of X1 matters.
+	//
+	// X1 L, X2 T then dpos, X4 TL then dneg, X3 residual.
+#define P12(off) \
+	MOVL    off(R11), X2   \
+	MOVL    off-4(R11), X4 \
+	MOVO    X2, X5         \
+	PSUBUSB X4, X5         \
+	PSUBUSB X2, X4         \
+	MOVL    off(SI), X3    \
+	PADDUSB X5, X1         \
+	PSUBUSB X4, X1         \
+	PADDB   X3, X1         \
+	MOVL    X1, off(DI)
+
+pr12:
+	MOVL -4(DI), X1
+
+pr12v:
+	CMPQ R13, $4
+	JB   pr12s
+	P12(0)
+	P12(4)
+	P12(8)
+	P12(12)
+	ADDQ $16, SI
+	ADDQ $16, DI
+	ADDQ $16, R11
+	SUBQ $4, R13
+	JMP  pr12v
+
+pr12s:
+	TESTQ R13, R13
+	JZ    prtile
+	P12(0)
+	ADDQ  $4, SI
+	ADDQ  $4, DI
+	ADDQ  $4, R11
+	DECQ  R13
+	JMP   pr12s
+
+#undef P12

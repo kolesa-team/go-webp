@@ -168,9 +168,9 @@ func crossColorRow(mults, src, dst []uint32, bits int) {
 // tile of 1<<bits pixels in modes. up is the previous output row extended
 // by out[0] (see predictRun). in may alias out.
 //
-// The assembly handles every mode but 12 and 13 (rare, and serial per
-// pixel): it returns at the first tile of those, which predictRun then
-// does before the assembly goes on.
+// The assembly handles every mode but 13 (rare, and serial per pixel): it
+// returns at the first tile of mode 13, which predictRun then does before
+// the assembly goes on.
 func predictRow(modes, in, out, up []uint32, bits int) {
 	width := len(out)
 	if width < 2 || x86Level < cpuinfo.SSE41 {
