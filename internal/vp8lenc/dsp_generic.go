@@ -49,3 +49,9 @@ func (s *histoSet) addRefsRawDist(h *histo, refs []pixOrCopy) { s.addRefsRawDist
 func (s *histoSet) addTileRefs(refs []pixOrCopy, xsize, histoBits, hx int) {
 	s.addTileRefsGo(refs, xsize, histoBits, hx)
 }
+
+func ccHistoRed(histo *[256]int32, r, g []int8, c []int32, m int8) { ccHistoRedGo(histo, r, g, c, m) }
+
+func ccHistoBlue(histo *[256]int32, b, g, r []int8, c []int32, mg, mr int8) {
+	ccHistoBlueGo(histo, b, g, r, c, mg, mr)
+}

@@ -262,3 +262,37 @@ func TestAccEntropyInitGuard(t *testing.T) {
 		}
 	})
 }
+
+func TestCCHistoGuard(t *testing.T) {
+	rng := rand.New(rand.NewSource(11))
+	forEachLevel(t, func(t *testing.T) {
+		for _, n := range []int{1, 7, 8, 9, 15, 16, 17, 31, 33, 100} {
+			for _, atEnd := range []bool{false, true} {
+				b0, g0, r0, c0 := randCC(rng, n, 0)
+				gi8 := func(s []int8) []int8 {
+					u := guardedBytes(t, n, atEnd)
+					g := unsafe.Slice((*int8)(unsafe.Pointer(&u[0])), n)
+					copy(g, s)
+					return g
+				}
+				b, g, r := gi8(b0), gi8(g0), gi8(r0)
+				c := unsafe.Slice((*int32)(unsafe.Pointer(&guardedU32(t, n, atEnd)[0])), n)
+				copy(c, c0)
+				hu := guardedU32(t, 256, atEnd)
+				histo := (*[256]int32)(unsafe.Pointer(&hu[0]))
+				var want [256]int32
+				ccHistoBlueGo(&want, b0, g0, r0, c0, -7, 33)
+				ccHistoBlue(histo, b, g, r, c, -7, 33)
+				if *histo != want {
+					t.Fatalf("n %d atEnd %v: blue histograms differ", n, atEnd)
+				}
+				*histo, want = [256]int32{}, [256]int32{}
+				ccHistoRedGo(&want, r0, g0, c0, 101)
+				ccHistoRed(histo, r, g, c, 101)
+				if *histo != want {
+					t.Fatalf("n %d atEnd %v: red histograms differ", n, atEnd)
+				}
+			}
+		}
+	})
+}

@@ -249,3 +249,34 @@ func (a *accEntropy) init(h *[256]int32) {
 	}
 	a.initGo(h)
 }
+
+//go:noescape
+func ccHistoSSE41(histo *[256]int32, d, s1, s2 *int8, c *int32, n int, m1, m2 int)
+
+// ccHistoRed is ccHistoRedGo: the kernel computes the transformed values 8
+// at a time in 16-bit lanes (the products of two int8 fit), then adds the
+// counts to their bins one by one. The red transform is the blue one with
+// a zero second multiplier.
+func ccHistoRed(histo *[256]int32, r, g []int8, c []int32, m int8) {
+	n := len(r)
+	if x86Level >= cpuinfo.SSE41 && n > 0 {
+		g = g[:n]
+		c = c[:n]
+		ccHistoSSE41(histo, &r[0], &g[0], &g[0], &c[0], n, int(m), 0)
+		return
+	}
+	ccHistoRedGo(histo, r, g, c, m)
+}
+
+// ccHistoBlue is ccHistoBlueGo (see ccHistoRed).
+func ccHistoBlue(histo *[256]int32, b, g, r []int8, c []int32, mg, mr int8) {
+	n := len(b)
+	if x86Level >= cpuinfo.SSE41 && n > 0 {
+		g = g[:n]
+		r = r[:n]
+		c = c[:n]
+		ccHistoSSE41(histo, &b[0], &g[0], &r[0], &c[0], n, int(mg), int(mr))
+		return
+	}
+	ccHistoBlueGo(histo, b, g, r, c, mg, mr)
+}

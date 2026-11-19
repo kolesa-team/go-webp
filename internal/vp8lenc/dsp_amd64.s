@@ -1449,3 +1449,93 @@ rle_done:
 	MOVQ AX, count+48(FP)
 	MOVQ BX, next+56(FP)
 	RET
+
+// ---------------------------------------------------------------------------
+// Cross-color statistics (libwebp CollectColorRedTransforms_SSE2 and
+// CollectColorBlueTransforms_SSE2 compute the transformed values the same
+// way, then add them to the histogram one by one).
+
+// CCBIN adds the count k of the block to the bin in the low byte of AX,
+// then moves to the next byte. Clobbers DX, R12.
+#define CCBIN(k) \
+	MOVBLZX AL, DX;               \
+	MOVL    k*4(R10)(BX*4), R12;  \
+	ADDL    R12, (DI)(DX*4);      \
+	SHRQ    $8, AX
+
+// func ccHistoSSE41(histo *[256]int32, d, s1, s2 *int8, c *int32, n int, m1, m2 int)
+//
+// ccHistoBlueGo with b = d, g = s1, r = s2, mg = m1, mr = m2 (ccHistoRedGo
+// when m2 = 0): histo[uint8(d[i] - (m1*s1[i])>>5 - (m2*s2[i])>>5)] += c[i]
+// for i < n (n >= 1). 8 entries per step: PMOVSXBW widens the int8 to
+// 16-bit lanes, where m*s (in [-16256, 16384]) and the difference (in
+// [-1152, 1143]) are exact, PMULLW/PSRAW/PSUBW compute it, PSHUFB packs the
+// low bytes (the bins) into AX, and CCBIN adds the 8 counts. The last
+// n%8 entries are done one by one with the same integer operations.
+// DI = histo, SI = d, R8 = s1, R9 = s2, R10 = c, CX = n, BX = i,
+// R11 = m1, R13 = m2, X6/X7 = m1/m2 in every 16-bit lane, X5 = shuffle.
+TEXT ·ccHistoSSE41(SB), NOSPLIT, $0-64
+	MOVQ    histo+0(FP), DI
+	MOVQ    d+8(FP), SI
+	MOVQ    s1+16(FP), R8
+	MOVQ    s2+24(FP), R9
+	MOVQ    c+32(FP), R10
+	MOVQ    n+40(FP), CX
+	MOVQ    m1+48(FP), R11
+	MOVQ    m2+56(FP), R13
+	MOVQ    R11, X6
+	PSHUFLW $0, X6, X6
+	PSHUFD  $0, X6, X6
+	MOVQ    R13, X7
+	PSHUFLW $0, X7, X7
+	PSHUFD  $0, X7, X7
+	MOVQ    $0x0e0c0a0806040200, AX
+	MOVQ    AX, X5
+	XORQ    BX, BX
+
+cc_block:
+	LEAQ     8(BX), DX
+	CMPQ     DX, CX
+	JHI      cc_tail
+	PMOVSXBW (SI)(BX*1), X0
+	PMOVSXBW (R8)(BX*1), X1
+	PMOVSXBW (R9)(BX*1), X2
+	PMULLW   X6, X1
+	PMULLW   X7, X2
+	PSRAW    $5, X1
+	PSRAW    $5, X2
+	PSUBW    X1, X0
+	PSUBW    X2, X0
+	PSHUFB   X5, X0
+	MOVQ     X0, AX
+	CCBIN(0)
+	CCBIN(1)
+	CCBIN(2)
+	CCBIN(3)
+	CCBIN(4)
+	CCBIN(5)
+	CCBIN(6)
+	CCBIN(7)
+	ADDQ     $8, BX
+	JMP      cc_block
+
+cc_tail:
+	CMPQ    BX, CX
+	JAE     cc_done
+	MOVBQSX (SI)(BX*1), AX
+	MOVBQSX (R8)(BX*1), DX
+	IMULQ   R11, DX
+	SARQ    $5, DX
+	SUBQ    DX, AX
+	MOVBQSX (R9)(BX*1), DX
+	IMULQ   R13, DX
+	SARQ    $5, DX
+	SUBQ    DX, AX
+	MOVBLZX AL, AX
+	MOVL    (R10)(BX*4), DX
+	ADDL    DX, (DI)(AX*4)
+	INCQ    BX
+	JMP     cc_tail
+
+cc_done:
+	RET
