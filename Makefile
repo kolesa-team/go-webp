@@ -1,21 +1,28 @@
-.PHONY: vendor test
+.PHONY: test race vet bench bench-compare interop fuzz
 
-GO ?= $(which go)
+GO ?= go
 
 test:
-	@GO test ./... -v
+	$(GO) test ./...
 
-vendor:
-	@GO mod vendor
+race:
+	$(GO) test -race ./...
 
 vet:
-	@GO vet ./... -v
+	$(GO) vet ./...
 
 bench:
-	@GO test -bench=. ./webp
+	$(GO) test -run '^$$' -bench . -benchmem ./webp
 
-libwebp-mac:
-	brew install webp
+# v1 (cgo, libwebp) vs v2 pure Go vs v2 as built by default, the tables of
+# the README's Benchmarks section (needs libwebp and benchstat; about an
+# hour, see benchmarks/run.sh for the knobs).
+bench-compare:
+	./benchmarks/run.sh
 
-libwebp-ubuntu:
-	sudo apt-get install libwebp-dev
+# Conformance tests against libwebp's cwebp/dwebp (must be in PATH).
+interop:
+	$(GO) test -tags interop -run Interop ./...
+
+fuzz:
+	$(GO) test -run '^$$' -fuzz FuzzDecode -fuzztime 60s ./decoder

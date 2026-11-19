@@ -36,15 +36,15 @@ func TestOptions_GetConfig(t *testing.T) {
 		}
 		if cfg, err := options.GetConfig(); err != nil {
 			t.Fatal(err)
-		} else if cfg.options.use_cropping != 1 {
+		} else if !cfg.UseCropping {
 			t.Fatal("cropping is disabled")
-		} else if cfg.options.crop_left != 100 {
+		} else if cfg.CropLeft != 100 {
 			t.Fatal("crop_left is invalid")
-		} else if cfg.options.crop_top != 200 {
+		} else if cfg.CropTop != 200 {
 			t.Fatal("crop_top is invalid")
-		} else if cfg.options.crop_width != 400 {
+		} else if cfg.CropWidth != 400 {
 			t.Fatal("crop_width is invalid")
-		} else if cfg.options.crop_height != 500 {
+		} else if cfg.CropHeight != 500 {
 			t.Fatal("crop_height is invalid")
 		}
 	})
@@ -56,12 +56,32 @@ func TestOptions_GetConfig(t *testing.T) {
 		}
 		if cfg, err := options.GetConfig(); err != nil {
 			t.Fatal(err)
-		} else if cfg.options.use_scaling != 1 {
+		} else if !cfg.UseScaling {
 			t.Fatal("scaling is disabled")
-		} else if cfg.options.scaled_width != 400 {
+		} else if cfg.ScaledWidth != 400 {
 			t.Fatal("scaled_width is invalid")
-		} else if cfg.options.scaled_height != 500 {
+		} else if cfg.ScaledHeight != 500 {
 			t.Fatal("scaled_height is invalid")
+		}
+	})
+	t.Run("crop and scale need both dimensions", func(t *testing.T) {
+		options := &Options{
+			Crop:  image.Rectangle{Max: image.Point{X: 10}},
+			Scale: image.Rectangle{Max: image.Point{Y: 10}},
+		}
+		cfg, err := options.GetConfig()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.UseCropping || cfg.UseScaling {
+			t.Fatal("cropping/scaling must stay disabled")
+		}
+	})
+	t.Run("nil options", func(t *testing.T) {
+		var options *Options
+		cfg, err := options.GetConfig()
+		if err != nil || cfg == nil {
+			t.Fatal("nil options must give the default config")
 		}
 	})
 }

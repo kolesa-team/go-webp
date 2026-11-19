@@ -1,0 +1,209 @@
+name: CI
+
+# A branch with an open pull request used to get two identical runs, one
+# for the push and one for the pull request. Pushes now run CI on master
+# only (which also feeds Codecov's master badge); other branches run it
+# through their pull request, or by hand from the Actions tab.
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# The jobs only read the repository.
+permissions:
+  contents: read
+
+# A new push to a pull request cancels the run of its previous commit;
+# runs on master are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-24.04-arm is native linux/arm64 (the NEON code paths);
+        # ubuntu-latest and windows-latest are amd64 (the SSE4.1/AVX2/AVX-512
+        # code paths, up to the runner CPU's level), macos-latest is arm64.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+        go: ["1.27", "stable"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      # The amd64 kernels are picked at run time by CPU level; the tests
+      # run every level up to the runner's, so log which one that is.
+      - name: Log the detected x86 SIMD level
+        if: runner.arch == 'X64'
+        run: go test -count=1 -v -run TestLevelsConsistent ./internal/cpuinfo
+      - name: Check formatting
+        if: runner.os == 'Linux'
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:"; echo "$unformatted"; exit 1
+          fi
+      - name: Build without cgo
+        env:
+          CGO_ENABLED: "0"
+        run: go build ./...
+      - name: Vet
+        run: go vet ./... ./_examples/decode ./_examples/encode
+      # _examples starts with "_", so ./... (build, vet, test) skips it:
+      # run the examples explicitly, from the repository root as documented.
+      - name: Run examples
+        run: |
+          go run ./_examples/decode
+          go run ./_examples/encode
+      # benchmarks/ is a separate module (v1 vs v2, see README); its v1
+      # side needs libwebp, so only the shared suite and the v2 side are
+      # checked here, to keep the benchmarks building.
+      - name: Vet the benchmark suite
+        if: runner.os == 'Linux' && matrix.go == 'stable'
+        working-directory: benchmarks
+        run: go vet ./suite ./v2/...
+      - name: Test
+        # Coverage for Codecov is collected here, not in the race detector
+        # step: under -race every update of the (then atomic) coverage
+        # counters goes through the race runtime, and with the encoders'
+        # helper goroutines updating the same counters in their hot loops
+        # that made some packages ~300x slower and time out.
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Linux ] && [ "$RUNNER_ARCH" = X64 ] && [ "${{ matrix.go }}" = stable ]; then
+            go test -coverprofile=coverage.txt ./...
+          else
+            go test ./...
+          fi
+      # The assembly kernels (arm64 NEON, amd64 SSE4.1/AVX2/AVX-512) are
+      # compared with the pure Go code they replace by the tests above; this
+      # runs the whole suite on the pure Go code path as well (what other
+      # architectures use).
+      - name: Test the pure Go code path (-tags purego)
+        run: go test -tags purego ./...
+      - name: Test on 32-bit (linux/386)
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        env:
+          GOARCH: "386"
+          CGO_ENABLED: "0"
+        run: go vet ./... && go test -short ./...
+      - name: Test with the race detector
+        # The race detector needs cgo; it is enabled where a C toolchain is
+        # available by default.
+        if: runner.os != 'Windows'
+        env:
+          CGO_ENABLED: "1"
+        # Under the race detector the heaviest tests check fewer
+        # combinations (raceEnabled in the test files); the longer timeout
+        # is a margin for slow runners.
+        run: go test -race -short -timeout 30m ./...
+      # Memory accesses made by assembly are invisible to the race detector:
+      # on arm64 and amd64 also race-check the pure Go kernels, which write
+      # the same buffers.
+      - name: Test with the race detector (-tags purego)
+        if: runner.os != 'Windows'
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race -short -timeout 30m -tags purego ./...
+      - name: Vet other architectures
+        # Pure Go fallbacks only (no assembly there): catches build and vet
+        # errors on 32-bit, big-endian and wasm targets.
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          for target in linux/386 linux/riscv64 linux/ppc64le linux/s390x js/wasm wasip1/wasm; do
+            echo "go vet $target"
+            GOOS="${target%/*}" GOARCH="${target#*/}" go vet ./...
+          done
+          # asmdecl checks of the arm64 assembly from an amd64 runner.
+          GOOS=linux GOARCH=arm64 go vet ./...
+      - name: Vet amd64 from arm64
+        # asmdecl checks of the amd64 assembly (and its purego fallbacks)
+        # from the arm64 runner, so both assembly sets are vetted on both.
+        if: runner.os == 'Linux' && runner.arch == 'ARM64'
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          GOOS=linux GOARCH=amd64 go vet ./...
+          GOOS=linux GOARCH=amd64 go vet -tags purego ./...
+      - name: Check that decodeBit is inlined into the token loop
+        # The lossy decoder's speed depends on the boolean decoder being
+        # inlined into getCoeffs (internal/vp8/parse.go); a change that
+        # makes it too expensive to inline would silently cost ~20%.
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        run: |
+          out="$(go build -gcflags=-m ./internal/vp8 2>&1)"
+          if ! echo "$out" | grep -q 'can inline decodeBit'; then
+            echo "decodeBit (internal/vp8/bitreader.go) is no longer inlinable"; exit 1
+          fi
+          start=$(grep -n '^func getCoeffs' internal/vp8/parse.go | cut -d: -f1)
+          end=$(awk -v s="$start" 'NR > s && /^}/ { print NR; exit }' internal/vp8/parse.go)
+          n=$(echo "$out" | awk -F: -v s="$start" -v e="$end" \
+            '$1 ~ /parse\.go$/ && $2 >= s && $2 <= e && /inlining call to decodeBit/' | wc -l)
+          if [ "$n" -lt 3 ]; then
+            echo "decodeBit is inlined $n times into getCoeffs (want 3)"; exit 1
+          fi
+      - name: Upload coverage
+        if: runner.os == 'Linux' && runner.arch == 'X64' && matrix.go == 'stable'
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.txt
+        continue-on-error: true
+
+  interop:
+    # Conformance against libwebp's cwebp/dwebp (test-only dependency).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      # Pin the reference to libwebp 1.6.0 (the version the codec is
+      # conformant with: older releases report different status codes for
+      # some truncated streams) using Google's prebuilt binaries.
+      - name: Install libwebp 1.6.0 tools
+        env:
+          LIBWEBP: libwebp-1.6.0-linux-x86-64
+          SHA256: 1c5ffab71efecefa0e3c23516c3a3a1dccb45cc310ae1095c6f14ae268e38067
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/libwebp.tar.gz" \
+            "https://storage.googleapis.com/downloads.webmproject.org/releases/webp/$LIBWEBP.tar.gz"
+          echo "$SHA256  $RUNNER_TEMP/libwebp.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/libwebp.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$LIBWEBP/bin" >> "$GITHUB_PATH"
+      - run: dwebp -version && cwebp -version
+      # Same scope as "make interop": the internal packages have interop
+      # tests too.
+      - run: go test -tags interop -run Interop ./...
+
+  interop-arm64:
+    # The same conformance tests on native linux/arm64, where the NEON
+    # kernels run (amd64, above, runs the SSE4.1/AVX2/AVX-512 kernels).
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      # Google's prebuilt libwebp 1.6.0 for aarch64 (static binaries). The
+      # SHA256 is that of the tarball whose OpenPGP signature (.asc) checked
+      # out against the WebP release signing key
+      # 6B0E6B70976DE303EDF2F601F9C3D6BDB8232B5D.
+      - name: Install libwebp 1.6.0 tools
+        env:
+          LIBWEBP: libwebp-1.6.0-linux-aarch64
+          SHA256: 69f5eebe203e0f3942fe37986209a1725741be19c152950a4283b376c95ec798
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/libwebp.tar.gz" \
+            "https://storage.googleapis.com/downloads.webmproject.org/releases/webp/$LIBWEBP.tar.gz"
+          echo "$SHA256  $RUNNER_TEMP/libwebp.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/libwebp.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$LIBWEBP/bin" >> "$GITHUB_PATH"
+      - run: dwebp -version && cwebp -version
+      - run: go test -tags interop -run Interop ./...
