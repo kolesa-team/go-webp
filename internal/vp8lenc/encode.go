@@ -173,21 +173,9 @@ func EncodeWithHeadroom(img *image.NRGBA, cfg *Config, headroom int) ([]byte, er
 	for y := 0; y < h; y++ {
 		src := img.Pix[y*img.Stride : y*img.Stride+4*w]
 		dst := argb[y*w : (y+1)*w]
-		for x := range dst {
-			s := src[4*x : 4*x+4 : 4*x+4]
-			a := uint32(s[3])
-			if a != 0xff {
-				hasAlpha = true
-				if a == 0 {
-					transparent = true
-					if !cfg.Exact {
-						dst[x] = 0
-						continue
-					}
-				}
-			}
-			dst[x] = a<<24 | uint32(s[0])<<16 | uint32(s[1])<<8 | uint32(s[2])
-		}
+		a, t := nrgbaRow(dst, src, cfg.Exact)
+		hasAlpha = hasAlpha || a
+		transparent = transparent || t
 		colors.add(dst) // (a no-op past 256 colors)
 	}
 	var palBuf [maxPaletteSize]uint32
@@ -207,6 +195,31 @@ func EncodeWithHeadroom(img *image.NRGBA, cfg *Config, headroom int) ([]byte, er
 	hdr[3] = byte(v >> 16)
 	hdr[4] = byte(v >> 24)
 	return out, nil
+}
+
+// nrgbaRowGo converts the NRGBA pixels of src (4 bytes each, at least
+// 4*len(dst) bytes) to ARGB into dst, with the fully transparent pixels
+// zeroed unless exact, and reports whether a pixel is not opaque and
+// whether one is fully transparent. It is the Go reference of nrgbaRow
+// (dsp_amd64.go, dsp_generic.go).
+func nrgbaRowGo(dst []uint32, src []byte, exact bool) (hasAlpha, transparent bool) {
+	src = src[:4*len(dst)]
+	for x := range dst {
+		s := src[4*x : 4*x+4 : 4*x+4]
+		a := uint32(s[3])
+		if a != 0xff {
+			hasAlpha = true
+			if a == 0 {
+				transparent = true
+				if !exact {
+					dst[x] = 0
+					continue
+				}
+			}
+		}
+		dst[x] = a<<24 | uint32(s[0])<<16 | uint32(s[1])<<8 | uint32(s[2])
+	}
+	return hasAlpha, transparent
 }
 
 // EncodeAlpha encodes an alpha plane as an ALPH compression-method-1 stream:
@@ -1130,8 +1143,9 @@ func writeMainImage(bw *bitWriter, w, h int, p *params, c refsCandidate, sc *scr
 	}
 }
 
-// writeImageData writes the entropy-coded pixels.
-func writeImageData(bw *bitWriter, w int, refs []pixOrCopy, histoBits int, symbols []uint16, codes []huffCode) {
+// writeImageDataGo writes the entropy-coded pixels. It is the Go reference
+// of writeImageData (dsp_amd64.go, dsp_generic.go).
+func writeImageDataGo(bw *bitWriter, w int, refs []pixOrCopy, histoBits int, symbols []uint16, codes []huffCode) {
 	x, y := 0, 0
 	tileMask := 0
 	hx := 0

@@ -10,3 +10,5 @@ func testLevels() []cpuinfo.Level { return []cpuinfo.Level{cpuinfo.Go} }
 func setLevel(cpuinfo.Level) (restore func()) { return func() {} }
 
 func setPrefetch(int) (restore func()) { return func() {} }
+
+func setAddRefsMin(int) (restore func()) { return func() {} }

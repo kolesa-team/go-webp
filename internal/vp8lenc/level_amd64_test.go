@@ -22,3 +22,10 @@ func setPrefetch(pf int) (restore func()) {
 	hcPrefetch = pf
 	return func() { hcPrefetch = old }
 }
+
+// setAddRefsMin sets the smallest parse of the addRefs kernel.
+func setAddRefsMin(n int) (restore func()) {
+	old := addRefsMin
+	addRefsMin = n
+	return func() { addRefsMin = old }
+}

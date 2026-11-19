@@ -27,3 +27,19 @@ func bestCacheBits(argb []uint32, quality int, refs []pixOrCopy, maxBits int, sc
 func backwardRefsRle(xsize, n int, argb []uint32, refs []pixOrCopy) []pixOrCopy {
 	return backwardRefsRleGo(xsize, n, argb, refs)
 }
+
+func nrgbaRow(dst []uint32, src []byte, exact bool) (hasAlpha, transparent bool) {
+	return nrgbaRowGo(dst, src, exact)
+}
+
+func writeImageData(bw *bitWriter, w int, refs []pixOrCopy, histoBits int, symbols []uint16, codes []huffCode) {
+	writeImageDataGo(bw, w, refs, histoBits, symbols, codes)
+}
+
+func (s *histoSet) addRefs(h *histo, refs []pixOrCopy, xsize int) { s.addRefsGo(h, refs, xsize) }
+
+func (s *histoSet) addRefsRawDist(h *histo, refs []pixOrCopy) { s.addRefsRawDistGo(h, refs) }
+
+func (s *histoSet) addTileRefs(refs []pixOrCopy, xsize, histoBits, hx int) {
+	s.addTileRefsGo(refs, xsize, histoBits, hx)
+}
