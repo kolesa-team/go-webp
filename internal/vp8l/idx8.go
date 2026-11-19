@@ -408,7 +408,12 @@ func (d *decoder) processIdx8(base, row int) error {
 	w := d.xsize
 	idx := d.ib[y0*w-base : row*w-base]
 	d.lastRow = row
-	return d.emitIdx8(idx, y0, row)
+	t0 := d.probeStart()
+	if err := d.emitIdx8(idx, y0, row); err != nil {
+		return err
+	}
+	d.probeDone(t0, y0)
+	return nil
 }
 
 // emitIdx8 is emitRows for index bytes: it expands the (possibly bundled)

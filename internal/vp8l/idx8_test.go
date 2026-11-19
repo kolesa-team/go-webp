@@ -101,19 +101,19 @@ func TestIdx8MatchesWide(t *testing.T) {
 				want = out()
 			})
 			for _, at := range []int{0, 1, w - 1, 16*w + 3, w * h / 3, w*h - 1} {
-				for _, async := range []bool{false, true} {
+				for _, m := range threadModes {
 					withIdx8(true, at, func() {
-						withAsync(w*5+1, func(*int) {
+						withAsync(w*5+1, m.probe, func(*int) {
 							s, out := sc.make(w, h)
 							var err error
-							if async {
+							if m.threads {
 								err = DecodeWithOptions(payload, s, &Options{UseThreads: true})
 							} else {
 								err = Decode(payload, s)
 							}
-							must(t, err, name, sc.name, at, async)
+							must(t, err, name, sc.name, at, m.name)
 							if !bytes.Equal(want, out()) {
-								t.Errorf("%s %s widen at %d async %v: output differs from the 32-bit path", name, sc.name, at, async)
+								t.Errorf("%s %s widen at %d %s: output differs from the 32-bit path", name, sc.name, at, m.name)
 							}
 						})
 					})
@@ -141,15 +141,15 @@ func TestIdx8Truncated(t *testing.T) {
 			ref := &rowSink{img: image.NewNRGBA(image.Rect(0, 0, w, h)), need: h}
 			var wantErr error
 			withIdx8(false, 0, func() { wantErr = Decode(p, ref) })
-			for _, async := range []bool{false, true} {
-				withAsync(w*3+1, func(*int) {
+			for _, m := range threadModes {
+				withAsync(w*3+1, m.probe, func(*int) {
 					s := &rowSink{img: image.NewNRGBA(image.Rect(0, 0, w, h)), need: h}
-					err := DecodeWithOptions(p, s, &Options{UseThreads: async})
+					err := DecodeWithOptions(p, s, &Options{UseThreads: m.threads})
 					if fmt.Sprint(err) != fmt.Sprint(wantErr) {
-						t.Errorf("%s[:%d] async %v: error %v, want %v", name, n, async, err, wantErr)
+						t.Errorf("%s[:%d] %s: error %v, want %v", name, n, m.name, err, wantErr)
 					}
 					if s.next != ref.next || !bytes.Equal(s.img.Pix, ref.img.Pix) {
-						t.Errorf("%s[:%d] async %v: committed %d rows, want %d (or pixels differ)", name, n, async, s.next, ref.next)
+						t.Errorf("%s[:%d] %s: committed %d rows, want %d (or pixels differ)", name, n, m.name, s.next, ref.next)
 					}
 				})
 			}
@@ -181,19 +181,19 @@ func TestIdx8UnsetCacheSlot(t *testing.T) {
 		var wantErr error
 		withIdx8(false, 0, func() { wantErr = Decode(payload, ref) })
 		check(t, (wantErr != nil) == c.fails, c.name, wantErr)
-		for _, async := range []bool{false, true} {
-			withAsync(w*2+1, func(*int) {
+		for _, m := range threadModes {
+			withAsync(w*2+1, m.probe, func(*int) {
 				before := idx8Widens.Load()
 				s := &rowSink{img: image.NewNRGBA(image.Rect(0, 0, w, h)), need: h}
-				err := DecodeWithOptions(payload, s, &Options{UseThreads: async})
+				err := DecodeWithOptions(payload, s, &Options{UseThreads: m.threads})
 				if idx8Widens.Load() == before {
 					t.Errorf("%s flip %d.%d: no switch to 32 bits", c.name, c.pos, c.bit)
 				}
 				if fmt.Sprint(err) != fmt.Sprint(wantErr) {
-					t.Errorf("%s flip %d.%d async %v: error %v, want %v", c.name, c.pos, c.bit, async, err, wantErr)
+					t.Errorf("%s flip %d.%d %s: error %v, want %v", c.name, c.pos, c.bit, m.name, err, wantErr)
 				}
 				if s.next != ref.next || !bytes.Equal(s.img.Pix, ref.img.Pix) {
-					t.Errorf("%s flip %d.%d async %v: output differs from the 32-bit path", c.name, c.pos, c.bit, async)
+					t.Errorf("%s flip %d.%d %s: output differs from the 32-bit path", c.name, c.pos, c.bit, m.name)
 				}
 			})
 		}

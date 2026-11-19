@@ -111,6 +111,7 @@ type decoder struct {
 
 	useThreads bool       // Options.UseThreads
 	async      *asyncEmit // two-stage decode in progress (async.go)
+	probe      asyncProbe // timing of the first rows before a two-stage decode
 }
 
 // pixState is the position of a (resumable) pixel decoding loop. base is
@@ -143,6 +144,7 @@ func getDecoder() *decoder {
 	d.bundleReady = false
 	d.useThreads = false
 	d.async = nil
+	d.probe = asyncProbe{}
 	return d
 }
 
@@ -483,11 +485,21 @@ func (d *decoder) decodeLevel0(w, h int) error {
 	} else {
 		d.initBuffer32()
 	}
-	if d.startAsync() {
+	if d.asyncWanted() {
 		// Stop the helper on every path; after a normal return finishAsync
 		// already did, and this is a no-op.
 		defer d.abortAsync()
-		return d.finishAsync(d.decodeLevel0Pixels(h))
+		if asyncProbePixels > 0 {
+			// The helper starts, or not, after the first rows (probeDone).
+			d.probe.active = true
+		} else {
+			d.startAsync()
+		}
+		err := d.decodeLevel0Pixels(h)
+		if d.async != nil {
+			return d.finishAsync(err)
+		}
+		return err
 	}
 	return d.decodeLevel0Pixels(h)
 }

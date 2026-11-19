@@ -342,6 +342,7 @@ func (d *decoder) processRows(buf []uint32, base, row int) error {
 	if d.async != nil {
 		return d.sendRows(base, row, false)
 	}
+	y0, t0 := d.lastRow, d.probeStart()
 	// A resumed decode (AlphaDecoder) may have more than numCacheRows
 	// decoded rows pending: emit them in batches that fit d.rows.
 	for row-d.lastRow > numCacheRows {
@@ -349,7 +350,11 @@ func (d *decoder) processRows(buf []uint32, base, row int) error {
 			return err
 		}
 	}
-	return d.processBatch(buf, base, row)
+	if err := d.processBatch(buf, base, row); err != nil {
+		return err
+	}
+	d.probeDone(t0, y0)
+	return nil
 }
 
 // processBatch is processRows for at most numCacheRows rows.
