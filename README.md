@@ -48,7 +48,7 @@ Requires Go 1.27 or newer. The only other module it pulls in is
 `golang.org/x/sys`, which amd64 builds use to read the CPU's features; no C
 toolchain or system library is needed.
 
-The cgo/libwebp based v1 remains available at tag `v1.0.5` (module path
+The cgo/libwebp based v1 remains available at tag `v1.0.6` (module path
 `github.com/kolesa-team/go-webp`).
 
 ## Examples
@@ -466,10 +466,7 @@ for races around buffers shared with the codec.
 
 ## Migrating from v1
 
-The v1 (cgo) line is tagged `v1.0.5`. Note that the last v1 commit on
-`master`, `64776d9` ("fix: add missing cgo linker flags for Windows"), is
-**not** part of `v1.0.5`: tag it `v1.0.6` before merging v2, so that v1 users
-on Windows can get the fix with `go get github.com/kolesa-team/go-webp@v1.0.6`.
+The last v1 (cgo) release is `v1.0.6` (`go get github.com/kolesa-team/go-webp@v1.0.6`).
 
 v2 keeps the v1 API: the same packages, types, fields, constants, functions
 and option semantics (presets, lossless levels, `Crop`/`Scale` conventions,
