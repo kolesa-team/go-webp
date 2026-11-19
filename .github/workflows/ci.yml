@@ -1,8 +1,24 @@
 name: CI
 
+# A branch with an open pull request used to get two identical runs, one
+# for the push and one for the pull request. Pushes now run CI on master
+# only (which also feeds Codecov's master badge); other branches run it
+# through their pull request, or by hand from the Actions tab.
 on:
   push:
+    branches: [master]
   pull_request:
+  workflow_dispatch:
+
+# The jobs only read the repository.
+permissions:
+  contents: read
+
+# A new push to a pull request cancels the run of its previous commit;
+# runs on master are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
