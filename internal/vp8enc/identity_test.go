@@ -18,8 +18,9 @@ import (
 // identityHashes holds the SHA-256 (first 16 hex digits) of each case's
 // output as produced at b6b0954 (pure Go, before the NEON kernels);
 // TestEncodeIdentity checks them in every build (go test, go test -tags
-// purego, other architectures) and at every kernel level of the machine. Set VP8ENC_PRINT_HASHES=1 to print the
-// current hashes in the format of the table.
+// purego, other architectures) and at every kernel level of the machine.
+// Set VP8ENC_PRINT_HASHES=1 to print the current hashes in the format of
+// the table.
 
 type identityCase struct {
 	name  string
