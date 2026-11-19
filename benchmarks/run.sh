@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Compares v1 (cgo, libwebp) with v2 (pure Go, and NEON assembly on arm64)
+# Compares v1 (cgo, libwebp) with v2 (pure Go, and the assembly kernels on
+# arm64 and amd64)
 # on the same workloads; see the Benchmarks section of ../README.md.
 #
 #   benchmarks/run.sh               # everything (about an hour)
@@ -10,7 +11,7 @@
 #               v1 = github.com/kolesa-team/go-webp v1.0.5 + the system
 #               libwebp (needs cgo and libwebp's pkg-config file);
 #               v2-purego = this repository built with -tags purego (the
-#               code amd64 and other architectures run);
+#               code other architectures run);
 #               v2 = this repository as built by default.
 #   ROUNDS      benchmark rounds (default 10); the builds alternate within
 #               every round, in a rotating order, so that a change of the

@@ -1,6 +1,6 @@
-// Package v2 adapts this repository's v2 (pure Go, NEON assembly on arm64)
-// to the benchmark suite. Build with -tags purego for the pure Go code path
-// that amd64 and the other architectures run.
+// Package v2 adapts this repository's v2 (pure Go, with assembly kernels on
+// arm64 and amd64) to the benchmark suite. Build with -tags purego for the
+// pure Go code path that the other architectures run.
 package v2
 
 import (

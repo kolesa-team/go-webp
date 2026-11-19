@@ -5,11 +5,12 @@
 [![Go Report](https://goreportcard.com/badge/github.com/kolesa-team/go-webp)](https://goreportcard.com/report/github.com/kolesa-team/go-webp)
 [![codecov](https://codecov.io/gh/kolesa-team/go-webp/branch/master/graph/badge.svg)](https://codecov.io/gh/kolesa-team/go-webp)
 
-WebP encoder and decoder written in Go — **no cgo**, no libwebp, no
-dependencies outside the standard library. On arm64 the hot loops run as
-NEON assembly, with results identical to the pure Go code that other
-architectures and `-tags purego` builds use (see
-[Assembly and the `purego` tag](#assembly-and-the-purego-tag)).
+WebP encoder and decoder written in Go — **no cgo**, no libwebp; the only
+dependency outside the standard library is `golang.org/x/sys` (CPU feature
+detection). On arm64 and amd64 the hot loops run as assembly (NEON on
+arm64; SSE4.1, AVX2 or AVX-512 on amd64, picked at run time), with results
+identical to the pure Go code that other architectures and `-tags purego`
+builds use (see [Assembly and the `purego` tag](#assembly-and-the-purego-tag)).
 
 - Lossy (VP8) and lossless (VP8L) encoding and decoding.
 - Alpha channel for lossy images (`ALPH` chunk, raw or compressed, with
@@ -43,7 +44,9 @@ Animated WebP is not supported (as in v1, decoding reports
 go get github.com/kolesa-team/go-webp/v2
 ```
 
-Requires Go 1.27 or newer. Nothing else.
+Requires Go 1.27 or newer. The only other module it pulls in is
+`golang.org/x/sys`, which amd64 builds use to read the CPU's features; no C
+toolchain or system library is needed.
 
 The cgo/libwebp based v1 remains available at tag `v1.0.5` (module path
 `github.com/kolesa-team/go-webp`).
@@ -262,16 +265,25 @@ Helper goroutines are opt-in, per call:
   - lossless pictures of at least about 256K output pixels: the caller
     entropy-decodes while a helper applies the inverse transforms and
     writes the output rows (libwebp ignores `use_threads` for lossless
-    pictures; this is a go-webp extension).
+    pictures; this is a go-webp extension). The caller first writes 32K
+    pixels itself and times them; the helper starts only if the rest of
+    the picture projects to at least 200 µs of that work (pictures made of
+    long copies of one colour do not gain from it). On Linux it also
+    starts only when all the CPUs the process may run on share one
+    last-level cache: with the rows in another core complex's L3 cache the
+    helper made the 3000x2000 logo 10% slower on an 8-core EPYC (two L3
+    caches) instead of 12-24% faster, so pin such a process to one L3
+    domain (`taskset`, a cpuset) to get the gain.
 - `encoder.Options.ThreadLevel`:
   - lossy: the analysis pass runs in row bands (384 macroblocks or more,
     1024 at methods 0-1); the macroblock rows are coded as a wavefront on
     up to 8 goroutines when the picture is large enough to pay for the
-    hand-offs (on arm64 about 0.3 MP at methods 3-6, 1700 pixels wide at
-    method 2, several MP at methods 0-1; about 0.1 MP at methods 3-6 in the
-    pure Go build), taking at most `GOMAXPROCS` / (lossy encodes in
-    progress) goroutines; and the compressed alpha plane of a transparent
-    picture (64K pixels or more) is coded while the VP8 frame is;
+    hand-offs (with the assembly kernels of arm64 and amd64 about 0.3 MP
+    at methods 3-6, 1700 pixels wide at method 2, several MP at methods
+    0-1; about 0.1 MP at methods 3-6 in the pure Go build), taking at
+    most `GOMAXPROCS` / (lossy encodes in progress) goroutines; and the
+    compressed alpha plane of a transparent picture (64K pixels or more)
+    is coded while the VP8 frame is;
   - lossless and compressed alpha (256K pixels or more): the hash-chain
     match search, the predictor search (methods 0-4) and the histogram
     remap are split among helpers, which are released at the end of each
@@ -319,6 +331,25 @@ flags therefore help most an application that decodes or encodes one large
 picture at a time, or a server with spare cores; a server that already
 runs about one call per core may leave them off, which remains the
 default.
+
+On the amd64 server of the [Benchmarks](#amd-epyc-8024p-amd64) section
+(8 cores, Linux), measured the same way:
+
+| Call (wall / CPU time) | assembly, one goroutine | assembly, with the flag | pure Go, one goroutine | pure Go, with the flag |
+|---|---|---|---|---|
+| Decode lossy 675x900 | 5.88 ms / 6.22 ms | 3.97 ms / 6.82 ms (−32% / +10%) | 15.6 ms / 16.1 ms | 11.4 ms / 16.7 ms (−27% / +4%) |
+| Decode lossy+alpha 3000x2000 | 15.6 ms / 16.1 ms | 11.9 ms / 26.7 ms (−24% / +66%) | 60.4 ms / 61.2 ms | 37.6 ms / 65.2 ms (−38% / +7%) |
+| Decode lossless 3000x2000 | 5.04 ms / 5.41 ms | 5.05 ms / 5.41 ms (+0% / +0%) | 7.74 ms / 8.21 ms | 7.94 ms / 8.42 ms (+3% / +3%) |
+| Encode lossy q75 method 0, 1.2 MP | 30.0 ms / 30.0 ms | 32.3 ms / 34.6 ms (+8% / +15%) | 56.9 ms / 57.1 ms | 54.2 ms / 62.1 ms (−5% / +9%) |
+| Encode lossy q75 method 4, 1.2 MP | 82.9 ms / 83.1 ms | 38.1 ms / 89.0 ms (−54% / +7%) | 303 ms / 304 ms | 82.8 ms / 309 ms (−73% / +2%) |
+| Encode lossy q75 method 6, 1.2 MP | 239 ms / 239 ms | 73.7 ms / 245 ms (−69% / +3%) | 388 ms / 389 ms | 105 ms / 394 ms (−73% / +1%) |
+| Encode lossy+alpha q75, 3000x2000 | 517 ms / 518 ms | 327 ms / 533 ms (−37% / +3%) | 1.20 s / 1.21 s | 366 ms / 1.22 s (−70% / +1%) |
+| Encode lossless level 6, 1.2 MP | 463 ms / 464 ms | 227 ms / 493 ms (−51% / +6%) | 699 ms / 701 ms | 335 ms / 734 ms (−52% / +5%) |
+| Encode lossless level 0, 1.2 MP | 56.0 ms / 56.2 ms | 42.3 ms / 65.0 ms (−24% / +16%) | 103 ms / 103 ms | 79.6 ms / 108 ms (−23% / +4%) |
+
+There `UseThreads` started no helper for the lossless logo, because the
+process may run on both of the CPU's L3 caches (see above), and
+`ThreadLevel` made the method 0 encode 8% slower, with 15% more CPU time.
 
 On Linux VMs with coarse timers (for example Docker Desktop's linux/arm64
 VM) every hand-off between goroutines costs about a millisecond, so there
@@ -368,11 +399,20 @@ or encodes untrusted pictures:
 - Profile-guided optimization applies to dependencies: building the
   service with a CPU profile of its own workload (`default.pgo` in the main
   package) also optimizes this library. A library cannot ship a profile.
+- On amd64 the codec picks its SIMD kernels at run time, so it needs no
+  `GOAMD64` setting: building with `GOAMD64=v3` moved its times by −6% to
+  +3% (see [Building with GOAMD64=v3](#building-with-goamd64v3)), so
+  choose it for the rest of the service, not for the codec.
+- On Linux servers with several L3 caches (multi-socket, or EPYC with
+  several core complexes), `UseThreads` speeds up lossless decodes only in
+  a process confined to one L3 domain (cpuset, `taskset`); see
+  [Threads](#threads).
 
 ## Assembly and the `purego` tag
 
-On arm64 (Linux, macOS, Windows) the codec runs its hot loops as NEON
-assembly, written for the Go assembler (no cgo):
+On arm64 (Linux, macOS, Windows) and amd64 (every operating system) the
+codec runs its hot loops as assembly, written for the Go assembler (no
+cgo):
 
 - lossy decoding: macroblock reconstruction (intra prediction, inverse
   DCT and WHT), the in-loop deblocking filters, fancy upsampling and the
@@ -383,24 +423,46 @@ assembly, written for the Go assembler (no cgo):
   unfilters;
 - scaling (`Scale`): libwebp's rescaler and the alpha premultiplication;
 - lossy encoding: forward and inverse DCT, quantization, distortion
-  metrics, intra prediction and the analysis histogram.
+  metrics, intra prediction and the analysis histogram, and on amd64 also
+  the residual cost estimate of the mode decision;
+- lossless encoding, on amd64 only (NEON versions gained nothing on
+  arm64): predictor residuals, subtract-green, the cross-color and entropy
+  estimates, the hash-chain match search, the RLE and colour cache passes,
+  the histograms and the entropy-coded writer.
 
-All other architectures run the same algorithms in pure Go; amd64
-assembly is planned. Building with `-tags purego` selects the pure Go code
-on arm64 too (for example to rule the assembly out while investigating a
-problem).
+Every arm64 CPU has NEON. On amd64 the kernels come in levels, and the
+highest one the CPU supports is picked once, at program start, from CPUID
+(through `golang.org/x/sys/cpu`, which also checks that the operating
+system saves the vector registers):
+
+| Level | CPUs | What runs at this level |
+|---|---|---|
+| SSE4.1 | x86-64 CPUs since about 2011 (Intel since 2008, AMD since Bulldozer) | every amd64 kernel |
+| AVX2 (x86-64-v3) | Intel Haswell (2013) and later, AMD Excavator and Zen and later: practically every x86 server in use | 256-bit versions where they measured faster: most decoder kernels, the rescaler, the lossy encoder's transforms, quantizer and distortion metrics, three of the lossless encoder's kernels |
+| AVX-512 (x86-64-v4) | Intel Xeon since Skylake-SP, AMD Zen 4 and later | the lossless decoder's palette lookups, with AVX-512 VBMI (Intel Ice Lake and later, AMD Zen 4 and later); every other kernel runs its AVX2 version, as wider ones were not at least 10% faster |
+
+CPUs without SSE4.1 (or, for the lossy encoder, POPCNT) run the pure Go
+code.
+The level does not depend on `GOAMD64`, which only changes the code the Go
+compiler generates for the Go parts (see [Running on a
+server](#running-on-a-server)). `GODEBUG=cpu.avx512f=off`, `cpu.avx2=off`
+or `cpu.sse41=off` lowers the level of a process, for example to compare
+levels. Building with `-tags purego` selects the pure Go code on arm64 and
+amd64 (for example to rule the assembly out while investigating a
+problem); all other architectures always run it.
 
 The results do not depend on it: every assembly function is bit-exact with
-the Go function it replaces, so decoded pixels and encoded bytes are the
-same with and without `-tags purego`, on every architecture. The tests
-compare each assembly function with its Go counterpart (exhaustively where
-the input space allows it, otherwise on millions of random and boundary
-inputs, with fuzz targets and guard pages that catch out-of-bounds
-accesses), and CI runs the whole test suite, conformance tests included,
-on both code paths. Nothing else is needed: no build flag, no
-`GOEXPERIMENT`, no extra dependency. One caveat: the race detector does
-not see memory accesses made by assembly, so also run `go test -race
--tags purego` when looking for races around buffers shared with the codec.
+the Go function it replaces, at every level, so decoded pixels and encoded
+bytes are the same with and without `-tags purego`, on every architecture
+and CPU. The tests compare each assembly function with its Go counterpart
+at every level the machine supports (exhaustively where the input space
+allows it, otherwise on millions of random and boundary inputs, with fuzz
+targets and guard pages that catch out-of-bounds accesses), and CI runs
+the whole test suite, conformance tests included, on both code paths, on
+arm64 and amd64. Nothing else is needed: no build flag, no `GOEXPERIMENT`,
+no C toolchain. One caveat: the race detector does not see memory accesses
+made by assembly, so also run `go test -race -tags purego` when looking
+for races around buffers shared with the codec.
 
 ## Migrating from v1
 
@@ -468,32 +530,36 @@ Other differences worth knowing:
 
 ## Benchmarks
 
-All measurements in this README were taken on one machine: **Apple M5 Pro**
-(15 CPU cores, 24 GB RAM), macOS 27.2, Go 1.27.1, darwin/arm64. The tables
-of this section (and the one in [Threads](#threads)) were measured on
-2026-11-18 with [`benchmarks/run.sh`](benchmarks/run.sh), see
-[Reproducing the measurements](#reproducing-the-measurements). Absolute
-times differ on other hardware; compare the columns with each other. On
-amd64 v2 currently runs the code of the "pure Go" column (amd64 assembly
-is planned); it was not measured on amd64 hardware.
+The measurements in this README were taken on two machines with
+[`benchmarks/run.sh`](benchmarks/run.sh) (see [Reproducing the
+measurements](#reproducing-the-measurements)): an **Apple M5 Pro**
+(arm64) and an **AMD EPYC 8024P** server (amd64). Absolute times differ
+on other hardware; compare the columns of one table with each other.
 
-- **v1**: v1.0.5 with Homebrew libwebp 1.6.0 (cgo; libwebp uses its own
-  NEON code). Its memory counts only Go allocations: libwebp's C heap is
-  not visible to the Go benchmark.
+- **v1**: v1.0.5 with libwebp 1.6.0 (cgo; libwebp uses its own NEON code
+  on arm64 and SSE2/SSE4.1/AVX2 code on amd64). Its memory counts only Go
+  allocations: libwebp's C heap is not visible to the Go benchmark.
 - **v2, pure Go**: this version built with `-tags purego`, the code that
-  runs on amd64 and every other architecture for now (measured here on
-  the same arm64 machine).
-- **v2 (NEON)**: this version as built by default on arm64.
+  every other architecture runs (measured here on the same machines).
+- **v2 (NEON)**, **v2 (assembly)**: this version as built by default on
+  arm64 and amd64.
 
 Method: every benchmark binary is built once and run in 10 rounds; within a
 round the three builds run one after another in a rotating order (1 s per
 decode benchmark, 2 s per encode benchmark, `-benchmem`), so that changes of
-the machine's state affect all of them alike. The table shows medians; the
+the machine's state affect all of them alike. The tables show medians; the
 percentages are the time difference from v1 (benchstat, p < 0.05; "~"
 means no significant difference). The 95% confidence interval of nearly
 every time is within ±2% of the median. MB = 10^6 bytes allocated per
 operation. The CPU time that `UseThreads` and `ThreadLevel` cost is in
 [Threads](#threads).
+
+### Apple M5 Pro (arm64)
+
+15 CPU cores, 24 GB RAM, macOS 27.2, Go 1.27.1, darwin/arm64, Homebrew
+libwebp 1.6.0; measured on 2026-11-18 (before the amd64 assembly, which
+changed nothing on arm64 but the `UseThreads` start of lossless decodes,
+see [Threads](#threads)).
 
 | Benchmark | v1 (libwebp) | v2, pure Go (`-tags purego`) | v2 (NEON) |
 |---|---|---|---|
@@ -536,7 +602,7 @@ NEON kernels do not speed up; lossless photos and graphics decode 20-55%
 faster with them. Lossy pictures scaled to a thumbnail decode faster than
 at full size.
 
-### Throughput under load
+#### Throughput under load
 
 The same calls, 15 at a time on the 15 cores (`b.RunParallel`, as on a
 busy server), in calls per second; the percentages compare the throughput
@@ -564,7 +630,7 @@ with v1. Under full load the run-to-run spread is much larger (±10-30%);
 | Encode lossless level 0, 1.2 MP | 177/s | 151/s (−15%) | 155/s (−12%) |
 | ↳ `ThreadLevel` | 173/s | 143/s (−18%) | 149/s (−14%) |
 
-### Peak memory
+#### Peak memory
 
 Peak resident memory of a whole process (`getrusage` maxrss, one workload
 per process, median of 3 runs with the range when the runs differ by more
@@ -600,6 +666,127 @@ the peak instead. Compared with `golang.org/x/image/webp` (decoder only),
 the first pure Go v2 already decoded lossy pictures 1.6-2.6x and lossless
 pictures 1.7-3.4x faster, with far fewer allocations.
 
+### AMD EPYC 8024P (amd64)
+
+A bare-metal server: AMD EPYC 8024P (Zen 4c, 8 cores in two core
+complexes with a 16 MB L3 cache each, SMT off, `performance` frequency
+governor), 62 GiB RAM, Ubuntu 24.04 (Linux 6.8), Go 1.27.1, linux/amd64,
+libwebp 1.6.0 built from source; measured on 2026-11-19 with nothing else
+running, the same method and the same `benchmarks/run.sh` as above. The
+CPU has AVX-512 with VBMI, so v2 runs its AVX-512 level, which for every
+kernel but the lossless decoder's palette lookups is the AVX2 code.
+
+| Benchmark | v1 (libwebp) | v2, pure Go (`-tags purego`) | v2 (assembly) |
+|---|---|---|---|
+| Decode lossy 675x900 (`m4_q75.webp`) | 5.73 ms, 2.57 MB, 21 allocs | 15.6 ms (+173%), 2.50 MB, 10 allocs | 5.88 ms (+3%), 2.50 MB, 10 allocs |
+| ↳ with `UseThreads` | 5.78 ms, 2.57 MB, 21 allocs | 11.4 ms (+97%), 2.51 MB, 24 allocs | 3.97 ms (−31%), 2.50 MB, 17 allocs |
+| ↳ scaled to 320x240 (`Scale`) | 6.31 ms, 0.45 MB, 21 allocs | 8.94 ms (+42%), 0.38 MB, 12 allocs | 5.12 ms (−19%), 0.38 MB, 12 allocs |
+| ↳ `DecodeInto` (reused buffer) |  | 15.1 ms, 0.10 MB, 8 allocs | 5.39 ms, 0.08 MB, 8 allocs |
+| ↳ `DecodeYCbCr` |  | 11.9 ms, 0.98 MB, 9 allocs | 5.36 ms, 0.98 MB, 9 allocs |
+| Decode lossy+alpha 3000x2000 (`webp-logo-lossy.webp`) | 32.7 ms, 24.2 MB, 22 allocs | 60.4 ms (+85%), 24.2 MB, 17 allocs | 15.6 ms (−52%), 24.1 MB, 15 allocs |
+| ↳ with `UseThreads` | 34.3 ms, 24.2 MB, 22 allocs | 37.6 ms (+10%), 24.3 MB, 38 allocs | 11.9 ms (−65%), 24.1 MB, 37 allocs |
+| ↳ scaled to 320x240 (`Scale`) | 23.2 ms, 0.50 MB, 22 allocs | 27.7 ms (+20%), 0.44 MB, 16 allocs | 11.5 ms (−50%), 0.41 MB, 16 allocs |
+| ↳ `DecodeInto` (reused buffer) |  | 58.6 ms, 1.39 MB, 13 allocs | 14.4 ms, 0.39 MB, 11 allocs |
+| ↳ `DecodeNYCbCrA` |  | 27.3 ms, 15.1 MB, 14 allocs | 14.1 ms, 15.1 MB, 14 allocs |
+| Decode lossless 3000x2000 (`webp-logo-lossless.webp`) | 12.7 ms, 24.2 MB, 22 allocs | 7.74 ms (−39%), 24.1 MB, 10 allocs | 5.04 ms (−60%), 24.1 MB, 10 allocs |
+| ↳ with `UseThreads` | 12.5 ms, 24.2 MB, 22 allocs | 7.94 ms (−37%), 24.1 MB, 10 allocs | 5.05 ms (−60%), 24.1 MB, 10 allocs |
+| ↳ scaled to 320x240 (`Scale`) | 17.9 ms, 0.52 MB, 22 allocs | 16.8 ms (−6%), 0.43 MB, 10 allocs | 5.16 ms (−71%), 0.41 MB, 9 allocs |
+| ↳ `DecodeInto` (reused buffer) |  | 6.36 ms, 0.23 MB, 8 allocs | 3.81 ms, 0.17 MB, 8 allocs |
+| Encode lossy q75 method 4, 960x1280 JPEG source (`source.jpg`) | 127 ms, 117 858 bytes, 4.92 MB, 7 allocs | 303 ms (+139%), 117 918 bytes, 0.13 MB, 12 allocs | 82.9 ms (−35%), 117 918 bytes, 0.13 MB, 10 allocs |
+| ↳ with `ThreadLevel` | 122 ms, 117 858 bytes, 4.92 MB, 7 allocs | 82.8 ms (−32%), 117 918 bytes, 0.13 MB, 74 allocs | 38.1 ms (−69%), 117 918 bytes, 0.13 MB, 68 allocs |
+| ↳ method 0 | 43.7 ms, 150 802 bytes, 4.92 MB, 7 allocs | 56.9 ms (+30%), 149 144 bytes, 0.16 MB, 10 allocs | 30.0 ms (−31%), 149 144 bytes, 0.16 MB, 10 allocs |
+| ↳ method 0 with `ThreadLevel` | 42.1 ms, 150 802 bytes, 4.92 MB, 7 allocs | 54.2 ms (+29%), 149 144 bytes, 0.16 MB, 43 allocs | 32.3 ms (−23%), 149 144 bytes, 0.16 MB, 41 allocs |
+| ↳ method 6 | 260 ms, 108 840 bytes, 4.92 MB, 7 allocs | 388 ms (+49%), 108 710 bytes, 0.13 MB, 12 allocs | 239 ms (−8%), 108 710 bytes, 0.12 MB, 11 allocs |
+| ↳ method 6 with `ThreadLevel` | 256 ms, 108 840 bytes, 4.92 MB, 7 allocs | 105 ms (−59%), 108 710 bytes, 0.12 MB, 72 allocs | 73.7 ms (−71%), 108 710 bytes, 0.12 MB, 70 allocs |
+| Encode lossy+alpha q75 method 4, 3000x2000 logo | 611 ms, 57 584 bytes, 360 B, 5 allocs | 1.20 s (+97%), 57 538 bytes, 0.88 MB, 52 allocs | 517 ms (−15%), 57 538 bytes, 0.60 MB, 47 allocs |
+| ↳ with `ThreadLevel` | 399 ms, 57 584 bytes, 360 B, 5 allocs | 366 ms (−8%), 57 538 bytes, 1.42 MB, 124 allocs | 327 ms (−18%), 57 538 bytes, 1.10 MB, 119 allocs |
+| Encode lossless level 6, same JPEG source | 693 ms, 1 098 384 bytes, 4.92 MB, 7 allocs | 699 ms (~), 1 098 360 bytes, 1.68 MB, 25 allocs | 463 ms (−33%), 1 098 360 bytes, 1.54 MB, 24 allocs |
+| ↳ with `ThreadLevel` | 689 ms, 1 098 384 bytes, 4.92 MB, 7 allocs | 335 ms (−51%), 1 098 360 bytes, 2.38 MB, 119 allocs | 227 ms (−67%), 1 098 360 bytes, 2.15 MB, 118 allocs |
+| Encode lossless level 0, same JPEG source | 65.4 ms, 1 201 738 bytes, 4.92 MB, 7 allocs | 103 ms (+57%), 1 216 356 bytes, 1.41 MB, 19 allocs | 56.0 ms (−14%), 1 216 356 bytes, 1.39 MB, 19 allocs |
+| ↳ with `ThreadLevel` | 65.4 ms, 1 201 738 bytes, 4.92 MB, 7 allocs | 79.6 ms (+22%), 1 216 356 bytes, 1.52 MB, 50 allocs | 42.3 ms (−35%), 1 216 356 bytes, 1.50 MB, 50 allocs |
+
+The two v2 columns decode identical pixels and encode identical bytes.
+With `UseThreads` / `ThreadLevel` the process has 7 helper slots here. The
+lossless decode with `UseThreads` starts no helper on this machine: the
+process may run on both core complexes, whose L3 caches are separate (see
+[Threads](#threads)); pinned to one complex (4 cores, `taskset`), the
+flag made it about 12% faster. The lossless logo is a 256-colour palette
+picture, whose lookups use AVX-512 VBMI here (Intel Ice Lake and later,
+AMD Zen 4 and later): forced to the AVX2 level, the lossless decoder's
+own benchmark of that picture gains 8% over pure Go instead of 39%. A
+lossless photo decodes about 30% faster than in pure Go at every level,
+SSE4.1 included.
+
+#### Throughput under load, amd64
+
+The same calls, 8 at a time on the 8 cores, in calls per second; the
+percentages compare the throughput with v1. With the assembly, v2
+completes more calls per second than v1 in every row.
+
+| Call (8 at a time) | v1 (libwebp) | v2, pure Go | v2 (assembly) |
+|---|---|---|---|
+| Decode lossy 675x900 | 1 177/s | 503/s (−57%) | 1 337/s (+14%) |
+| ↳ `UseThreads` | 1 054/s | 511/s (−52%) | 1 355/s (+29%) |
+| Decode lossy+alpha 3000x2000 | 225/s | 129/s (−43%) | 457/s (+103%) |
+| ↳ `UseThreads` | 216/s | 130/s (−40%) | 441/s (+105%) |
+| Decode lossless 3000x2000 | 476/s | 769/s (+62%) | 833/s (+75%) |
+| ↳ `UseThreads` | 477/s | 765/s (+60%) | 833/s (+75%) |
+| Encode lossy q75 method 0, 1.2 MP | 170/s | 136/s (−20%) | 254/s (+49%) |
+| ↳ `ThreadLevel` | 168/s | 137/s (−19%) | 253/s (+50%) |
+| Encode lossy q75 method 4, 1.2 MP | 60/s | 25/s (−58%) | 95/s (+57%) |
+| ↳ `ThreadLevel` | 60/s | 25/s (−58%) | 94/s (+57%) |
+| Encode lossy q75 method 6, 1.2 MP | 30/s | 19/s (−37%) | 31/s (+3%) |
+| ↳ `ThreadLevel` | 30/s | 19/s (−37%) | 33/s (+11%) |
+| Encode lossy+alpha q75, 3000x2000 | 11/s | 5/s (−53%) | 12/s (+8%) |
+| ↳ `ThreadLevel` | 11/s | 6/s (−47%) | 14/s (+23%) |
+| Encode lossless level 6, 1.2 MP | 10/s | 9/s (−7%) | 16/s (+69%) |
+| ↳ `ThreadLevel` | 10/s | 10/s (+2%) | 16/s (+64%) |
+| Encode lossless level 0, 1.2 MP | 113/s | 72/s (−36%) | 136/s (+21%) |
+| ↳ `ThreadLevel` | 113/s | 73/s (−35%) | 136/s (+21%) |
+
+#### Peak memory, amd64
+
+Measured as on the M5 Pro (`getrusage` maxrss, median of 3 runs with the
+range when the runs differ by more than 10%; wall time of the encodes).
+v2 peaks lower than v1 in every row.
+
+| Workload | v1 (libwebp) | v2, pure Go | v2 (assembly) |
+|---|---|---|---|
+| One 12 MP lossy encode (4000x3000 `*image.YCbCr`, q75; the source takes 18 MB) | 162 MB, 1.30 s | 64 MB, 2.96 s | 64 MB, 0.79 s |
+| ↳ with `ThreadLevel` | 162 MB, 1.26 s | 66 MB, 0.60 s | 66 MB, 0.27 s |
+| One 12 MP lossless level 6 encode (upscaled photo) | 325 MB, 7.08 s | 257 MB, 6.61 s | 256 MB, 4.19 s |
+| Three 12 MP lossless level 6 encodes in a row | 529 MB (448-533), 21.45 s | 267 MB, 19.76 s | 267 MB, 12.37 s |
+| ↳ with `GOMEMLIMIT=450MiB` | 449 MB, 21.25 s | 406 MB, 19.79 s | 403 MB, 12.49 s |
+| One 12 MP lossless decode (output 48 MB) | 116 MB | 67 MB | 67 MB |
+| 15 goroutines x 4 decodes of the 6 MP lossless logo | 1267 MB | 651 MB (571-654) | 672 MB (598-723) |
+| ↳ `DecodeInto`, one buffer per goroutine |  | 395 MB | 395 MB |
+| 15 goroutines x 4 decodes of the 6 MP lossy+alpha logo | 864 MB | 774 MB | 647 MB (600-804) |
+| ↳ `DecodeInto`, one buffer per goroutine |  | 403 MB | 401 MB |
+
+#### Building with GOAMD64=v3
+
+`GOAMD64=v3` lets the Go compiler use x86-64-v3 instructions (AVX2,
+BMI2, FMA...) in Go code, and the binary then runs only on such CPUs. It
+does not change the assembly kernels, which are picked at run time either
+way. One call at a time on the same server (8 rounds, same method; the
+percentages compare with v1):
+
+| Benchmark | v1 (libwebp) | v2, pure Go | v2, pure Go, `GOAMD64=v3` | v2 (assembly) | v2 (assembly), `GOAMD64=v3` |
+|---|---|---|---|---|---|
+| Decode lossy 675x900 | 5.70 ms | 15.7 ms (+175%) | 15.4 ms (+170%) | 5.90 ms (+4%) | 5.56 ms (−2%) |
+| Decode lossy+alpha 3000x2000 | 33.0 ms | 60.6 ms (+83%) | 59.9 ms (+81%) | 15.8 ms (−52%) | 15.6 ms (−53%) |
+| Decode lossless 3000x2000 | 12.6 ms | 7.76 ms (−38%) | 7.60 ms (−40%) | 5.12 ms (−59%) | 5.15 ms (−59%) |
+| Encode lossy q75 method 0, 1.2 MP | 43.7 ms | 57.0 ms (+30%) | 56.8 ms (+30%) | 30.0 ms (−31%) | 30.8 ms (−30%) |
+| Encode lossy q75 method 4, 1.2 MP | 127 ms | 303 ms (+138%) | 302 ms (+138%) | 83.0 ms (−35%) | 83.1 ms (−35%) |
+| Encode lossy q75 method 6, 1.2 MP | 261 ms | 387 ms (+49%) | 387 ms (+48%) | 239 ms (−8%) | 238 ms (−9%) |
+| Encode lossless level 6, 1.2 MP | 692 ms | 700 ms (+1%) | 693 ms (~) | 463 ms (−33%) | 462 ms (−33%) |
+| Encode lossless level 0, 1.2 MP | 65.3 ms | 103 ms (+58%) | 103 ms (+58%) | 56.0 ms (−14%) | 55.6 ms (−15%) |
+
+The pure Go build gains 0-2% from it (geomean −0.9%). With the assembly,
+the lossy decode, whose bitstream parsing is Go code, gains 6%, the
+method 0 encode loses 3%, and the rest moves by 1% or less (geomean
+−0.6%).
+
 ### Reproducing the measurements
 
 The benchmarks live in [`benchmarks/`](benchmarks), a separate Go module
@@ -611,19 +798,37 @@ and run through two thin adapters, `benchmarks/v1` (v1.0.5 + libwebp) and
 ```bash
 # v1 needs cgo and libwebp with its pkg-config file:
 brew install webp pkg-config                 # macOS
-# sudo apt install libwebp-dev pkg-config    # Debian/Ubuntu (check the libwebp version)
 go install golang.org/x/perf/cmd/benchstat@latest
 
 make bench-compare        # runs benchmarks/run.sh: every table above, about an hour
 ```
 
+On Linux, build libwebp 1.6.0 from source: distributions ship older
+releases (Ubuntu 24.04 has 1.3.2), and the numbers above are for 1.6.0.
+`/usr/local` comes first in `pkg-config`'s and the dynamic linker's search
+paths, so v1 then uses it even with the distribution's `libwebp-dev`
+installed (`env.txt` reports the version found):
+
+```bash
+sudo apt install build-essential cmake pkg-config
+curl -fsSLO https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.6.0.tar.gz
+curl -fsSLO https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.6.0.tar.gz.asc
+gpg --verify libwebp-1.6.0.tar.gz.asc       # WebP release key 6B0E6B70976DE303EDF2F601F9C3D6BDB8232B5D
+tar -xzf libwebp-1.6.0.tar.gz && cd libwebp-1.6.0
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON
+cmake --build build -j"$(nproc)" && sudo cmake --install build && sudo ldconfig
+```
+
+The amd64 tables were measured that way, with the whole machine to
+themselves (`benchmarks/run.sh` uses every core; nothing else ran).
+
 The results go to `benchmarks/out/`:
 
 - `benchstat.txt`: the main table and the [Threads](#threads) table.
   Columns `v1.txt`, `v2-purego.txt` and `v2.txt` are v1, v2 pure Go and
-  v2 (NEON); `sec/op` is the time, `cpu-sec/op` the CPU time, `B/op` and
-  `allocs/op` the allocations, `bytes` the size of the encoded file;
-  "vs base" is the difference from v1 with its p-value;
+  v2 (NEON or assembly); `sec/op` is the time, `cpu-sec/op` the CPU
+  time, `B/op` and `allocs/op` the allocations, `bytes` the size of the
+  encoded file; "vs base" is the difference from v1 with its p-value;
 - `benchstat-saturation.txt`: [Throughput under load](#throughput-under-load)
   (sec/op there is the inverse of the throughput);
 - `rss.txt`: [Peak memory](#peak-memory);
@@ -648,8 +853,8 @@ different machines. The correctness statements above are checked by the
 tests: `go test -tags interop ./...` (libwebp tools in `PATH`) compares
 decoded pixels with libwebp's `dwebp`, decodes the files v2 encodes with
 `dwebp`, and compares their sizes and quality with `cwebp`'s; `go test
-./...` checks that the NEON and pure Go code paths produce the same
-output.
+./...` checks that the assembly (at every level the machine supports) and
+pure Go code paths produce the same output.
 
 For a quick check of v2 alone, `make bench` runs the `webp` package
 benchmarks.
