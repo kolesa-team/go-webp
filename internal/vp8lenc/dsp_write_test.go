@@ -2,6 +2,7 @@ package vp8lenc
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"math/rand"
 	"slices"
@@ -108,6 +109,66 @@ func FuzzNrgbaRow(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte, exact bool, off uint8) {
 		src := data[:len(data)&^3]
 		forEachLevel(t, func(t *testing.T) { nrgbaBoth(t, src, int(off%8), exact) })
+	})
+}
+
+// subGreenBoth transforms p at every level in place, placed off elements
+// into a buffer of sentinels, and compares with subtractGreenGo.
+func subGreenBoth(t *testing.T, p []uint32, off int) {
+	t.Helper()
+	n := len(p)
+	want := slices.Clone(p)
+	subtractGreenGo(want)
+	buf := make([]uint32, n+off+9)
+	for i := range buf {
+		buf[i] = 0xdeadbeef
+	}
+	got := buf[off : off+n : off+n]
+	copy(got, p)
+	subtractGreen(got)
+	if !slices.Equal(got, want) {
+		t.Fatalf("n %d off %d: got %08x, want %08x", n, off, got, want)
+	}
+	for i, v := range buf {
+		if (i < off || i >= off+n) && v != 0xdeadbeef {
+			t.Fatalf("n %d off %d: element %d outside p written", n, off, i-off)
+		}
+	}
+}
+
+func TestSubtractGreenLevels(t *testing.T) {
+	rng := rand.New(rand.NewSource(11))
+	widths := []int{0}
+	for n := 1; n <= 64; n++ {
+		widths = append(widths, n)
+	}
+	widths = append(widths, 100, 255, 1000, 4097, 65536+13)
+	forEachLevel(t, func(t *testing.T) {
+		for _, n := range widths {
+			for off := 0; off < 16; off++ {
+				subGreenBoth(t, randPixels(rng, n), off)
+			}
+		}
+		if testing.Short() {
+			return
+		}
+		// Every (green, red, blue) byte triple, with random alphas.
+		p := make([]uint32, 1<<24)
+		for i := range p {
+			p[i] = uint32(i) | uint32(rng.Intn(256))<<24
+		}
+		subGreenBoth(t, p, 3)
+	})
+}
+
+func FuzzSubtractGreen(f *testing.F) {
+	f.Add([]byte{1, 2, 3, 255, 4, 5, 6, 0, 7, 8, 9, 10, 1, 2, 3, 255, 0, 0, 0, 0}, uint8(1))
+	f.Fuzz(func(t *testing.T, data []byte, off uint8) {
+		p := make([]uint32, len(data)/4)
+		for i := range p {
+			p[i] = binary.LittleEndian.Uint32(data[4*i:])
+		}
+		forEachLevel(t, func(t *testing.T) { subGreenBoth(t, p, int(off%16)) })
 	})
 }
 
@@ -518,6 +579,12 @@ func BenchmarkStreamKernels(b *testing.B) {
 				for y := 0; y < len(argb); y += w {
 					nrgbaRow(dst[y:y+w], src[4*y:4*(y+w)], false)
 				}
+			}
+		})
+		b.Run(fmt.Sprintf("subGreen/%v", l), func(b *testing.B) {
+			defer setLevel(l)()
+			for i := 0; i < b.N; i++ {
+				subtractGreen(dst)
 			}
 		})
 		b.Run(fmt.Sprintf("addRefs/%v", l), func(b *testing.B) {

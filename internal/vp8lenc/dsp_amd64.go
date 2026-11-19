@@ -212,3 +212,40 @@ func combinedPopulationCost(a, b []uint32) float64 {
 	}
 	return combinedPopulationCostGo(a, b)
 }
+
+// zeroPop is the second operand of popStatsSSE41 for populationCost: zeros
+// as long as the longest population (the literal histogram with the
+// largest color cache). Never written.
+var zeroPop [numLiteralCodes + numLengthCodes + 1<<maxColorCacheBits]uint32
+
+// populationCost is populationCostGo, which is combinedPopulationCostGo
+// with a zero second operand: the same kernel with zeroPop as that operand
+// (pop[i]+0 == pop[i]), so the statistics and the cost are those of the Go
+// code.
+func populationCost(pop []uint32) float64 {
+	n := len(pop)
+	if x86Level >= cpuinfo.SSE41 && n > 16 && n <= len(zeroPop) {
+		var st popStats
+		popStatsSSE41(&pop[0], &zeroPop[0], n, &st)
+		st.e.entropy += slog2(st.e.sum)
+		return st.e.refine() + st.s.finalHuffmanCost()
+	}
+	return populationCostGo(pop)
+}
+
+//go:noescape
+func accEntropyInitSSE41(h *[256]int32, a *accEntropy)
+
+// init is initGo: the kernel adds up the bins with vector adds, stores
+// zeros for the zero bins and visits only the non-zero ones (a bit mask
+// built 16 bins at a time), whose terms it adds to the total in the order
+// of the Go code. The skipped terms of the Go code are slog2(0) = +0, and
+// x + (+0) == x for every total it can reach (a sum of non-negative terms
+// from +0, never -0), so the total is bit-identical.
+func (a *accEntropy) init(h *[256]int32) {
+	if x86Level >= cpuinfo.SSE41 {
+		accEntropyInitSSE41(h, a)
+		return
+	}
+	a.initGo(h)
+}

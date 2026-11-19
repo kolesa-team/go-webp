@@ -668,10 +668,7 @@ func encodeStream(src []uint32, mutable bool, w, h int, p *params, cc crunchConf
 		applyNearLossless(width, h, p.nearLossless, cur)
 	}
 	if useSubGreen {
-		for i, px := range cur {
-			g := (px >> 8) & 0xff
-			cur[i] = px&0xff00ff00 | (((px >> 16) - g) & 0xff << 16) | ((px - g) & 0xff)
-		}
+		subtractGreen(cur)
 		bw.putBits(1, 1)
 		bw.putBits(subtractGreenTransform, 2)
 	}

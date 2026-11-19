@@ -2,6 +2,7 @@ package vp8lenc
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math"
 	"math/rand"
 	"testing"
@@ -283,6 +284,225 @@ func BenchmarkCombinedShannonEntropy(b *testing.B) {
 			var s float64
 			for i := 0; i < b.N; i++ {
 				s += combinedShannonEntropy(&xs[i&15], &y, &acc)
+			}
+			sinkF = s
+		})
+	}
+}
+
+// junkAcc fills a with random values, which init must overwrite.
+func junkAcc(rng *rand.Rand, a *accEntropy) {
+	for i := range a.s {
+		a.s[i] = rng.NormFloat64()
+	}
+	a.total = rng.NormFloat64()
+	a.sum = rng.Uint32()
+}
+
+// accDiff returns a description of the first difference between a and b
+// (bit for bit), or "".
+func accDiff(a, b *accEntropy) string {
+	for i := range a.s {
+		if math.Float64bits(a.s[i]) != math.Float64bits(b.s[i]) {
+			return fmt.Sprintf("s[%d] %v != %v", i, a.s[i], b.s[i])
+		}
+	}
+	if math.Float64bits(a.total) != math.Float64bits(b.total) {
+		return fmt.Sprintf("total %v != %v", a.total, b.total)
+	}
+	if a.sum != b.sum {
+		return fmt.Sprintf("sum %d != %d", a.sum, b.sum)
+	}
+	return ""
+}
+
+func TestAccEntropyInitLevels(t *testing.T) {
+	n := 200000
+	if testing.Short() {
+		n = 20000
+	}
+	rng := rand.New(rand.NewSource(12))
+	var h [256]int32
+	var got, want accEntropy
+	forEachLevel(t, func(t *testing.T) {
+		for i := 0; i < n; i++ {
+			randHisto(rng, h[:])
+			junkAcc(rng, &got)
+			junkAcc(rng, &want)
+			want.initGo(&h)
+			got.init(&h)
+			if d := accDiff(&got, &want); d != "" {
+				t.Fatalf("h %v: %s", h, d)
+			}
+		}
+	})
+}
+
+// TestAccEntropyInitSlog2 checks the kernel's v*log2(v) for every v below
+// 2^24 (every 251st above the SSE4.1 level, which runs the same kernel) and
+// random larger ones, isolated in bin v&255 of an otherwise zero histogram:
+// the bin's term and the total are then exactly slog2(v).
+func TestAccEntropyInitSlog2(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short")
+	}
+	rng := rand.New(rand.NewSource(13))
+	for _, l := range testLevels() {
+		if l == cpuinfo.Go {
+			continue
+		}
+		step := uint32(1)
+		if l != cpuinfo.SSE41 {
+			step = 251
+		}
+		t.Run(l.String(), func(t *testing.T) {
+			defer setLevel(l)()
+			var h [256]int32
+			var a accEntropy
+			check := func(v uint32) {
+				i := int(v & 255)
+				h[i] = int32(v)
+				a.init(&h)
+				h[i] = 0
+				want := math.Float64bits(slog2(v))
+				if math.Float64bits(a.s[i]) != want || math.Float64bits(a.total) != want || a.sum != v {
+					t.Fatalf("v %d: s %v total %v sum %d, want %v", v, a.s[i], a.total, a.sum, slog2(v))
+				}
+			}
+			for v := uint32(1); v < 1<<24; v += step {
+				check(v)
+			}
+			for k := 0; k < 1<<20; k += int(step) {
+				check(rng.Uint32() | 1<<24)
+			}
+			check(1<<32 - 1)
+		})
+	}
+}
+
+func FuzzAccEntropyInit(f *testing.F) {
+	f.Add([]byte{1, 0, 0, 0, 2, 0, 0, 0, 0, 16, 0, 0})
+	f.Fuzz(func(t *testing.T, hb []byte) {
+		var h [256]int32
+		for i := 0; i < 256 && 4*i+4 <= len(hb); i++ {
+			h[i] = int32(binary.LittleEndian.Uint32(hb[4*i:]))
+		}
+		var want accEntropy
+		want.initGo(&h)
+		atEveryLevel(func(l cpuinfo.Level) {
+			var got accEntropy
+			got.total, got.sum = 1, 1
+			got.init(&h)
+			if d := accDiff(&got, &want); d != "" {
+				t.Fatalf("level %v: %s", l, d)
+			}
+		})
+	})
+}
+
+func TestPopulationCostLevels(t *testing.T) {
+	iters := 100000
+	if testing.Short() {
+		iters = 10000
+	}
+	rng := rand.New(rand.NewSource(14))
+	sizes := []int{0, 1, 2, 15, 16, 17, 18, 31, 32, 33, 40, 47, 48, 49, 256, 280, 281, 282, 284, 288, 296, 312, 344, 408, 536, 792, 1304, 1305, 2000}
+	forEachLevel(t, func(t *testing.T) {
+		for i := 0; i < iters; i++ {
+			n := sizes[i%len(sizes)]
+			if i%3 == 0 {
+				n = rng.Intn(400)
+			}
+			var p []uint32
+			if rng.Intn(2) == 0 {
+				p = randStreaky(rng, n)
+			} else {
+				h := make([]int32, n)
+				randHisto(rng, h)
+				p = make([]uint32, n)
+				for k := range p {
+					p[k] = uint32(h[k])
+				}
+			}
+			want := populationCostGo(p)
+			got := populationCost(p)
+			if math.Float64bits(got) != math.Float64bits(want) {
+				t.Fatalf("p %v: got %v, want %v", p, got, want)
+			}
+		}
+	})
+}
+
+func FuzzPopulationCost(f *testing.F) {
+	f.Add([]byte{1, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0}, uint16(40))
+	f.Fuzz(func(t *testing.T, data []byte, n uint16) {
+		size := int(n) % 1400
+		p := make([]uint32, size)
+		for i := range p {
+			if len(data) >= 4 {
+				p[i] = uint32(data[(2*i)%len(data)]) << (data[(2*i+1)%len(data)] & 31)
+				if data[(i+3)%len(data)]&1 == 0 {
+					p[i] = 0
+				}
+			}
+		}
+		want := populationCostGo(p)
+		atEveryLevel(func(l cpuinfo.Level) {
+			if got := populationCost(p); math.Float64bits(got) != math.Float64bits(want) {
+				t.Fatalf("level %v: got %v, want %v", l, got, want)
+			}
+		})
+	})
+}
+
+// BenchmarkAccEntropyInit runs init on accumulated residual histograms:
+// sparse (a graphic: a few bins around 0) and dense (a photo).
+func BenchmarkAccEntropyInit(b *testing.B) {
+	rng := rand.New(rand.NewSource(15))
+	for _, kind := range []struct {
+		name  string
+		sigma float64
+	}{{"sparse", 0.7}, {"dense", 12}} {
+		var hs [8][256]int32
+		for k := range hs {
+			for i := 0; i < 1<<16; i++ {
+				hs[k][uint8(int(rng.NormFloat64()*kind.sigma*float64(4+k)/4))]++
+			}
+		}
+		for _, l := range testLevels() {
+			b.Run(kind.name+"/"+l.String(), func(b *testing.B) {
+				defer setLevel(l)()
+				var a accEntropy
+				for i := 0; i < b.N; i++ {
+					a.init(&hs[i&7])
+				}
+				sinkF = a.total
+			})
+		}
+	}
+}
+
+// BenchmarkPopulationCost runs populationCost on the literal histograms of
+// BenchmarkCombinedPopulationCost.
+func BenchmarkPopulationCost(b *testing.B) {
+	rng := rand.New(rand.NewSource(9))
+	const n = 280 + 1<<6
+	var hs [8][]uint32
+	for k := range hs {
+		hs[k] = make([]uint32, n)
+		for i := 0; i < 4000; i++ {
+			v := int(128 + rng.NormFloat64()*float64(10+5*k))
+			if v >= 0 && v < n {
+				hs[k][v]++
+			}
+		}
+	}
+	for _, l := range testLevels() {
+		b.Run(l.String(), func(b *testing.B) {
+			defer setLevel(l)()
+			var s float64
+			for i := 0; i < b.N; i++ {
+				s += populationCost(hs[i&7])
 			}
 			sinkF = s
 		})

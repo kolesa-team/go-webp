@@ -209,3 +209,56 @@ func TestWriteImageDataGuard(t *testing.T) {
 		})
 	}
 }
+
+func TestSubtractGreenGuard(t *testing.T) {
+	rng := rand.New(rand.NewSource(8))
+	forEachLevel(t, func(t *testing.T) {
+		for _, n := range []int{1, 3, 4, 5, 7, 8, 9, 15, 16, 17, 23, 24, 25, 31, 33, 100} {
+			for _, atEnd := range []bool{false, true} {
+				p := guardedU32(t, n, atEnd)
+				copy(p, randPixels(rng, n))
+				want := slices.Clone(p)
+				subtractGreenGo(want)
+				subtractGreen(p)
+				if !slices.Equal(p, want) {
+					t.Fatalf("n %d atEnd %v: got %08x, want %08x", n, atEnd, p, want)
+				}
+			}
+		}
+	})
+}
+
+func TestPopulationCostGuard(t *testing.T) {
+	rng := rand.New(rand.NewSource(9))
+	forEachLevel(t, func(t *testing.T) {
+		for _, n := range []int{17, 18, 31, 32, 33, 40, 256, 280, 281, 1304} {
+			for _, atEnd := range []bool{false, true} {
+				p := guardedU32(t, n, atEnd)
+				copy(p, randStreaky(rng, n))
+				want := populationCostGo(slices.Clone(p))
+				if got := populationCost(p); got != want {
+					t.Fatalf("n %d atEnd %v: got %v, want %v", n, atEnd, got, want)
+				}
+			}
+		}
+	})
+}
+
+func TestAccEntropyInitGuard(t *testing.T) {
+	rng := rand.New(rand.NewSource(10))
+	words := int(unsafe.Sizeof(accEntropy{}) / 4)
+	forEachLevel(t, func(t *testing.T) {
+		for _, atEnd := range []bool{false, true} {
+			hu := guardedU32(t, 256, atEnd)
+			h := (*[256]int32)(unsafe.Pointer(&hu[0]))
+			randHisto(rng, h[:])
+			a := (*accEntropy)(unsafe.Pointer(&guardedU32(t, words, atEnd)[0]))
+			var want accEntropy
+			want.initGo(h)
+			a.init(h)
+			if d := accDiff(a, &want); d != "" {
+				t.Fatalf("atEnd %v: %s", atEnd, d)
+			}
+		}
+	})
+}

@@ -110,9 +110,11 @@ func bitsEntropy(pop []uint32) float64 {
 	return e.refine()
 }
 
-// populationCost estimates the number of bits to code pop with a Huffman
-// code, including the cost of storing the code itself.
-func populationCost(pop []uint32) float64 {
+// populationCostGo estimates the number of bits to code pop with a Huffman
+// code, including the cost of storing the code itself. It is the Go
+// reference of populationCost (dsp_amd64.go, dsp_generic.go), and
+// combinedPopulationCostGo with a zero second operand.
+func populationCostGo(pop []uint32) float64 {
 	var e bitEntropy
 	var s streaks
 	n := len(pop)
@@ -217,7 +219,9 @@ type accEntropy struct {
 	sum   uint32
 }
 
-func (a *accEntropy) init(h *[256]int32) {
+// initGo sets a to the entropy terms of h. It is the Go reference of init
+// (dsp_amd64.go, dsp_generic.go).
+func (a *accEntropy) initGo(h *[256]int32) {
 	a.total = 0
 	a.sum = 0
 	for i, v := range h {

@@ -626,6 +626,106 @@ cse_slow4:
 	SLOG2_SLOW
 	JMP cse_back4
 
+// NZMASK16 ORs into R12, at bit sh, the mask of the zero bins among the 16
+// int32 at off(SI)(R11*4) (as ZEROMASK16), after adding them into X8-X11.
+#define NZMASK16(off, sh) \
+	MOVOU    off(SI)(R11*4), X1;    \
+	MOVOU    off+16(SI)(R11*4), X2; \
+	MOVOU    off+32(SI)(R11*4), X3; \
+	MOVOU    off+48(SI)(R11*4), X4; \
+	PADDL    X1, X8;                \
+	PADDL    X2, X9;                \
+	PADDL    X3, X10;               \
+	PADDL    X4, X11;               \
+	PACKSSLW X2, X1;                \
+	PACKSSLW X4, X3;                \
+	PACKSSWB X3, X1;                \
+	PCMPEQB  X15, X1;               \
+	PMOVMSKB X1, R13;               \
+	SHLQ     $sh, R13;              \
+	ORQ      R13, R12
+
+// ZERO8 stores 8 zero float64 at off(AX).
+#define ZERO8(off) \
+	MOVOU X15, off(AX);    \
+	MOVOU X15, off+16(AX); \
+	MOVOU X15, off+32(AX); \
+	MOVOU X15, off+48(AX)
+
+// func accEntropyInitSSE41(h *[256]int32, a *accEntropy)
+//
+// accEntropy.initGo (libwebp has no counterpart: it recomputes the
+// entropy of the accumulated histogram in every CombinedShannonEntropy).
+// For each chunk of 64 bins: the bins are added into 4 lanes of sums, a
+// mask of the non-zero bins is built, a.s is zeroed for the chunk, then for
+// each set bit i (BSF, clear lowest) a.s[i] = slog2(h[i]) and
+// total += a.s[i], in the order of the Go loop.
+// SI = h, DX = a, R8 = &slog2Tab, R11 = chunk base, R12 = mask, BX = bin,
+// X0 = total, X8-X11 = sums, X14 = Ln2, X15 = 0.
+TEXT ·accEntropyInitSSE41(SB), NOSPLIT, $0-16
+	MOVQ  h+0(FP), SI
+	MOVQ  a+8(FP), DX
+	LEAQ  ·slog2Tab(SB), R8
+	MOVQ  $0x3fe62e42fefa39ef, AX // math.Ln2
+	MOVQ  AX, X14
+	PXOR  X15, X15
+	XORPS X0, X0
+	PXOR  X8, X8
+	PXOR  X9, X9
+	PXOR  X10, X10
+	PXOR  X11, X11
+	XORL  R11, R11
+
+ae_chunk:
+	XORL R12, R12
+	NZMASK16(0, 0)
+	NZMASK16(64, 16)
+	NZMASK16(128, 32)
+	NZMASK16(192, 48)
+	NOTQ R12
+	LEAQ accEntropy_s(DX)(R11*8), AX
+	ZERO8(0)
+	ZERO8(64)
+	ZERO8(128)
+	ZERO8(192)
+	ZERO8(256)
+	ZERO8(320)
+	ZERO8(384)
+	ZERO8(448)
+
+ae_bin:
+	TESTQ R12, R12
+	JZ    ae_next
+	BSFQ  R12, BX
+	LEAQ  -1(R12), AX
+	ANDQ  AX, R12
+	ADDQ  R11, BX
+	MOVL  (SI)(BX*4), AX
+	SLOG2(ae_slow, ae_back)
+	MOVSD X2, accEntropy_s(DX)(BX*8)
+	ADDSD X2, X0
+	JMP   ae_bin
+
+ae_next:
+	ADDQ   $64, R11
+	CMPQ   R11, $256
+	JB     ae_chunk
+	MOVSD  X0, accEntropy_total(DX)
+	PADDL  X9, X8
+	PADDL  X11, X10
+	PADDL  X10, X8
+	PSHUFD $0x4e, X8, X1
+	PADDL  X1, X8
+	PSHUFD $0xb1, X8, X1
+	PADDL  X1, X8
+	MOVQ   X8, AX
+	MOVL   AX, accEntropy_sum(DX)
+	RET
+
+ae_slow:
+	SLOG2_SLOW
+	JMP ae_back
+
 // SLOG2T is SLOG2 with the table address loaded into R9 (which the slow
 // path clobbers anyway), for kernels short of registers.
 #define SLOG2T(slow, back) \

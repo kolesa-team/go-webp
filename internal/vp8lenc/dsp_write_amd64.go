@@ -37,6 +37,31 @@ func nrgbaRow(dst []uint32, src []byte, exact bool) (hasAlpha, transparent bool)
 }
 
 //go:noescape
+func subtractGreenSSE41(p *uint32, n int)
+
+//go:noescape
+func subtractGreenAVX2(p *uint32, n int)
+
+// subtractGreen is subtractGreenGo: the kernels transform the pixels 4
+// (SSE4.1) or 8 (AVX2) at a time, as many as fill whole blocks; the Go
+// code transforms the rest. (The transform is not idempotent, so the last
+// block cannot overlap pixels already transformed.)
+func subtractGreen(p []uint32) {
+	n := len(p)
+	switch {
+	case x86Level >= cpuinfo.AVX2 && n >= 8:
+		m := n &^ 7
+		subtractGreenAVX2(&p[0], m)
+		p = p[m:]
+	case x86Level >= cpuinfo.SSE41 && n >= 4:
+		m := n &^ 3
+		subtractGreenSSE41(&p[0], m)
+		p = p[m:]
+	}
+	subtractGreenGo(p)
+}
+
+//go:noescape
 func addRefsSSE41(q *uint32, stride, litLen int, refs *pixOrCopy, n, xsize int, raw bool) (done int)
 
 // addRefsMin is the smallest parse the addRefs kernel takes (below, clearing

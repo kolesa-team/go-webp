@@ -144,6 +144,81 @@ nrv_flags:
 	RET
 
 // ---------------------------------------------------------------------------
+// func subtractGreenSSE41(p *uint32, n int)
+//
+// subtractGreenGo for n pixels, n a multiple of 4 (libwebp
+// SubtractGreenFromBlueAndRed_SSE2, with PSHUFB): the shuffle copies the
+// green byte of each pixel to its blue and red bytes and zeroes the
+// others, and PSUBB subtracts it (mod 256) in place.
+// DI = p, CX = end offset, AX = offset, X7 = shuffle.
+TEXT ·subtractGreenSSE41(SB), NOSPLIT, $0-16
+	MOVQ   p+0(FP), DI
+	MOVQ   n+8(FP), CX
+	SHLQ   $2, CX
+	MOVQ   $0x8005800580018001, AX
+	MOVQ   AX, X7
+	MOVQ   $0x800d800d80098009, AX
+	PINSRQ $1, AX, X7
+	XORQ   AX, AX
+	TESTQ  CX, CX
+	JZ     sgs_done
+
+sgs_loop:
+	MOVOU  (DI)(AX*1), X0
+	MOVO   X0, X1
+	PSHUFB X7, X1
+	PSUBB  X1, X0
+	MOVOU  X0, (DI)(AX*1)
+	ADDQ   $16, AX
+	CMPQ   AX, CX
+	JB     sgs_loop
+
+sgs_done:
+	RET
+
+// func subtractGreenAVX2(p *uint32, n int)
+//
+// subtractGreenSSE41 with 8 pixels per ymm (n a multiple of 8), two ymm
+// per step while 16 pixels remain.
+TEXT ·subtractGreenAVX2(SB), NOSPLIT, $0-16
+	MOVQ        p+0(FP), DI
+	MOVQ        n+8(FP), CX
+	SHLQ        $2, CX
+	MOVQ        $0x8005800580018001, AX
+	VMOVQ       AX, X7
+	MOVQ        $0x800d800d80098009, AX
+	VPINSRQ     $1, AX, X7, X7
+	VINSERTI128 $1, X7, Y7, Y7
+	XORQ        AX, AX
+	LEAQ        -64(CX), BX
+
+sgv_loop2:
+	CMPQ    AX, BX
+	JGT     sgv_one
+	VMOVDQU (DI)(AX*1), Y0
+	VMOVDQU 32(DI)(AX*1), Y2
+	VPSHUFB Y7, Y0, Y1
+	VPSHUFB Y7, Y2, Y3
+	VPSUBB  Y1, Y0, Y0
+	VPSUBB  Y3, Y2, Y2
+	VMOVDQU Y0, (DI)(AX*1)
+	VMOVDQU Y2, 32(DI)(AX*1)
+	ADDQ    $64, AX
+	JMP     sgv_loop2
+
+sgv_one:
+	CMPQ    AX, CX
+	JAE     sgv_done
+	VMOVDQU (DI)(AX*1), Y0
+	VPSHUFB Y7, Y0, Y1
+	VPSUBB  Y1, Y0, Y0
+	VMOVDQU Y0, (DI)(AX*1)
+
+sgv_done:
+	VZEROUPPER
+	RET
+
+// ---------------------------------------------------------------------------
 // PREFIXCODE sets r (32 bits) to prefixCode(v) for v in r: d = uint32(v-1)
 // is its own code below 4, else the code is 2*hb + bit hb-1 of d, hb being
 // the index of its highest set bit (BTL sets the carry to that bit). t is
