@@ -8,9 +8,10 @@ import (
 	"testing"
 )
 
-// The row kernels the build selects (assembly on arm64) against the Go
-// reference kernels, on identical rescaler state. Without assembly both
-// sides are the Go kernels and the tests are trivially true.
+// The row kernels the build selects (assembly on arm64, and on amd64 at
+// every SIMD level, see forEachLevel) against the Go reference kernels, on
+// identical rescaler state. Without assembly both sides are the Go kernels
+// and the tests are trivially true.
 
 // importRow runs the selected or the reference import kernel on src.
 func importRow(rs *Rescaler, src []byte, acc []uint32, ref bool) {
@@ -105,16 +106,18 @@ func kernelWidths(rnd *rand.Rand, expand bool) (int, int) {
 }
 
 func TestImportKernels(t *testing.T) {
-	rnd := rand.New(rand.NewSource(11))
-	n := 200000
-	if testing.Short() {
-		n = 20000
-	}
-	for i := 0; i < n; i++ {
-		ch := []int{1, 4, 1, 4, 2, 3}[i%6]
-		sw, dw := kernelWidths(rnd, i%5 == 0)
-		checkImport(t, rnd, sw, dw, ch, nil, nil)
-	}
+	forEachLevel(t, func(t *testing.T) {
+		rnd := rand.New(rand.NewSource(11))
+		n := 200000
+		if testing.Short() {
+			n = 20000
+		}
+		for i := 0; i < n; i++ {
+			ch := []int{1, 4, 1, 4, 2, 3}[i%6]
+			sw, dw := kernelWidths(rnd, i%5 == 0)
+			checkImport(t, rnd, sw, dw, ch, nil, nil)
+		}
+	})
 }
 
 func FuzzImportKernels(f *testing.F) {
@@ -123,8 +126,10 @@ func FuzzImportKernels(f *testing.F) {
 	f.Add(uint16(30), uint16(700), uint8(4), int64(3))
 	f.Add(uint16(4100), uint16(2), uint8(1), int64(4))
 	f.Fuzz(func(t *testing.T, sw, dw uint16, ch uint8, seed int64) {
-		w, ow, c := int(sw%5000)+1, int(dw%5000)+1, int(ch%4)+1
-		checkImport(t, rand.New(rand.NewSource(seed)), w, ow, c, nil, nil)
+		eachLevel(func() {
+			w, ow, c := int(sw%5000)+1, int(dw%5000)+1, int(ch%4)+1
+			checkImport(t, rand.New(rand.NewSource(seed)), w, ow, c, nil, nil)
+		})
 	})
 }
 
@@ -223,42 +228,54 @@ func checkRescale(t testing.TB, rnd *rand.Rand, sw, sh, dw, dh, ch int, dst []by
 }
 
 func TestExportKernels(t *testing.T) {
-	rnd := rand.New(rand.NewSource(12))
-	n := 3000
-	if testing.Short() {
-		n = 300
-	}
-	for i := 0; i < n; i++ {
-		sw, sh, dw, dh := randomGeometry(rnd)
-		ch := []int{1, 4, 1, 4, 2, 3}[i%6]
-		checkRescale(t, rnd, sw, sh, dw, dh, ch, nil)
-	}
+	forEachLevel(t, func(t *testing.T) {
+		rnd := rand.New(rand.NewSource(12))
+		n := 3000
+		if testing.Short() {
+			n = 300
+		}
+		for i := 0; i < n; i++ {
+			sw, sh, dw, dh := randomGeometry(rnd)
+			ch := []int{1, 4, 1, 4, 2, 3}[i%6]
+			checkRescale(t, rnd, sw, sh, dw, dh, ch, nil)
+		}
+	})
 }
 
 func FuzzExportKernels(f *testing.F) {
 	f.Add(uint16(100), uint16(100), uint16(30), uint16(40), uint8(4), int64(1))
 	f.Add(uint16(30), uint16(20), uint16(70), uint16(90), uint8(1), int64(2))
 	f.Fuzz(func(t *testing.T, sw, sh, dw, dh uint16, ch uint8, seed int64) {
-		w, h, ow, oh := int(sw%400)+1, int(sh%400)+1, int(dw%400)+1, int(dh%400)+1
-		checkRescale(t, rand.New(rand.NewSource(seed)), w, h, ow, oh, int(ch%4)+1, nil)
+		eachLevel(func() {
+			w, h, ow, oh := int(sw%400)+1, int(sh%400)+1, int(dw%400)+1, int(dh%400)+1
+			checkRescale(t, rand.New(rand.NewSource(seed)), w, h, ow, oh, int(ch%4)+1, nil)
+		})
 	})
 }
 
-// BenchmarkKernels compares the selected kernels ("sel": assembly where
-// available) with the Go ones on single rows.
+// BenchmarkKernels compares the selected kernels (assembly where available:
+// "sel", or on amd64 each SIMD level by name) with the Go ones ("go") on
+// single rows.
 func BenchmarkKernels(b *testing.B) {
+	defer restoreLevel()
+	levels, setLevel := benchLevels()
 	rnd := rand.New(rand.NewSource(15))
 	for _, c := range []struct{ sw, dw, ch int }{
-		{1024, 300, 4}, {3000, 320, 4}, {300, 1024, 4},
-		{512, 320, 1}, {1024, 320, 1}, {1500, 320, 1}, {3000, 320, 1}, {3000, 100, 1},
+		{1024, 300, 4}, {3000, 320, 4}, {300, 1024, 4}, {300, 1024, 1}, {250, 320, 1},
+		{338, 320, 1}, {512, 320, 1}, {675, 320, 1}, {1024, 320, 1}, {1500, 320, 1},
+		{3000, 320, 1}, {4000, 320, 1}, {3000, 100, 1},
 	} {
-		rs, err := New(c.sw, 2, c.dw, 1, c.ch)
-		if err != nil {
-			b.Fatal(err)
-		}
 		src := randomPixels(rnd, c.sw*c.ch)
-		for _, ref := range []bool{false, true} {
-			name := map[bool]string{false: "sel", true: "go"}[ref]
+		for li := 0; li <= len(levels); li++ {
+			name, ref := "go", li == len(levels)
+			if !ref {
+				name = levels[li]
+				setLevel(li)
+			}
+			rs, err := New(c.sw, 2, c.dw, 1, c.ch)
+			if err != nil {
+				b.Fatal(err)
+			}
 			b.Run(fmt.Sprintf("import/%dto%dx%d/%s", c.sw, c.dw, c.ch, name), func(b *testing.B) {
 				b.SetBytes(int64(len(src)))
 				for i := 0; i < b.N; i++ {
@@ -276,13 +293,23 @@ func BenchmarkKernels(b *testing.B) {
 		{"exportShrink",
 			func() { exportShrink(dst, irow, frow, 0x12345678, 0x9abc) },
 			func() { exportShrinkGo(dst, irow, frow, 0x12345678, 0x9abc) }},
+		{"exportShrinkZero",
+			func() { exportShrinkZero(dst, irow, 0x9abc) },
+			func() { exportShrinkZeroGo(dst, irow, 0x9abc) }},
+		{"exportExpand",
+			func() { exportExpand(dst, frow, 0x9abc) },
+			func() { exportExpandGo(dst, frow, 0x9abc) }},
 		{"exportExpandMix",
 			func() { exportExpandMix(dst, frow, irow, 0x40000000, 0xc0000000, 0x9abc) },
 			func() { exportExpandMixGo(dst, frow, irow, 0x40000000, 0xc0000000, 0x9abc) }},
 	} {
-		for _, ref := range []bool{false, true} {
-			f := map[bool]func(){false: k.sel, true: k.ref}[ref]
-			b.Run(k.name+"/"+map[bool]string{false: "sel", true: "go"}[ref], func(b *testing.B) {
+		for li := 0; li <= len(levels); li++ {
+			name, f := "go", k.ref
+			if li < len(levels) {
+				name, f = levels[li], k.sel
+				setLevel(li)
+			}
+			b.Run(k.name+"/"+name, func(b *testing.B) {
 				b.SetBytes(n)
 				for i := 0; i < b.N; i++ {
 					f()
@@ -341,19 +368,23 @@ func checkExportRow(t testing.TB, rnd *rand.Rand, n int) {
 }
 
 func TestExportRowKernels(t *testing.T) {
-	rnd := rand.New(rand.NewSource(14))
-	n := 200000
-	if testing.Short() {
-		n = 20000
-	}
-	for i := 0; i < n; i++ {
-		checkExportRow(t, rnd, rnd.Intn(80))
-	}
+	forEachLevel(t, func(t *testing.T) {
+		rnd := rand.New(rand.NewSource(14))
+		n := 200000
+		if testing.Short() {
+			n = 20000
+		}
+		for i := 0; i < n; i++ {
+			checkExportRow(t, rnd, rnd.Intn(80))
+		}
+	})
 }
 
 func FuzzExportRowKernels(f *testing.F) {
 	f.Add(uint16(37), int64(1))
 	f.Fuzz(func(t *testing.T, n uint16, seed int64) {
-		checkExportRow(t, rand.New(rand.NewSource(seed)), int(n%4096))
+		eachLevel(func() {
+			checkExportRow(t, rand.New(rand.NewSource(seed)), int(n%4096))
+		})
 	})
 }

@@ -92,13 +92,15 @@ func runOp(t testing.TB, r goldenRec) []byte {
 }
 
 func TestGoldenLibwebp(t *testing.T) {
-	rs := readGolden(t, "testdata/golden.bin.gz")
-	if len(rs) == 0 {
-		t.Fatal("no golden records")
-	}
-	for i, r := range rs {
-		if got := runOp(t, r); !bytes.Equal(got, r.out) {
-			t.Errorf("record %d (op %d, params %v): mismatch with libwebp", i, r.op, r.p)
+	forEachLevel(t, func(t *testing.T) {
+		rs := readGolden(t, "testdata/golden.bin.gz")
+		if len(rs) == 0 {
+			t.Fatal("no golden records")
 		}
-	}
+		for i, r := range rs {
+			if got := runOp(t, r); !bytes.Equal(got, r.out) {
+				t.Errorf("record %d (op %d, params %v): mismatch with libwebp", i, r.op, r.p)
+			}
+		}
+	})
 }

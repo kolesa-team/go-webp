@@ -71,24 +71,26 @@ func randomGeometry(r *rand.Rand) (sw, sh, dw, dh int) {
 // TestLegacyEquivalence checks the table-driven rescaler (with whatever
 // kernels this build selects) against the legacy line-by-line port.
 func TestLegacyEquivalence(t *testing.T) {
-	r := rand.New(rand.NewSource(7))
-	n := 3000
-	if testing.Short() {
-		n = 600
-	}
-	for i := 0; i < n; i++ {
-		sw, sh, dw, dh := randomGeometry(r)
-		ch := 1 + r.Intn(4)
-		if i%3 != 0 {
-			ch = []int{1, 4}[r.Intn(2)]
+	forEachLevel(t, func(t *testing.T) {
+		r := rand.New(rand.NewSource(7))
+		n := 3000
+		if testing.Short() {
+			n = 600
 		}
-		src := randomPixels(r, sw*sh*ch)
-		want := rescaleLegacy(t, src, sw, sh, dw, dh, ch)
-		got := rescaleAll(t, src, sw, sh, dw, dh, ch)
-		if !bytes.Equal(got, want) {
-			t.Fatalf("%dx%d -> %dx%d, %d channels: output differs from the legacy rescaler", sw, sh, dw, dh, ch)
+		for i := 0; i < n; i++ {
+			sw, sh, dw, dh := randomGeometry(r)
+			ch := 1 + r.Intn(4)
+			if i%3 != 0 {
+				ch = []int{1, 4}[r.Intn(2)]
+			}
+			src := randomPixels(r, sw*sh*ch)
+			want := rescaleLegacy(t, src, sw, sh, dw, dh, ch)
+			got := rescaleAll(t, src, sw, sh, dw, dh, ch)
+			if !bytes.Equal(got, want) {
+				t.Fatalf("%dx%d -> %dx%d, %d channels: output differs from the legacy rescaler", sw, sh, dw, dh, ch)
+			}
 		}
-	}
+	})
 }
 
 // TestColumnTable checks the column table invariants the assembly relies
