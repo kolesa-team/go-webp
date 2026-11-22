@@ -1,0 +1,296 @@
+// The MIT License (MIT)
+//
+// Copyright (c) 2019 Amangeldy Kadyl
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy of
+// this software and associated documentation files (the "Software"), to deal in
+// the Software without restriction, including without limitation the rights to
+// use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+// the Software, and to permit persons to whom the Software is furnished to do so,
+// subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+// FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+// COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+// IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+// CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+package vp8lenc
+
+import "sync"
+
+// scratch holds all reusable buffers of one encoding goroutine.
+type scratch struct {
+	hc      hashChain
+	hcBox   hashChain // matches of the box LZ77 parse
+	counts  []uint16  // pixel repetition counts (box LZ77)
+	refs    [4][]pixOrCopy
+	cm      costModel
+	costMgr costManager
+	tmpSet  histoSet
+	clus    clusterer
+	out     histoSet
+	huff    huffScratch
+	lens    []uint8
+	codes   []uint16
+	hcodes  []huffCode
+
+	costRing *[costRing]int64 // trace backwards costs
+	ccost    []int64
+	u16buf   []uint16
+	cache    []uint32
+	u32abuf  []uint32
+	resid    []uint32
+	curbuf   []uint32 // working copy of the image (encodeStream)
+	rowa     []uint32
+	rowb     []uint32
+	idxRow   []uint8
+	md       []uint8  // near-lossless max diffs, or cleanMask
+	predMode []uint32 // mode images of all the samplings (predSearch)
+	predHist []histo4 // per sampling and mode residual histograms
+	predAccH []histo4 // per sampling accumulated histograms
+	tile     tilePixels
+
+	bwTmp [2]bitWriter
+
+	// ThreadLevel only.
+	crew      crew         // helpers of the parallel stages (stopped by the encode)
+	predBatch []histo4     // per tile and mode histograms (predSearch.runPar)
+	predWork  []predWorker // per goroutine buffers (predSearch.runPar)
+	hcChain   []uint32     // hash chain kept apart from the results (fillStripes)
+	hcMarks   []uint64     // positions searched by the stripes
+	hcExits   []int        // last position searched by each stripe
+
+	sub *scratch // for sub-images encoded while the main buffers are in use
+
+	// pixels is the largest image (in pixels) this scratch has served; its
+	// buffers are sized accordingly.
+	pixels int
+
+	// interrupt is Config.Interrupt of the encode the scratch serves: long
+	// loops poll it to stop early.
+	interrupt func() bool
+}
+
+func (s *scratch) interrupted() bool { return s.interrupt != nil && s.interrupt() }
+
+// maxPooledPixels bounds the image size whose scratch is kept in the
+// sync.Pool when the free list (see freelist.go), which has a budget, does
+// not take it: the buffers of a large encode (hundreds of MB for 12 MP) are
+// left to the garbage collector instead of being retained until the next
+// collections.
+const maxPooledPixels = 2 << 20
+
+// minScratchFit is the image size (in pixels) up to which a scratch from
+// the free list serves an image of any size.
+const minScratchFit = 1 << 20
+
+var scratchPool = sync.Pool{New: func() any { return new(scratch) }}
+
+// getScratch returns a scratch for an image of n pixels: the most recently
+// returned one of the free list not sized for an image more than 4 times
+// larger (whose buffers an encode of that size could reuse), else one from
+// the pool.
+func getScratch(n int) *scratch {
+	if s, ok := scratchFree.Get(func(s *scratch) bool { return s.pixels <= max(4*n, minScratchFit) }); ok {
+		return s
+	}
+	return scratchPool.Get().(*scratch)
+}
+
+// putScratch returns s to the free list if the budget allows, else to the
+// pool unless it served an image larger than maxPooledPixels (dropping it
+// bounds the memory retained by the pool).
+func putScratch(s *scratch) {
+	s.interrupt = nil // do not retain the caller's closure in the free list or pool
+	if scratchFree.Put(s, s.bytes()) || s.pixels > maxPooledPixels {
+		return
+	}
+	scratchPool.Put(s)
+}
+
+// noteSize records that s is used for an image of n pixels.
+func (s *scratch) noteSize(n int) {
+	s.pixels = max(s.pixels, n)
+}
+
+func (s *scratch) child() *scratch {
+	if s.sub == nil {
+		s.sub = new(scratch)
+	}
+	return s.sub
+}
+
+func (s *scratch) u16(n int) []uint16 {
+	if cap(s.u16buf) < n {
+		s.u16buf = make([]uint16, n)
+	}
+	return s.u16buf[:n]
+}
+
+func (s *scratch) u32a(n int) []uint32 {
+	if cap(s.u32abuf) < n {
+		s.u32abuf = make([]uint32, n)
+	}
+	return s.u32abuf[:n]
+}
+
+// cacheBuf returns a zeroed buffer of n entries.
+func (s *scratch) cacheBuf(n int) []uint32 {
+	if cap(s.cache) < n {
+		s.cache = make([]uint32, n)
+	}
+	c := s.cache[:n]
+	for i := range c {
+		c[i] = 0
+	}
+	return c
+}
+
+// curBuf returns the working image buffer of n entries (contents
+// unspecified).
+func (s *scratch) curBuf(n int) []uint32 {
+	if cap(s.curbuf) < n {
+		s.curbuf = make([]uint32, n)
+	}
+	return s.curbuf[:n]
+}
+
+func (s *scratch) residBuf(n int) []uint32 {
+	if cap(s.resid) < n {
+		s.resid = make([]uint32, n)
+	}
+	return s.resid[:n]
+}
+
+func (s *scratch) rowA(n int) []uint32 {
+	if cap(s.rowa) < n {
+		s.rowa = make([]uint32, n)
+	}
+	return s.rowa[:n]
+}
+
+func (s *scratch) rowB(n int) []uint32 {
+	if cap(s.rowb) < n {
+		s.rowb = make([]uint32, n)
+	}
+	return s.rowb[:n]
+}
+
+func (s *scratch) idx(n int) []uint8 {
+	if cap(s.idxRow) < n {
+		s.idxRow = make([]uint8, n)
+	}
+	return s.idxRow[:n]
+}
+
+// tmpHisto returns a cleared single histogram with the given cache bits.
+func (s *scratch) tmpHisto(cacheBits int) *histo {
+	s.tmpSet.init(1, cacheBits)
+	return &s.tmpSet.h[0]
+}
+
+// refsBuf returns refs buffer i with capacity for at least n entries.
+func (s *scratch) refsBuf(i, n int) []pixOrCopy {
+	if cap(s.refs[i]) < n {
+		s.refs[i] = make([]pixOrCopy, 0, n)
+	}
+	return s.refs[i][:0]
+}
+
+func (s *scratch) maxDiffs(n int) []uint8 {
+	if cap(s.md) < n {
+		s.md = make([]uint8, n)
+	}
+	return s.md[:n]
+}
+
+func (s *scratch) predModeBuf(n int) []uint32 {
+	if cap(s.predMode) < n {
+		s.predMode = make([]uint32, n)
+	}
+	return s.predMode[:n]
+}
+
+// predHistos returns n cleared histograms.
+func (s *scratch) predHistos(n int) []histo4 {
+	if cap(s.predHist) < n {
+		s.predHist = make([]histo4, n)
+	}
+	h := s.predHist[:n]
+	clear(h)
+	return h
+}
+
+// predAcc returns n cleared histograms.
+func (s *scratch) predAcc(n int) []histo4 {
+	if cap(s.predAccH) < n {
+		s.predAccH = make([]histo4, n)
+	}
+	h := s.predAccH[:n]
+	clear(h)
+	return h
+}
+
+// predBatchBufs returns n histograms (contents unspecified).
+func (s *scratch) predBatchBufs(n int) []histo4 {
+	if cap(s.predBatch) < n {
+		s.predBatch = make([]histo4, n)
+	}
+	return s.predBatch[:n]
+}
+
+// predWorkers returns the buffers of n goroutines of predSearch.runPar.
+func (s *scratch) predWorkers(n, resid, row int) []predWorker {
+	if len(s.predWork) < n {
+		s.predWork = append(s.predWork, make([]predWorker, n-len(s.predWork))...)
+	}
+	w := s.predWork[:n]
+	for i := range w {
+		if cap(w[i].resid) < resid {
+			w[i].resid = make([]uint32, resid)
+		}
+		if cap(w[i].rowCur) < row {
+			w[i].rowCur = make([]uint32, row)
+			w[i].rowUp = make([]uint32, row)
+		}
+		w[i].resid, w[i].rowCur, w[i].rowUp = w[i].resid[:resid], w[i].rowCur[:row], w[i].rowUp[:row]
+	}
+	return w
+}
+
+// hcChainBuf returns a buffer of n entries (contents unspecified).
+func (s *scratch) hcChainBuf(n int) []uint32 {
+	if cap(s.hcChain) < n {
+		s.hcChain = make([]uint32, n)
+	}
+	return s.hcChain[:n]
+}
+
+// hcMarkBuf returns n cleared words.
+func (s *scratch) hcMarkBuf(n int) []uint64 {
+	if cap(s.hcMarks) < n {
+		s.hcMarks = make([]uint64, n)
+	}
+	m := s.hcMarks[:n]
+	clear(m)
+	return m
+}
+
+func (s *scratch) hcExitBuf(n int) []int {
+	if cap(s.hcExits) < n {
+		s.hcExits = make([]int, n)
+	}
+	return s.hcExits[:n]
+}
+
+func (s *scratch) cacheCosts(n int) []int64 {
+	if cap(s.ccost) < n {
+		s.ccost = make([]int64, n)
+	}
+	return s.ccost[:n]
+}

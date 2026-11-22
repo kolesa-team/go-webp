@@ -21,12 +21,16 @@
 
 package main
 
+// Encodes test_data/images/source.jpg to example/output_encode.webp.
+// Run from the repository root: go run ./_examples/encode
+
 import (
-	"github.com/kolesa-team/go-webp/encoder"
-	"github.com/kolesa-team/go-webp/webp"
 	"image/jpeg"
 	"log"
 	"os"
+
+	"github.com/kolesa-team/go-webp/v2/encoder"
+	"github.com/kolesa-team/go-webp/v2/webp"
 )
 
 func main() {
@@ -34,25 +38,32 @@ func main() {
 	if err != nil {
 		log.Fatalln(err)
 	}
+	//noinspection GoUnhandledErrorResult
+	defer file.Close()
 
 	img, err := jpeg.Decode(file)
 	if err != nil {
 		log.Fatalln(err)
 	}
 
-	output, err := os.Create("example/output_encode.webp")
-	if err != nil {
-		log.Fatal(err)
-	}
-	//noinspection GoUnhandledErrorResult
-	defer output.Close()
-
 	options, err := encoder.NewLossyEncoderOptions(encoder.PresetDefault, 75)
 	if err != nil {
 		log.Fatalln(err)
 	}
 
+	if err := os.MkdirAll("example", 0o755); err != nil {
+		log.Fatalln(err)
+	}
+	output, err := os.Create("example/output_encode.webp")
+	if err != nil {
+		log.Fatalln(err)
+	}
+
 	if err := webp.Encode(output, img, options); err != nil {
+		output.Close()
+		log.Fatalln(err)
+	}
+	if err := output.Close(); err != nil {
 		log.Fatalln(err)
 	}
 }

@@ -1,0 +1,129 @@
+// The MIT License (MIT)
+//
+// Copyright (c) 2019 Amangeldy Kadyl
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy of
+// this software and associated documentation files (the "Software"), to deal in
+// the Software without restriction, including without limitation the rights to
+// use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+// the Software, and to permit persons to whom the Software is furnished to do so,
+// subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+// FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+// COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+// IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+// CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+package decoder
+
+import (
+	"bytes"
+	"image"
+	"os"
+	"path/filepath"
+	"runtime"
+	"testing"
+	"time"
+)
+
+// FuzzDecode feeds arbitrary files and options through the public decoder:
+// it must never panic or hang, whatever the input.
+func FuzzDecode(f *testing.F) {
+	files, _ := filepath.Glob("../test_data/images/*.webp")
+	files = append(files, "testdata/alpha_bomb_vp8_truncated.webp", "testdata/alpha_truncated_both.webp")
+	for _, name := range files {
+		data, err := os.ReadFile(name)
+		if err != nil || len(data) > 100<<10 {
+			continue
+		}
+		f.Add(data, uint8(0), uint16(0), uint16(0))
+		f.Add(data, uint8(0xff), uint16(0x1234), uint16(0x0505))
+	}
+	f.Fuzz(func(t *testing.T, data []byte, flags uint8, crop, scale uint16) {
+		o := &Options{
+			BypassFiltering:        flags&1 != 0,
+			NoFancyUpsampling:      flags&2 != 0,
+			UseThreads:             flags&4 != 0,
+			Flip:                   flags&8 != 0,
+			DitheringStrength:      int(flags>>4) * 7,
+			AlphaDitheringStrength: int(flags>>4) * 7,
+		}
+		if crop != 0 {
+			o.Crop = image.Rectangle{
+				Min: image.Pt(int(crop&0xf), int(crop>>4&0xf)),
+				Max: image.Pt(int(crop>>8&0xf)+1, int(crop>>12)+1),
+			}
+		}
+		if scale != 0 {
+			o.Scale = image.Rectangle{Max: image.Pt(int(scale&0xff)+1, int(scale>>8)+1)}
+		}
+		d, err := NewDecoder(bytes.NewReader(data), o)
+		if err != nil {
+			return
+		}
+		feat := d.GetFeatures()
+		if px := uint64(feat.Width) * uint64(feat.Height); px > 1<<22 {
+			// Large declared frames: only decode a small window (to keep the
+			// fuzzer fast) and check that nothing proportional to the full
+			// RGBA frame is allocated. The alpha plane (1 byte per pixel)
+			// and lossless transform sub-images (< 1 byte per pixel) are
+			// legitimately sized by the declared dimensions.
+			o.Crop = image.Rectangle{Max: image.Pt(16, 16)}
+			o.Scale = image.Rectangle{}
+			o.Flip = false
+			d, err := NewDecoder(bytes.NewReader(data), o)
+			if err != nil {
+				return
+			}
+			var m0, m1 runtime.MemStats
+			runtime.ReadMemStats(&m0)
+			start := time.Now()
+			_, _ = d.Decode()
+			elapsed := time.Since(start)
+			runtime.ReadMemStats(&m1)
+			// Only the rows down to the window are decoded, so neither the
+			// alpha plane nor the pixels below the window may cost time
+			// or memory; the lossless transform and entropy sub-images
+			// (at most 3/4 byte per pixel) are sized by the declared
+			// dimensions.
+			if a, limit := m1.TotalAlloc-m0.TotalAlloc, 64<<20+px; a > limit {
+				t.Fatalf("%dx%d frame: decoding a 16x16 window allocated %d bytes (limit %d)", feat.Width, feat.Height, a, limit)
+			}
+			if elapsed > 5*time.Second {
+				t.Fatalf("%dx%d frame: decoding a 16x16 window took %v", feat.Width, feat.Height, elapsed)
+			}
+			return
+		}
+		img, err := d.Decode()
+		if err == nil && img.Bounds().Empty() {
+			t.Fatal("empty image without error")
+		}
+
+		// DecodeInto a dirty buffer that is just large enough must give the
+		// same pixels (every output byte is written) and the same error.
+		n := 64
+		if err == nil {
+			n = len(img.(*image.NRGBA).Pix)
+		}
+		dst := dirty(n)
+		got, err2 := newDec(t, data, o).DecodeInto(dst)
+		switch {
+		case (err == nil) != (err2 == nil):
+			t.Fatalf("Decode: %v, DecodeInto: %v", err, err2)
+		case err != nil && err.Error() != err2.Error():
+			t.Fatalf("Decode: %v, DecodeInto: %v", err, err2)
+		case err == nil && !bytes.Equal(img.(*image.NRGBA).Pix, got.Pix):
+			t.Fatal("DecodeInto pixels differ from Decode")
+		}
+
+		// The Y'CbCr output must not panic either.
+		if ycc, err := newDec(t, data, o).DecodeNYCbCrA(); err == nil && ycc.Rect.Empty() {
+			t.Fatal("empty Y'CbCr image without error")
+		}
+	})
+}

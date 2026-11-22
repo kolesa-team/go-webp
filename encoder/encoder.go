@@ -19,62 +19,77 @@
 // IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 // CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+// Package encoder encodes images to WebP, lossy (VP8) or lossless (VP8L),
+// with a pure Go implementation of libwebp's encoders.
 package encoder
 
-/*
-
-#cgo linux LDFLAGS: -lwebp
-#cgo darwin pkg-config: libwebp
-#cgo windows LDFLAGS: -lwebp
-#include <stdlib.h>
-#include <webp/encode.h>
-static uint8_t* encodeNRBBA(WebPConfig* config, const uint8_t* rgba, int width, int height, int stride, size_t* output_size) {
-	WebPPicture pic;
-	WebPMemoryWriter wrt;
-	int ok;
-
-	if (!WebPPictureInit(&pic)) {
-		return NULL;
-	}
-
-	pic.use_argb = 1;
-	pic.width = width;
-	pic.height = height;
-	pic.writer = WebPMemoryWrite;
-	pic.custom_ptr = &wrt;
-	WebPMemoryWriterInit(&wrt);
-
-	ok = WebPPictureImportRGBA(&pic, rgba, stride) && WebPEncode(config, &pic);
-	WebPPictureFree(&pic);
-
-	if (!ok) {
-		WebPMemoryWriterClear(&wrt);
-		return NULL;
-	}
-
-	*output_size = wrt.size;
-	return wrt.mem;
-}
-*/
-import "C"
 import (
+	"context"
 	"errors"
+	"fmt"
 	"image"
-	"image/draw"
 	"io"
-	"unsafe"
+	"runtime"
+	"sync"
+
+	"github.com/kolesa-team/go-webp/v2/internal/container"
+	"github.com/kolesa-team/go-webp/v2/internal/vp8enc"
+	"github.com/kolesa-team/go-webp/v2/internal/vp8lenc"
 )
+
+// maxDimension is the largest width or height of a WebP image.
+const maxDimension = 16383
+
+// ErrReleased is returned by Encode and EncodeContext when they are called
+// after Release.
+var ErrReleased = errors.New("encoder: Encode called after Release")
 
 // Encoder stores information to encode image
 type Encoder struct {
 	options *Options
-	config  *C.WebPConfig
-	img     *image.NRGBA
+	config  *Config
+	// img is the picture to encode. Like v1 (which imported the source into
+	// a WebPPicture in NewEncoder), it is a snapshot taken by NewEncoder,
+	// except for an *image.NRGBA source, which is used in place (v1 shared
+	// its pixels too): changes made to any other source after NewEncoder
+	// do not affect Encode.
+	img *image.NRGBA
+	// pic is set instead of img for *image.YCbCr sources encoded lossy:
+	// they are converted in NewEncoder straight to the encoder's YUV 4:2:0
+	// (cheaper than going through NRGBA).
+	pic *vp8enc.Picture
+	// bounds of the source image
+	bounds image.Rectangle
+
+	// mu is held for reading by every encode and for writing by Release,
+	// which therefore waits for the encodes in progress.
+	mu       sync.RWMutex
+	released bool
+	// snap is the pooled storage of the snapshot (img's pixels or pic), if
+	// any. Release hands it back to the pools; if Release is never called,
+	// cleanup does so once the Encoder is unreachable.
+	snap    *snapshot
+	cleanup runtime.Cleanup
+}
+
+// snapshot is the pooled storage of an Encoder's copy of its source. It
+// must not reference the Encoder: it is the argument of the Encoder's
+// cleanup.
+type snapshot struct {
+	pix []byte          // storage of Encoder.img, from pooledNRGBA
+	pic *vp8enc.Picture // Encoder.pic, from vp8enc.FromYCbCr
+}
+
+func (s *snapshot) release() {
+	putPix(s.pix)
+	s.pix = nil
+	s.pic.Release()
+	s.pic = nil
 }
 
 // NewEncoder return new encoder instance
 func NewEncoder(src image.Image, options *Options) (e *Encoder, err error) {
-	var config *C.WebPConfig
+	var config *Config
 
 	if options == nil {
 		options, _ = NewLossyEncoderOptions(PresetDefault, 75)
@@ -82,47 +97,256 @@ func NewEncoder(src image.Image, options *Options) (e *Encoder, err error) {
 	if config, err = options.GetConfig(); err != nil {
 		return nil, err
 	}
-
-	e = &Encoder{options: options, config: config}
-
-	switch v := src.(type) {
-	case *image.NRGBA:
-		e.img = v
-	default:
-		e.img = e.convertToNRGBA(src)
+	if src == nil {
+		return nil, errors.New("cannot encode webppicture: nil image")
 	}
 
-	return
+	e = &Encoder{options: options, config: config, bounds: src.Bounds()}
+	if !validDimensions(e.bounds) {
+		// Reported by Encode, as libwebp's WebPEncode does; skip converting
+		// a picture that cannot be encoded.
+		return e, nil
+	}
+
+	// The snapshot's storage comes from pools. Encode does not consume it
+	// (Encode may be called several times); Release returns it, and so does
+	// a cleanup, as a safety net, when the Encoder becomes unreachable.
+	s := &snapshot{}
+	if v, ok := src.(*image.NRGBA); ok {
+		e.img = v
+	} else if ycc, ok := src.(*image.YCbCr); ok && !config.Lossless {
+		e.pic = vp8enc.FromYCbCr(ycc)
+		s.pic = e.pic
+	} else {
+		e.img, s.pix = pooledNRGBA(e.bounds.Dx(), e.bounds.Dy())
+		convertNRGBA(e.img, src)
+	}
+	if s.pix != nil || s.pic != nil {
+		e.snap = s
+		e.cleanup = runtime.AddCleanup(e, (*snapshot).release, s)
+	}
+	return e, nil
+}
+
+func validDimensions(r image.Rectangle) bool {
+	w, h := r.Dx(), r.Dy()
+	return w > 0 && h > 0 && w <= maxDimension && h <= maxDimension
 }
 
 // Encode picture and flush to io.Writer
 func (e *Encoder) Encode(w io.Writer) error {
-	var size C.size_t
-
-	output := C.encodeNRBBA(
-		e.config,
-		(*C.uint8_t)(&e.img.Pix[0]),
-		C.int(e.img.Rect.Dx()),
-		C.int(e.img.Rect.Dy()),
-		C.int(e.img.Stride),
-		&size,
-	)
-
-	if output == nil || size == 0 {
-		return errors.New("cannot encode webppicture")
+	out, err := e.encode(nil)
+	if err != nil {
+		return err
 	}
-	defer C.free(unsafe.Pointer(output))
-
-	_, err := w.Write(((*[1 << 30]byte)(unsafe.Pointer(output)))[0:int(size):int(size)])
-
+	_, err = w.Write(out)
 	return err
 }
 
-// Convert picture from any image.Image type to *image.NRGBA
-// @todo optimization needed
-func (e *Encoder) convertToNRGBA(src image.Image) (dst *image.NRGBA) {
-	dst = image.NewNRGBA(src.Bounds())
-	draw.Draw(dst, dst.Bounds(), src, src.Bounds().Min, draw.Src)
+// EncodeContext is Encode, but gives up when ctx is done: the encoders
+// check ctx about once per macroblock row (lossy) and between their passes
+// and search rows (lossless), stop together with their helper goroutines,
+// and EncodeContext returns ctx.Err() (not wrapped). Nothing is written to
+// w unless ctx is still not done once the file is complete. Converting the
+// source picture, which NewEncoder does, is not covered.
+func (e *Encoder) EncodeContext(ctx context.Context, w io.Writer) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	var interrupt func() bool
+	if ctx.Done() != nil { // nil for contexts that can never be canceled
+		interrupt = func() bool { return ctx.Err() != nil }
+	}
+	out, err := e.encode(interrupt)
+	if cerr := ctx.Err(); cerr != nil && (err == nil || interrupted(err)) {
+		return cerr
+	}
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(out)
+	return err
+}
 
-	return
+// Release hands the Encoder's copy of its source picture back to internal
+// pools, so that later encodes can reuse the memory. Encode and
+// EncodeContext return ErrReleased afterwards. Release waits for the encodes
+// in progress on other goroutines; calling it again does nothing.
+//
+// Calling Release is optional: otherwise the memory is reclaimed by the
+// garbage collector (and returned to the pools once the Encoder is
+// unreachable), as with v1, which had no Release.
+func (e *Encoder) Release() {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.released {
+		return
+	}
+	e.released = true
+	if e.snap != nil {
+		e.cleanup.Stop()
+		e.snap.release()
+		e.snap = nil
+	}
+	e.img, e.pic = nil, nil
+}
+
+// encode returns the WebP file. interrupt, if not nil, is polled by the
+// encoders (see EncodeContext).
+func (e *Encoder) encode(interrupt func() bool) ([]byte, error) {
+	// Holding the read lock until the snapshot is no longer used also keeps
+	// e reachable meanwhile, so that its cleanup cannot recycle the storage
+	// under the encoders.
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.released {
+		return nil, ErrReleased
+	}
+	if !validDimensions(e.bounds) {
+		return nil, &encodeError{fmt.Errorf("bad dimension %dx%d", e.bounds.Dx(), e.bounds.Dy())}
+	}
+
+	var (
+		out []byte
+		err error
+	)
+	if e.config.Lossless {
+		out, err = e.encodeLossless(interrupt)
+	} else {
+		out, err = e.encodeLossy(interrupt)
+	}
+	if err != nil {
+		return nil, &encodeError{err}
+	}
+	return out, nil
+}
+
+// interrupted reports whether err comes from an encoder that stopped
+// because its interrupt hook asked it to.
+func interrupted(err error) bool {
+	return errors.Is(err, vp8enc.ErrInterrupted) || errors.Is(err, vp8lenc.ErrInterrupted) ||
+		errors.Is(err, errAlphaInterrupted)
+}
+
+// encodeError reports an encoding failure with exactly v1's message,
+// "cannot encode webppicture" (v1 returned it for every libwebp failure),
+// and unwraps to the detailed cause.
+type encodeError struct{ err error }
+
+func (e *encodeError) Error() string { return "cannot encode webppicture" }
+
+func (e *encodeError) Unwrap() error { return e.err }
+
+// sliceWriter collects the container output in a single, pre-sized buffer,
+// so that the destination io.Writer receives exactly one Write call.
+type sliceWriter struct{ b []byte }
+
+func (s *sliceWriter) Write(p []byte) (int, error) {
+	s.b = append(s.b, p...)
+	return len(p), nil
+}
+
+func (e *Encoder) encodeLossless(interrupt func() bool) ([]byte, error) {
+	c := e.config
+	buf, err := vp8lenc.EncodeWithHeadroom(e.img, &vp8lenc.Config{
+		Quality:         c.Quality,
+		Method:          c.Method,
+		Exact:           c.Exact,
+		NearLossless:    c.NearLossless,
+		UseDeltaPalette: c.UseDeltaPalette,
+		LowMemory:       c.LowMemory,
+		ThreadLevel:     c.ThreadLevel,
+		ImageHint:       int(c.ImageHint),
+		Interrupt:       interrupt,
+	}, container.LosslessHeaderSize)
+	if err != nil {
+		return nil, err
+	}
+	// The payload was written after LosslessHeaderSize bytes of headroom:
+	// add the RIFF headers in place instead of copying it.
+	return container.FrameLossless(buf)
+}
+
+func (e *Encoder) encodeLossy(interrupt func() bool) ([]byte, error) {
+	c := e.config
+	cfg := vp8enc.Config{
+		Quality:         c.Quality,
+		Method:          c.Method,
+		ImageHint:       int(c.ImageHint),
+		TargetSize:      c.TargetSize,
+		TargetPSNR:      c.TargetPSNR,
+		Pass:            c.Pass,
+		Segments:        c.Segments,
+		SNSStrength:     c.SNSStrength,
+		FilterStrength:  c.FilterStrength,
+		FilterSharpness: c.FilterSharpness,
+		FilterType:      c.FilterType,
+		Autofilter:      c.Autofilter,
+		Preprocessing:   c.Preprocessing,
+		Partitions:      c.Partitions,
+		PartitionLimit:  c.PartitionLimit,
+		EmulateJPEGSize: c.EmulateJPEGSize,
+		ThreadLevel:     c.ThreadLevel,
+		LowMemory:       c.LowMemory,
+		Interrupt:       interrupt,
+	}
+
+	var (
+		payload []byte
+		alph    []byte
+		err     error
+	)
+	// Without alpha the file is a simple one: the VP8 payload is written
+	// after room for the RIFF and chunk headers, which are then filled in
+	// place instead of copying the payload into a new buffer.
+	headroom := container.LossyHeaderSize
+	if e.pic != nil {
+		payload, err = vp8Encode(e.pic, &cfg, headroom)
+	} else {
+		var at *alphaTask
+		if hasTransparency(e.img) {
+			headroom = 0
+			if c.ThreadLevel {
+				// Like libwebp's alpha worker (thread_level > 0), code the
+				// alpha plane concurrently with the VP8 frame when a helper
+				// goroutine is available.
+				at = startAlpha(e.img, c, interrupt)
+			}
+			if at != nil {
+				// Joins the helper on every return path, panics included.
+				defer at.cancel()
+			} else if alph, err = alphaEncode(e.img, c, interrupt); err != nil {
+				return nil, err
+			}
+		}
+		dithering := vp8enc.DitheringFor(&vp8enc.Config{Quality: c.Quality, Preprocessing: c.Preprocessing})
+		pic := vp8enc.FromNRGBADithered(e.img, c.UseSharpYUV || c.Preprocessing&4 != 0, c.Exact, dithering)
+		payload, err = vp8Encode(pic, &cfg, headroom)
+		pic.Release()
+		if at != nil {
+			// The sequential order codes the alpha plane first, so its
+			// errors take precedence, except an interruption caused by the
+			// failure of the VP8 frame.
+			var aerr error
+			alph, aerr = at.wait(err != nil)
+			if aerr != nil && (err == nil || !interrupted(aerr)) {
+				return nil, aerr
+			}
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	if headroom > 0 {
+		return container.FrameLossy(payload)
+	}
+
+	sw := sliceWriter{b: make([]byte, 0, len(payload)+len(alph)+64)}
+	if err := container.WriteLossy(&sw, e.bounds.Dx(), e.bounds.Dy(), payload, alph); err != nil {
+		return nil, err
+	}
+	return sw.b, nil
 }
