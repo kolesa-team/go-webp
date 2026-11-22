@@ -59,6 +59,7 @@ import (
 	"errors"
 
 	"github.com/kolesa-team/go-webp/v2/internal/status"
+	"github.com/kolesa-team/go-webp/v2/utils"
 )
 
 // MaxDimension is the largest width or height the VP8 bitstream can carry.
@@ -118,6 +119,13 @@ type Config struct {
 
 // ErrInterrupted is returned by Encode when Config.Interrupt asked it to stop.
 var ErrInterrupted = errors.New("vp8enc: interrupted")
+
+// ErrTooManyTokens is returned by Encode when a coding pass records more
+// coefficient tokens than the encoder can index (maxTokens). That takes a
+// picture close to MaxDimension in both directions with noise-like content
+// at a high quality, and about 4 GiB of tokens. libwebp reports running
+// out of memory for its token buffer, so the status is OutOfMemory.
+var ErrTooManyTokens = status.New(utils.Vp8StatusOutOfMemory, "vp8enc: too many coefficient tokens")
 
 // interrupted polls c.Interrupt.
 func (c *Config) interrupted() bool { return c.Interrupt != nil && c.Interrupt() }

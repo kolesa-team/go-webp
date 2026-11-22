@@ -211,8 +211,9 @@ type wfState struct {
 	nextRow     atomic.Int32 // next row to take
 	epoch       atomic.Int32 // cost table refreshes done
 	committed   atomic.Int32 // rows committed
-	stopped     atomic.Bool  // interrupted, or a worker panicked
+	stopped     atomic.Bool  // interrupted, too many tokens, or a worker panicked
 	interrupted atomic.Bool
+	tooMany     atomic.Bool // a commit would have exceeded maxTokens
 
 	rows  []wfRow
 	slots []wfSlot
@@ -262,7 +263,7 @@ func (e *encoder) codePassWavefront(nw int, isLastPass bool, maxCount int) (size
 		its[n], tasks[n] = sit, t
 		n++
 	}
-	joined, interrupted := false, false
+	joined, interrupted, tooMany := false, false, false
 	join := func() {
 		// Wait for every helper before recycling anything, then re-raise
 		// a helper panic, if any.
@@ -271,8 +272,10 @@ func (e *encoder) codePassWavefront(nw int, isLastPass bool, maxCount int) (size
 		}
 		joined = true
 		// Read only now: a helper may still poll Interrupt for the last
-		// rows after the calling goroutine ran out of rows.
+		// rows after the calling goroutine ran out of rows, and commit
+		// them.
 		interrupted = wf.interrupted.Load()
+		tooMany = wf.tooMany.Load()
 		for k := range wf.nw {
 			e.mergeMaxEdge(wf.workers[k].it)
 			sizeP0 += wf.workers[k].sizeP0
@@ -305,6 +308,9 @@ func (e *encoder) codePassWavefront(nw int, isLastPass bool, maxCount int) (size
 	if interrupted {
 		return 0, 0, true, ErrInterrupted
 	}
+	if tooMany {
+		return 0, 0, true, ErrTooManyTokens
+	}
 	return sizeP0, distortion, true, nil
 }
 
@@ -323,6 +329,7 @@ func (wf *wfState) init(e *encoder, nw int, isLastPass bool, maxCount int) {
 	wf.committed.Store(0)
 	wf.stopped.Store(false)
 	wf.interrupted.Store(false)
+	wf.tooMany.Store(false)
 	wf.rows = wfRowPool.Get(wf.mbH)
 	for r := range wf.rows {
 		wf.rows[r].prog.Store(0)
@@ -481,10 +488,9 @@ func (wf *wfState) awaitMB(w *wfWorker, r, x int, seen *wfSeen) bool {
 // earlier macroblocks, which it first waits for (the rows above) and
 // commits (this row's).
 func (wf *wfState) refresh(w *wfWorker, r, x int, epoch int32) bool {
-	if !wf.await(w, -1, 0, 0, epoch-1, int32(r)) {
+	if !wf.await(w, -1, 0, 0, epoch-1, int32(r)) || !wf.commit(r, x) {
 		return false
 	}
-	wf.commit(r, x)
 	p := &wf.e.proba
 	p.finalizeTokenProbas()
 	p.calculateLevelCosts()
@@ -518,7 +524,9 @@ func (wf *wfState) finishRow(r int) {
 	mine := int(wf.committed.Load()) == r
 	wf.mu.Unlock()
 	for mine && !wf.stopped.Load() {
-		wf.commit(r, wf.mbW)
+		if !wf.commit(r, wf.mbW) {
+			return
+		}
 		wf.mu.Lock()
 		wf.slots[r%nslots].finished = false
 		r++
@@ -532,20 +540,29 @@ func (wf *wfState) finishRow(r int) {
 // commit commits macroblocks [commitX, x1) of row r: it appends their
 // tokens to e.tokens, accumulates their token statistics and autofilter
 // values. Rows are committed in raster order, as the sequential pass
-// records them.
-func (wf *wfState) commit(r, x1 int) {
+// records them. If the tokens would take e.tokens past maxTokens, it
+// commits nothing, stops the pass and returns false.
+//
+// A slot holds one row's tokens, at most a few million (mbW <= 1024), so
+// the slot's int32 offsets (mbEnd) cannot overflow.
+func (wf *wfState) commit(r, x1 int) bool {
 	e := wf.e
 	s := &wf.slots[r%len(wf.slots)]
 	x0 := s.commitX
 	if x0 >= x1 {
-		return
+		return true
+	}
+	start, end := int(s.mbEnd[x0]), int(s.mbEnd[x1])
+	if e.tokens.len()+(end-start) > maxTokens {
+		wf.tooMany.Store(true)
+		wf.stop()
+		return false
 	}
 	base := r * wf.mbW
 	off := int32(e.tokens.len()) - s.mbEnd[x0]
 	for x := x0; x < x1; x++ {
 		e.mbTokStart[base+x] = s.mbEnd[x] + off
 	}
-	start, end := int(s.mbEnd[x0]), int(s.mbEnd[x1])
 	for i := start; i < end; {
 		c := s.tokens.chunk(i, end)
 		e.tokens.appendTokens(c)
@@ -564,6 +581,7 @@ func (wf *wfState) commit(r, x1 int) {
 		}
 	}
 	s.commitX = x1
+	return true
 }
 
 // ready reports whether w's wait is over (under mu).
