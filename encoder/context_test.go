@@ -26,11 +26,10 @@ import (
 	"context"
 	"fmt"
 	"image"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/stretchr/testify/require"
 
 	"github.com/kolesa-team/go-webp/v2/internal/workers"
 )
@@ -97,15 +96,24 @@ type contextCase struct {
 }
 
 func contextCases(t *testing.T) []contextCase {
+	t.Helper()
 	lossy, err := NewLossyEncoderOptions(PresetDefault, 75)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewLossyEncoderOptions: %v", err)
+	}
 	multiPass, err := NewLossyEncoderOptions(PresetDefault, 75)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewLossyEncoderOptions: %v", err)
+	}
 	multiPass.Pass, multiPass.TargetSize = 4, 3000
 	ll6, err := NewLosslessEncoderOptions(PresetDefault, 6)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewLosslessEncoderOptions(6): %v", err)
+	}
 	ll9, err := NewLosslessEncoderOptions(PresetDefault, 9)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewLosslessEncoderOptions(9): %v", err)
+	}
 	srcs := sourceImages(67, 45, 11)
 	return []contextCase{
 		{"lossy", srcs[1], lossy},
@@ -125,26 +133,42 @@ func TestEncodeContextPolls(t *testing.T) {
 	checkNoLeak(t)
 	for _, tc := range contextCases(t) {
 		e, err := NewEncoder(tc.img, tc.o)
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("%s: NewEncoder: %v", tc.name, err)
+		}
 		var want bytes.Buffer
-		require.NoError(t, e.Encode(&want))
+		if err := e.Encode(&want); err != nil {
+			t.Fatalf("%s: Encode: %v", tc.name, err)
+		}
 
 		never := newPollCtx(0)
 		var got bytes.Buffer
-		require.NoError(t, e.EncodeContext(never, &got), tc.name)
-		require.Equal(t, want.Bytes(), got.Bytes(), tc.name)
+		if err := e.EncodeContext(never, &got); err != nil {
+			t.Fatalf("%s: EncodeContext: %v", tc.name, err)
+		}
+		if !bytes.Equal(got.Bytes(), want.Bytes()) {
+			t.Fatalf("%s: EncodeContext output differs from Encode (%d bytes, want %d)", tc.name, got.Len(), want.Len())
+		}
 		polls := never.polls.Load()
 		// Before, after, and at least once during the encode.
-		require.Greater(t, polls, int64(2), tc.name)
+		if polls <= 2 {
+			t.Fatalf("%s: %d polls, want more than 2", tc.name, polls)
+		}
 
 		for _, k := range pollPoints(polls) {
 			ctx := newPollCtx(k)
 			var cw countWriter
 			err := e.EncodeContext(ctx, &cw)
-			require.Equal(t, context.Canceled, err, "%s: canceled at poll %d of %d", tc.name, k, polls)
-			require.Zero(t, cw.calls, tc.name)
+			if !reflect.DeepEqual(err, context.Canceled) {
+				t.Fatalf("%s: canceled at poll %d of %d: EncodeContext = %v, want %v", tc.name, k, polls, err, context.Canceled)
+			}
+			if cw.calls != 0 {
+				t.Fatalf("%s: canceled at poll %d: %d Write calls, want 0", tc.name, k, cw.calls)
+			}
 			extra := ctx.polls.Load() - k
-			require.LessOrEqual(t, extra, int64(16), "%s: kept polling after poll %d", tc.name, k)
+			if extra > 16 {
+				t.Fatalf("%s: kept polling after poll %d: %d more polls, want at most 16", tc.name, k, extra)
+			}
 		}
 		e.Release()
 	}
@@ -155,29 +179,43 @@ func TestEncodeContextPolls(t *testing.T) {
 func TestEncodeContextThreads(t *testing.T) {
 	checkNoLeak(t)
 	o, err := NewLossyEncoderOptions(PresetDefault, 75)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewLossyEncoderOptions: %v", err)
+	}
 	o.ThreadLevel = true
 	img := alphaImage(300, 260, 4)
 	want := encodeBytes(t, img, o)
 	for _, b := range budgets {
 		withBudget(t, b, func() {
 			e, err := NewEncoder(img, o)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("budget %s: NewEncoder: %v", b, err)
+			}
 			defer e.Release()
 			var got bytes.Buffer
-			require.NoError(t, e.EncodeContext(newPollCtx(0), &got))
-			require.Equal(t, want, got.Bytes())
+			if err := e.EncodeContext(newPollCtx(0), &got); err != nil {
+				t.Fatalf("budget %s: EncodeContext: %v", b, err)
+			}
+			if !bytes.Equal(got.Bytes(), want) {
+				t.Fatalf("budget %s: EncodeContext output differs from the sequential one (%d bytes, want %d)", b, got.Len(), len(want))
+			}
 			for _, k := range []int64{1, 2, 3, 5, 8, 13, 21, 34} {
 				var cw countWriter
 				err := e.EncodeContext(newPollCtx(k), &cw)
 				if err == nil {
 					continue // finished before the k-th poll
 				}
-				require.Equal(t, context.Canceled, err, "budget %s, poll %d", b, k)
-				require.Zero(t, cw.calls)
+				if !reflect.DeepEqual(err, context.Canceled) {
+					t.Fatalf("budget %s, poll %d: EncodeContext = %v, want %v", b, k, err, context.Canceled)
+				}
+				if cw.calls != 0 {
+					t.Fatalf("budget %s, poll %d: %d Write calls, want 0", b, k, cw.calls)
+				}
 			}
 		})
-		require.Zero(t, workers.InUse())
+		if n := workers.InUse(); n != 0 {
+			t.Fatalf("budget %s: workers.InUse() = %d, want 0", b, n)
+		}
 	}
 }
 
@@ -187,13 +225,21 @@ func TestEncodeContextNotCanceled(t *testing.T) {
 	type key struct{}
 	for _, tc := range contextCases(t) {
 		e, err := NewEncoder(tc.img, tc.o)
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("%s: NewEncoder: %v", tc.name, err)
+		}
 		var want bytes.Buffer
-		require.NoError(t, e.Encode(&want))
+		if err := e.Encode(&want); err != nil {
+			t.Fatalf("%s: Encode: %v", tc.name, err)
+		}
 		for _, c := range []context.Context{context.Background(), context.WithValue(context.Background(), key{}, 1), ctx} {
 			var got bytes.Buffer
-			require.NoError(t, e.EncodeContext(c, &got))
-			require.Equal(t, want.Bytes(), got.Bytes(), tc.name)
+			if err := e.EncodeContext(c, &got); err != nil {
+				t.Fatalf("%s: EncodeContext(%v): %v", tc.name, c, err)
+			}
+			if !bytes.Equal(got.Bytes(), want.Bytes()) {
+				t.Fatalf("%s: EncodeContext(%v) output differs from Encode (%d bytes, want %d)", tc.name, c, got.Len(), want.Len())
+			}
 		}
 		e.Release()
 	}
@@ -208,12 +254,18 @@ func TestEncodeContextDone(t *testing.T) {
 	cancel3(fmt.Errorf("custom cause"))
 	img := sourceImages(16, 16, 1)[0]
 	e, err := NewEncoder(img, nil)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewEncoder: %v", err)
+	}
 	for _, c := range []context.Context{canceled, expired, cause} {
 		var cw countWriter
 		err := e.EncodeContext(c, &cw)
-		require.Equal(t, c.Err(), err)
-		require.Zero(t, cw.calls)
+		if want := c.Err(); !reflect.DeepEqual(want, err) {
+			t.Fatalf("EncodeContext(%v) = %v, want %v", c, err, want)
+		}
+		if cw.calls != 0 {
+			t.Fatalf("EncodeContext(%v): %d Write calls, want 0", c, cw.calls)
+		}
 	}
 }
 
@@ -223,20 +275,36 @@ func TestEncodeContextOtherErrors(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	e, err := NewEncoder(image.NewNRGBA(image.Rect(0, 0, 16384, 1)), nil)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewEncoder(16384x1): %v", err)
+	}
 	err = e.EncodeContext(ctx, &bytes.Buffer{})
-	require.EqualError(t, err, "cannot encode webppicture")
+	if err == nil || err.Error() != "cannot encode webppicture" {
+		t.Fatalf("EncodeContext(16384x1) = %v, want %q", err, "cannot encode webppicture")
+	}
 
 	img := image.NewNRGBA(image.Rect(0, 0, 8, 8))
 	o, err := NewLossyEncoderOptions(PresetDefault, 75)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewLossyEncoderOptions: %v", err)
+	}
 	o.AlphaCompression = 2
 	e, err = NewEncoder(img, o)
-	require.NoError(t, err)
-	require.EqualError(t, e.EncodeContext(ctx, &bytes.Buffer{}), "cannot encode webppicture")
+	if err != nil {
+		t.Fatalf("NewEncoder(AlphaCompression 2): %v", err)
+	}
+	if err := e.EncodeContext(ctx, &bytes.Buffer{}); err == nil || err.Error() != "cannot encode webppicture" {
+		t.Fatalf("EncodeContext(AlphaCompression 2) = %v, want %q", err, "cannot encode webppicture")
+	}
 
-	require.EqualError(t, e.EncodeContext(ctx, failWriter{}), "cannot encode webppicture")
+	if err := e.EncodeContext(ctx, failWriter{}); err == nil || err.Error() != "cannot encode webppicture" {
+		t.Fatalf("EncodeContext(AlphaCompression 2, failWriter) = %v, want %q", err, "cannot encode webppicture")
+	}
 	e, err = NewEncoder(sourceImages(8, 8, 1)[0], nil)
-	require.NoError(t, err)
-	require.EqualError(t, e.EncodeContext(ctx, failWriter{}), "boom")
+	if err != nil {
+		t.Fatalf("NewEncoder(8x8): %v", err)
+	}
+	if err := e.EncodeContext(ctx, failWriter{}); err == nil || err.Error() != "boom" {
+		t.Fatalf("EncodeContext(failWriter) = %v, want %q", err, "boom")
+	}
 }

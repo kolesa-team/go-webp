@@ -27,9 +27,6 @@ import (
 	"image"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-
 	"github.com/kolesa-team/go-webp/v2/internal/status"
 	"github.com/kolesa-team/go-webp/v2/utils"
 )
@@ -42,11 +39,15 @@ type chunk struct {
 // splitChunks returns the chunks of a RIFF/WEBP file.
 func splitChunks(t testing.TB, file []byte) []chunk {
 	t.Helper()
-	require.Equal(t, "RIFF", string(file[:4]))
+	if tag := string(file[:4]); tag != "RIFF" {
+		t.Fatalf("file starts with %q, want RIFF", tag)
+	}
 	var out []chunk
 	for p := 12; p+8 <= len(file); {
 		n := int(binary.LittleEndian.Uint32(file[p+4:]))
-		require.LessOrEqual(t, p+8+n, len(file))
+		if p+8+n > len(file) {
+			t.Fatalf("chunk %q at offset %d: %d payload bytes overrun the %d-byte file", file[p:p+4], p, n, len(file))
+		}
 		out = append(out, chunk{string(file[p : p+4]), bytes.Clone(file[p+8 : p+8+n])})
 		p += 8 + n + n&1
 	}
@@ -72,7 +73,9 @@ func modifyChunk(t testing.TB, file []byte, tag string, f func([]byte) []byte) [
 			found = true
 		}
 	}
-	require.True(t, found, tag)
+	if !found {
+		t.Fatalf("no %s chunk", tag)
+	}
 	return joinChunks(chunks)
 }
 
@@ -124,7 +127,9 @@ func TestAlphaInitErrorOrder(t *testing.T) {
 	for _, c := range cases {
 		for _, o := range alphaModes {
 			err := decodeErr(t, c.data, o)
-			assert.Equal(t, c.code, status.CodeOf(err), "%s %+v: %v", c.name, o, err)
+			if code := status.CodeOf(err); code != c.code {
+				t.Errorf("%s %+v: %v: code %v, want %v", c.name, o, err, code, c.code)
+			}
 		}
 	}
 }
@@ -142,25 +147,41 @@ func TestAlphaSetUpOnCaller(t *testing.T) {
 			alph = c.data
 		}
 	}
-	require.NotNil(t, alph)
+	if alph == nil {
+		t.Fatal("webp-logo-lossy.webp has no ALPH chunk")
+	}
 	frame := image.Rect(0, 0, 3000, 2000)
 
 	a := newLazyAlpha(alph, 3000, 2000, frame, &Config{UseThreads: true})
-	assert.True(t, a.started)
-	assert.NotNil(t, a.dec)
-	require.NoError(t, a.err)
+	if !a.started {
+		t.Error("UseThreads: alpha decoder not set up by newLazyAlpha")
+	}
+	if a.dec == nil {
+		t.Error("UseThreads: alpha decoder state not taken by newLazyAlpha")
+	}
+	if a.err != nil {
+		t.Fatalf("UseThreads: newLazyAlpha: %v", a.err)
+	}
 	a.release()
 
 	a = newLazyAlpha(alph, 3000, 2000, frame, &Config{})
-	assert.False(t, a.started)
-	assert.Nil(t, a.dec)
+	if a.started {
+		t.Error("without UseThreads: alpha decoder set up by newLazyAlpha, want lazy")
+	}
+	if a.dec != nil {
+		t.Error("without UseThreads: alpha decoder state taken by newLazyAlpha, want lazy")
+	}
 	a.release()
 
 	// A broken header is reported by the first get, not before.
 	bad := append([]byte{0xc1}, alph[1:]...)
 	a = newLazyAlpha(bad, 3000, 2000, frame, &Config{UseThreads: true})
-	assert.True(t, a.started)
+	if !a.started {
+		t.Error("broken header: alpha decoder not set up by newLazyAlpha")
+	}
 	_, _, err := a.get(0, 16)
-	assert.Equal(t, utils.Vp8StatusOutOfMemory, status.CodeOf(err))
+	if code := status.CodeOf(err); code != utils.Vp8StatusOutOfMemory {
+		t.Errorf("broken header: get(0, 16) = %v: code %v, want %v", err, code, utils.Vp8StatusOutOfMemory)
+	}
 	a.release()
 }

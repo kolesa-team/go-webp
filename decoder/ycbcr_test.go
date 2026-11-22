@@ -24,10 +24,9 @@ package decoder
 import (
 	"bytes"
 	"image"
+	"reflect"
+	"strings"
 	"testing"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 
 	"github.com/kolesa-team/go-webp/v2/encoder"
 	"github.com/kolesa-team/go-webp/v2/internal/status"
@@ -60,8 +59,12 @@ func yuvToRGB(y, u, v uint8) (r, g, b uint8) {
 func checkYCbCrMatchesRGB(t *testing.T, ycc *image.YCbCr, a []byte, want *image.NRGBA, msg string) {
 	t.Helper()
 	b := want.Rect
-	require.Equal(t, b, ycc.Rect, msg)
-	require.Equal(t, image.YCbCrSubsampleRatio420, ycc.SubsampleRatio)
+	if ycc.Rect != b {
+		t.Fatalf("%s: Rect = %v, want %v", msg, ycc.Rect, b)
+	}
+	if ycc.SubsampleRatio != image.YCbCrSubsampleRatio420 {
+		t.Fatalf("%s: SubsampleRatio = %v, want %v", msg, ycc.SubsampleRatio, image.YCbCrSubsampleRatio420)
+	}
 	for y := 0; y < b.Dy(); y++ {
 		for x := 0; x < b.Dx(); x++ {
 			r, g, bb := yuvToRGB(ycc.Y[y*ycc.YStride+x], ycc.Cb[(y/2)*ycc.CStride+x/2], ycc.Cr[(y/2)*ycc.CStride+x/2])
@@ -112,18 +115,28 @@ func TestDecodeYCbCr(t *testing.T) {
 			}
 			want := decode(t, data, withNoFancy(o))
 			na, err := newDec(t, data, o).DecodeNYCbCrA()
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("%s %+v: DecodeNYCbCrA: %v", file, o, err)
+			}
 			checkYCbCrMatchesRGB(t, &na.YCbCr, na.A, want, file)
-			require.Equal(t, na.Rect.Dx(), na.AStride)
+			if na.AStride != na.Rect.Dx() {
+				t.Fatalf("%s %+v: AStride = %d, want %d", file, o, na.AStride, na.Rect.Dx())
+			}
 			if hasAlpha {
 				_, err := newDec(t, data, o).DecodeYCbCr()
-				assert.Equal(t, utils.Vp8StatusUnsupportedFeature, status.CodeOf(err))
+				if code := status.CodeOf(err); code != utils.Vp8StatusUnsupportedFeature {
+					t.Errorf("%s %+v: DecodeYCbCr with alpha: code %v, want %v", file, o, code, utils.Vp8StatusUnsupportedFeature)
+				}
 				continue
 			}
 			ycc, err := newDec(t, data, o).DecodeYCbCr()
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("%s %+v: DecodeYCbCr: %v", file, o, err)
+			}
 			checkYCbCrMatchesRGB(t, ycc, nil, want, file)
-			assert.Equal(t, &na.YCbCr, ycc)
+			if !reflect.DeepEqual(&na.YCbCr, ycc) {
+				t.Errorf("%s %+v: DecodeYCbCr differs from the Y'CbCr planes of DecodeNYCbCrA", file, o)
+			}
 		}
 	}
 }
@@ -144,14 +157,26 @@ func TestDecodeYCbCrFlip(t *testing.T) {
 	data := readFile(t, "webp-logo-lossy.webp")
 	for _, crop := range []image.Rectangle{{}, image.Rect(10, 10, 101, 77), image.Rect(0, 0, 3000, 1)} {
 		ref, err := newDec(t, data, &Options{Crop: crop}).DecodeNYCbCrA()
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("crop %v: DecodeNYCbCrA: %v", crop, err)
+		}
 		got, err := newDec(t, data, &Options{Crop: crop, Flip: true}).DecodeNYCbCrA()
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("crop %v, flipped: DecodeNYCbCrA: %v", crop, err)
+		}
 		h, ch := ref.Rect.Dy(), (ref.Rect.Dy()+1)/2
-		assert.Equal(t, flipPlane(ref.Y, ref.YStride, h), got.Y)
-		assert.Equal(t, flipPlane(ref.Cb, ref.CStride, ch), got.Cb)
-		assert.Equal(t, flipPlane(ref.Cr, ref.CStride, ch), got.Cr)
-		assert.Equal(t, flipPlane(ref.A, ref.AStride, h), got.A)
+		if want := flipPlane(ref.Y, ref.YStride, h); got.Y == nil || !bytes.Equal(want, got.Y) {
+			t.Errorf("crop %v: flipped Y plane is not the mirrored plane", crop)
+		}
+		if want := flipPlane(ref.Cb, ref.CStride, ch); got.Cb == nil || !bytes.Equal(want, got.Cb) {
+			t.Errorf("crop %v: flipped Cb plane is not the mirrored plane", crop)
+		}
+		if want := flipPlane(ref.Cr, ref.CStride, ch); got.Cr == nil || !bytes.Equal(want, got.Cr) {
+			t.Errorf("crop %v: flipped Cr plane is not the mirrored plane", crop)
+		}
+		if want := flipPlane(ref.A, ref.AStride, h); got.A == nil || !bytes.Equal(want, got.A) {
+			t.Errorf("crop %v: flipped alpha plane is not the mirrored plane", crop)
+		}
 	}
 }
 
@@ -171,23 +196,37 @@ func TestDecodeYCbCrOddSizes(t *testing.T) {
 				}
 			}
 			o, err := encoder.NewLossyEncoderOptions(encoder.PresetDefault, 80)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("NewLossyEncoderOptions: %v", err)
+			}
 			buf := &bytes.Buffer{}
-			require.NoError(t, encodeTo(buf, img, o))
+			if err := encodeTo(buf, img, o); err != nil {
+				t.Fatalf("encode %dx%d alpha %v: %v", w, h, alpha, err)
+			}
 			data := buf.Bytes()
 			for _, opts := range []*Options{nil, {UseThreads: true}, {Flip: true}} {
 				na, err := newDec(t, data, opts).DecodeNYCbCrA()
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("%dx%d alpha %v %+v: DecodeNYCbCrA: %v", w, h, alpha, opts, err)
+				}
 				if opts == nil || !opts.Flip || h%2 == 0 {
 					checkYCbCrMatchesRGB(t, &na.YCbCr, na.A, decode(t, data, withNoFancy(opts)), "odd size")
 				}
-				assert.Len(t, na.Cb, ((w+1)/2)*((h+1)/2))
+				if want := ((w + 1) / 2) * ((h + 1) / 2); len(na.Cb) != want {
+					t.Errorf("%dx%d alpha %v %+v: len(Cb) = %d, want %d", w, h, alpha, opts, len(na.Cb), want)
+				}
 				ycc, err := newDec(t, data, opts).DecodeYCbCr()
 				if alpha {
-					assert.Error(t, err)
+					if err == nil {
+						t.Errorf("%dx%d %+v: DecodeYCbCr with alpha: no error", w, h, opts)
+					}
 				} else {
-					require.NoError(t, err)
-					assert.Equal(t, &na.YCbCr, ycc)
+					if err != nil {
+						t.Fatalf("%dx%d %+v: DecodeYCbCr: %v", w, h, opts, err)
+					}
+					if !reflect.DeepEqual(&na.YCbCr, ycc) {
+						t.Errorf("%dx%d %+v: DecodeYCbCr differs from the Y'CbCr planes of DecodeNYCbCrA", w, h, opts)
+					}
 				}
 			}
 			img.Pix[3] = 0 // has alpha from now on
@@ -221,13 +260,23 @@ func TestDecodeYCbCrErrors(t *testing.T) {
 	} {
 		d := newDec(t, c.data, c.o)
 		na, err := d.DecodeNYCbCrA()
-		assert.Nil(t, na)
-		assert.Equal(t, c.code, status.CodeOf(err), "%v", err)
-		assert.Contains(t, err.Error(), "cannot decode picture: ")
+		if na != nil {
+			t.Errorf("%+v: DecodeNYCbCrA returned an image, want nil", c.o)
+		}
+		if code := status.CodeOf(err); code != c.code {
+			t.Errorf("%+v: DecodeNYCbCrA: %v: code %v, want %v", c.o, err, code, c.code)
+		}
+		if msg, prefix := err.Error(), "cannot decode picture: "; !strings.Contains(msg, prefix) {
+			t.Errorf("%+v: DecodeNYCbCrA: error %q does not contain %q", c.o, msg, prefix)
+		}
 		if c.code != utils.Vp8StatusOutOfMemory && !bytes.Equal(c.data, alpha[:len(alpha)/2]) {
 			ycc, err := d.DecodeYCbCr()
-			assert.Nil(t, ycc)
-			assert.Equal(t, c.code, status.CodeOf(err), "%v", err)
+			if ycc != nil {
+				t.Errorf("%+v: DecodeYCbCr returned an image, want nil", c.o)
+			}
+			if code := status.CodeOf(err); code != c.code {
+				t.Errorf("%+v: DecodeYCbCr: %v: code %v, want %v", c.o, err, code, c.code)
+			}
 		}
 	}
 }

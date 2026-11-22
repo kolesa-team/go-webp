@@ -24,20 +24,27 @@ package encoder
 import (
 	"math"
 	"testing"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestNilOptions(t *testing.T) {
 	t.Run("config from nil Options succeeds", func(t *testing.T) {
 		var options *Options = nil
 		cfg, err := options.GetConfig()
-		require.NoError(t, err)
-		require.NotNil(t, cfg)
-		assert.True(t, cfg.Lossless)
-		assert.Equal(t, 0, cfg.Method)
-		assert.Equal(t, float32(0), cfg.Quality)
+		if err != nil {
+			t.Fatalf("GetConfig: %v", err)
+		}
+		if cfg == nil {
+			t.Fatal("GetConfig() = nil, want a *Config")
+		}
+		if !cfg.Lossless {
+			t.Error("Lossless = false, want true")
+		}
+		if cfg.Method != 0 {
+			t.Errorf("Method = %d, want 0", cfg.Method)
+		}
+		if cfg.Quality != 0 {
+			t.Errorf("Quality = %v, want 0", cfg.Quality)
+		}
 	})
 }
 
@@ -45,32 +52,54 @@ func TestNewLossyEncoderOptions(t *testing.T) {
 	t.Run("invalid quality", func(t *testing.T) {
 		for _, q := range []float32{-1, 100.5} {
 			options, err := NewLossyEncoderOptions(PresetDefault, q)
-			require.Error(t, err)
-			assert.Nil(t, options)
+			if err == nil {
+				t.Fatalf("NewLossyEncoderOptions(%v): no error", q)
+			}
+			if options != nil {
+				t.Errorf("NewLossyEncoderOptions(%v) = %+v, want nil options", q, options)
+			}
 		}
 	})
 	t.Run("NaN quality is accepted like libwebp", func(t *testing.T) {
 		// WebPValidateConfig's range checks are comparisons, false for NaN;
 		// v1 (cgo) accepts it.
 		options, err := NewLossyEncoderOptions(PresetDefault, float32(math.NaN()))
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("NewLossyEncoderOptions(NaN): %v", err)
+		}
 		_, err = options.GetConfig()
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("GetConfig with a NaN Quality: %v", err)
+		}
 		options.TargetPsnr = float32(math.NaN())
 		_, err = options.GetConfig()
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("GetConfig with a NaN TargetPsnr: %v", err)
+		}
 	})
 	t.Run("create lossy encoder options is success", func(t *testing.T) {
 		options, err := NewLossyEncoderOptions(PresetDefault, 75)
-		require.Nil(t, err)
-		require.NotNil(t, options)
+		if err != nil {
+			t.Fatalf("NewLossyEncoderOptions: %v", err)
+		}
+		if options == nil {
+			t.Fatal("NewLossyEncoderOptions returned nil options")
+		}
 
-		assert.False(t, options.Lossless)
-		assert.Equal(t, float32(75), options.Quality)
+		if options.Lossless {
+			t.Error("Lossless = true, want false")
+		}
+		if options.Quality != 75 {
+			t.Errorf("Quality = %v, want 75", options.Quality)
+		}
 
 		cfg, err := options.GetConfig()
-		require.NoError(t, err)
-		assert.NotNil(t, cfg)
+		if err != nil {
+			t.Fatalf("GetConfig: %v", err)
+		}
+		if cfg == nil {
+			t.Error("GetConfig() = nil, want a *Config")
+		}
 	})
 }
 
@@ -78,31 +107,57 @@ func TestNewLosslessEncoderOptions(t *testing.T) {
 	t.Run("invalid level of lossless encoder", func(t *testing.T) {
 		for _, level := range []int{-1, 10} {
 			options, err := NewLosslessEncoderOptions(PresetDefault, level)
-			require.Error(t, err)
-			assert.Nil(t, options)
+			if err == nil {
+				t.Fatalf("NewLosslessEncoderOptions(%d): no error", level)
+			}
+			if options != nil {
+				t.Errorf("NewLosslessEncoderOptions(%d) = %+v, want nil options", level, options)
+			}
 		}
 	})
 	t.Run("create lossless encoder options is success", func(t *testing.T) {
 		options, err := NewLosslessEncoderOptions(PresetDefault, 1)
-		require.Nil(t, err)
-		require.NotNil(t, options)
+		if err != nil {
+			t.Fatalf("NewLosslessEncoderOptions: %v", err)
+		}
+		if options == nil {
+			t.Fatal("NewLosslessEncoderOptions returned nil options")
+		}
 
-		assert.True(t, options.Lossless)
-		assert.Equal(t, 1, options.Method)
-		assert.Equal(t, float32(20), options.Quality)
+		if !options.Lossless {
+			t.Error("Lossless = false, want true")
+		}
+		if options.Method != 1 {
+			t.Errorf("Method = %d, want 1", options.Method)
+		}
+		if options.Quality != 20 {
+			t.Errorf("Quality = %v, want 20", options.Quality)
+		}
 
 		cfg, err := options.GetConfig()
-		require.NoError(t, err)
-		assert.NotNil(t, cfg)
+		if err != nil {
+			t.Fatalf("GetConfig: %v", err)
+		}
+		if cfg == nil {
+			t.Error("GetConfig() = nil, want a *Config")
+		}
 	})
 	t.Run("levels", func(t *testing.T) {
 		want := [][2]int{{0, 0}, {1, 20}, {2, 25}, {3, 30}, {3, 50}, {4, 50}, {4, 75}, {4, 90}, {5, 90}, {6, 100}}
 		for level, mq := range want {
 			options, err := NewLosslessEncoderOptions(PresetPhoto, level)
-			require.NoError(t, err)
-			assert.Equal(t, mq[0], options.Method, "level %d", level)
-			assert.Equal(t, float32(mq[1]), options.Quality, "level %d", level)
-			assert.Equal(t, 100, options.NearLossless)
+			if err != nil {
+				t.Fatalf("level %d: NewLosslessEncoderOptions: %v", level, err)
+			}
+			if options.Method != mq[0] {
+				t.Errorf("level %d: Method = %d, want %d", level, options.Method, mq[0])
+			}
+			if options.Quality != float32(mq[1]) {
+				t.Errorf("level %d: Quality = %v, want %d", level, options.Quality, mq[1])
+			}
+			if options.NearLossless != 100 {
+				t.Errorf("level %d: NearLossless = %d, want 100", level, options.NearLossless)
+			}
 		}
 	})
 }
@@ -130,10 +185,16 @@ func TestPresets(t *testing.T) {
 		want := base
 		mod(&want)
 		options, err := NewLossyEncoderOptions(preset, 42)
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("preset %d: NewLossyEncoderOptions: %v", preset, err)
+		}
 		got, err := options.GetConfig()
-		require.NoError(t, err)
-		assert.Equal(t, want, *got, "preset %d", preset)
+		if err != nil {
+			t.Fatalf("preset %d: GetConfig: %v", preset, err)
+		}
+		if *got != want {
+			t.Errorf("preset %d: GetConfig() = %+v, want %+v", preset, *got, want)
+		}
 	}
 }
 
@@ -166,14 +227,18 @@ func TestValidation(t *testing.T) {
 		{"Exact", func(o *Options, v int) { o.Exact = v }, 0, 1},
 	}
 	base, err := NewLossyEncoderOptions(PresetDefault, 75)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewLossyEncoderOptions: %v", err)
+	}
 	for _, f := range fields {
 		for v := -2; v <= 120; v++ {
 			o := *base
 			f.set(&o, v)
 			_, err := o.GetConfig()
 			valid := v >= f.min && (f.max < f.min || v <= f.max)
-			assert.Equal(t, valid, err == nil, "%s = %d", f.name, v)
+			if (err == nil) != valid {
+				t.Errorf("%s = %d: GetConfig() succeeded = %v, want %v (err: %v)", f.name, v, err == nil, valid, err)
+			}
 		}
 	}
 }

@@ -25,12 +25,11 @@ import (
 	"bytes"
 	"image"
 	"math/rand"
+	"reflect"
 	"runtime"
+	"slices"
 	"strconv"
 	"testing"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 
 	"github.com/kolesa-team/go-webp/v2/internal/resample"
 	"github.com/kolesa-team/go-webp/v2/internal/status"
@@ -54,6 +53,7 @@ func randomImage(r *rand.Rand, w, h int) *image.NRGBA {
 // feed pushes src through s like a decoder would, in batches of the given
 // size (0 = random sizes), stopping at NeedRows unless all is set.
 func feed(t testing.TB, s Sink, src *image.NRGBA, batch int, r *rand.Rand, all bool) {
+	t.Helper()
 	h := src.Rect.Dy()
 	limit := s.NeedRows()
 	if all {
@@ -68,11 +68,15 @@ func feed(t testing.TB, s Sink, src *image.NRGBA, batch int, r *rand.Rand, all b
 		n = min(n, h-y)
 		buf := s.Buffer(y, n)
 		stride := s.Stride()
-		require.GreaterOrEqual(t, len(buf), (n-1)*stride+w4)
+		if len(buf) < (n-1)*stride+w4 {
+			t.Fatalf("Buffer(%d, %d): len = %d, want >= %d", y, n, len(buf), (n-1)*stride+w4)
+		}
 		for i := 0; i < n; i++ {
 			copy(buf[i*stride:i*stride+w4], src.Pix[(y+i)*src.Stride:])
 		}
-		require.NoError(t, s.Commit(y, n))
+		if err := s.Commit(y, n); err != nil {
+			t.Fatalf("Commit(%d, %d): %v", y, n, err)
+		}
 		y += n
 	}
 }
@@ -95,8 +99,11 @@ func flipRef(img *image.NRGBA) *image.NRGBA {
 }
 
 func scaleRef(t testing.TB, src *image.NRGBA, w, h int, premult bool) *image.NRGBA {
+	t.Helper()
 	rs, err := resample.New(src.Rect.Dx(), src.Rect.Dy(), w, h, 4)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("resample.New(%d, %d, %d, %d, 4): %v", src.Rect.Dx(), src.Rect.Dy(), w, h, err)
+	}
 	out := image.NewNRGBA(image.Rect(0, 0, w, h))
 	row := make([]byte, src.Rect.Dx()*4)
 	for y := 0; y < src.Rect.Dy(); y++ {
@@ -118,17 +125,31 @@ func scaleRef(t testing.TB, src *image.NRGBA, w, h int, premult bool) *image.NRG
 
 func TestNoTransformIsDirect(t *testing.T) {
 	s, img, err := NewSink(Params{SrcW: 5, SrcH: 3})
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewSink(5x3): %v", err)
+	}
 	d, ok := s.(*lazyDirect)
-	require.True(t, ok)
+	if !ok {
+		t.Fatalf("NewSink(5x3) = %T, want *lazyDirect", s)
+	}
 	buf := d.Buffer(0, 3)
-	assert.Same(t, &d.img.Pix[0], &buf[0], "rows are written in place")
-	assert.Same(t, d.img, img())
-	assert.Equal(t, image.Rect(0, 0, 5, 3), img().Rect)
+	if &d.img.Pix[0] != &buf[0] {
+		t.Errorf("Buffer(0, 3) = %p, want the output image %p (rows are written in place)", &buf[0], &d.img.Pix[0])
+	}
+	if got := img(); d.img != got {
+		t.Errorf("img() = %p, want the sink's image %p", got, d.img)
+	}
+	if got, want := img().Rect, image.Rect(0, 0, 5, 3); want != got {
+		t.Errorf("img().Rect = %v, want %v", got, want)
+	}
 	// A crop covering the whole frame is not a crop.
 	s, _, err = NewSink(Params{SrcW: 5, SrcH: 3, Crop: image.Rect(0, 0, 5, 3)})
-	require.NoError(t, err)
-	assert.IsType(t, &lazyDirect{}, s)
+	if err != nil {
+		t.Fatalf("NewSink(5x3, full-frame crop): %v", err)
+	}
+	if _, ok := s.(*lazyDirect); !ok {
+		t.Errorf("NewSink(5x3, full-frame crop) = %T, want *lazyDirect", s)
+	}
 }
 
 // TestLazyOutput checks that no sink allocates the output image before the
@@ -143,9 +164,13 @@ func TestLazyOutput(t *testing.T) {
 		var m0, m1 runtime.MemStats
 		runtime.ReadMemStats(&m0)
 		s, img, err := NewSink(p)
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("NewSink(%+v): %v", p, err)
+		}
 		runtime.ReadMemStats(&m1)
-		assert.Less(t, m1.TotalAlloc-m0.TotalAlloc, uint64(1<<20), "%+v", p)
+		if got := m1.TotalAlloc - m0.TotalAlloc; got >= uint64(1<<20) {
+			t.Errorf("%+v: NewSink allocated %d bytes, want < %d", p, got, uint64(1<<20))
+		}
 		_ = s
 		_ = img
 	}
@@ -173,7 +198,9 @@ func TestTransforms(t *testing.T) {
 				p.ScaleW, p.ScaleH = p.ScaleH, 0
 			}
 			sw, sh, ok := resample.ScaledDimensions(crop.Dx(), crop.Dy(), p.ScaleW, p.ScaleH)
-			require.True(t, ok)
+			if !ok {
+				t.Fatalf("ScaledDimensions(%d, %d, %d, %d) failed", crop.Dx(), crop.Dy(), p.ScaleW, p.ScaleH)
+			}
 			want = scaleRef(t, want, sw, sh, p.Premultiply)
 		}
 		if p.Flip {
@@ -181,14 +208,21 @@ func TestTransforms(t *testing.T) {
 		}
 		for _, batch := range []int{1, 16, 0, h} {
 			s, img, err := NewSink(p)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("NewSink(%+v): %v", p, err)
+			}
 			wantNeed := h
 			if !p.Crop.Empty() {
 				wantNeed = crop.Max.Y
 			}
-			assert.Equal(t, wantNeed, s.NeedRows())
+			if got := s.NeedRows(); wantNeed != got {
+				t.Errorf("params %+v: NeedRows() = %d, want %d", p, got, wantNeed)
+			}
 			feed(t, s, src, batch, r, batch == 0 && r.Intn(2) == 0)
-			require.Equal(t, want, img(), "params %+v batch %d", p, batch)
+			if got := img(); !reflect.DeepEqual(want, got) {
+				t.Fatalf("params %+v batch %d: output (Rect %v, Stride %d, len(Pix) %d) differs from the reference (Rect %v, Stride %d, len(Pix) %d)",
+					p, batch, got.Rect, got.Stride, len(got.Pix), want.Rect, want.Stride, len(want.Pix))
+			}
 		}
 	}
 }
@@ -197,12 +231,19 @@ func TestFlipInPlace(t *testing.T) {
 	r := rand.New(rand.NewSource(2))
 	src := randomImage(r, 7, 9)
 	s, img, err := NewSink(Params{SrcW: 7, SrcH: 9, Flip: true})
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewSink(7x9, flip): %v", err)
+	}
 	// The decoder writes straight into the output image.
 	buf := s.Buffer(0, 9)
-	assert.Equal(t, &img().Pix[0], &buf[0])
+	if want, got := &img().Pix[0], &buf[0]; !reflect.DeepEqual(want, got) {
+		t.Errorf("Buffer(0, 9) = %p, want the output image %p", got, want)
+	}
 	feed(t, s, src, 3, r, false)
-	assert.Equal(t, flipRef(src), img())
+	if want, got := flipRef(src), img(); !reflect.DeepEqual(want, got) {
+		t.Errorf("output (Rect %v, Stride %d, len(Pix) %d) differs from the flipped source (Rect %v, Stride %d, len(Pix) %d)",
+			got.Rect, got.Stride, len(got.Pix), want.Rect, want.Stride, len(want.Pix))
+	}
 }
 
 func TestInvalidParams(t *testing.T) {
@@ -217,10 +258,14 @@ func TestInvalidParams(t *testing.T) {
 		{SrcW: 10, SrcH: 10, ScaleW: 1 << 30, ScaleH: 1},
 	} {
 		_, _, err := NewSink(p)
-		assert.Equal(t, utils.Vp8StatusInvalidParam, status.CodeOf(err), "%+v", p)
+		if got := status.CodeOf(err); utils.Vp8StatusInvalidParam != got {
+			t.Errorf("NewSink(%+v): status %v (err %v), want %v", p, got, err, utils.Vp8StatusInvalidParam)
+		}
 	}
 	_, _, err := NewSink(Params{SrcW: 10, SrcH: 10, ScaleW: 1 << 20, ScaleH: 1 << 20})
-	assert.Equal(t, utils.Vp8StatusOutOfMemory, status.CodeOf(err))
+	if got := status.CodeOf(err); utils.Vp8StatusOutOfMemory != got {
+		t.Errorf("NewSink(10x10 -> %dx%d): status %v (err %v), want %v", 1<<20, 1<<20, got, err, utils.Vp8StatusOutOfMemory)
+	}
 }
 
 // TestAllocationLimit checks that output images and rescalers above
@@ -229,9 +274,11 @@ func TestInvalidParams(t *testing.T) {
 // a lowered limit.
 func TestAllocationLimit(t *testing.T) {
 	if strconv.IntSize == 64 {
-		assert.Equal(t, uint64(1)<<34, maxAllocableMemory)
-	} else {
-		assert.Equal(t, uint64(1)<<31-1<<16, maxAllocableMemory)
+		if want := uint64(1) << 34; want != maxAllocableMemory {
+			t.Errorf("maxAllocableMemory = %d, want %d", maxAllocableMemory, want)
+		}
+	} else if want := uint64(1)<<31 - 1<<16; want != maxAllocableMemory {
+		t.Errorf("maxAllocableMemory = %d, want %d", maxAllocableMemory, want)
 	}
 	defer func(old uint64) { maxOutputBytes = old }(maxOutputBytes)
 	maxOutputBytes = 40 * 30 * 4
@@ -247,7 +294,9 @@ func TestAllocationLimit(t *testing.T) {
 		{SrcW: 10, SrcH: 10, ScaleW: 134, ScaleH: 1},
 	} {
 		_, _, err := NewSink(p)
-		assert.Equal(t, utils.Vp8StatusOutOfMemory, status.CodeOf(err), "%+v", p)
+		if got := status.CodeOf(err); utils.Vp8StatusOutOfMemory != got {
+			t.Errorf("NewSink(%+v): status %v (err %v), want %v", p, got, err, utils.Vp8StatusOutOfMemory)
+		}
 	}
 	for _, p := range []Params{
 		{SrcW: 40, SrcH: 30},
@@ -256,20 +305,34 @@ func TestAllocationLimit(t *testing.T) {
 		{SrcW: 10, SrcH: 10, ScaleW: 133, ScaleH: 1},
 	} {
 		sink, result, err := NewSink(p)
-		require.NoError(t, err, "%+v", p)
-		require.NotNil(t, sink)
-		require.NotNil(t, result)
+		if err != nil {
+			t.Fatalf("NewSink(%+v): %v", p, err)
+		}
+		if sink == nil {
+			t.Fatalf("NewSink(%+v) returned a nil sink", p)
+		}
+		if result == nil {
+			t.Fatalf("NewSink(%+v) returned a nil image function", p)
+		}
 	}
 }
 
 func TestCropFromV1(t *testing.T) {
-	assert.Equal(t, image.Rect(10, 20, 110, 70), CropFromV1(image.Rect(10, 20, 100, 50)))
+	if got, want := CropFromV1(image.Rect(10, 20, 100, 50)), image.Rect(10, 20, 110, 70); want != got {
+		t.Errorf("CropFromV1(%v) = %v, want %v", image.Rect(10, 20, 100, 50), got, want)
+	}
 }
 
 func TestSnapCropForYUV(t *testing.T) {
-	assert.Equal(t, image.Rect(2, 4, 7, 10), SnapCropForYUV(image.Rect(3, 5, 8, 11)))
-	assert.Equal(t, image.Rect(2, 4, 4, 6), SnapCropForYUV(image.Rect(2, 4, 4, 6)))
-	assert.True(t, SnapCropForYUV(image.Rectangle{}).Empty())
+	if got, want := SnapCropForYUV(image.Rect(3, 5, 8, 11)), image.Rect(2, 4, 7, 10); want != got {
+		t.Errorf("SnapCropForYUV(%v) = %v, want %v", image.Rect(3, 5, 8, 11), got, want)
+	}
+	if got, want := SnapCropForYUV(image.Rect(2, 4, 4, 6)), image.Rect(2, 4, 4, 6); want != got {
+		t.Errorf("SnapCropForYUV(%v) = %v, want %v", image.Rect(2, 4, 4, 6), got, want)
+	}
+	if got := SnapCropForYUV(image.Rectangle{}); !got.Empty() {
+		t.Errorf("SnapCropForYUV(empty) = %v, want an empty rectangle", got)
+	}
 }
 
 func BenchmarkSink(b *testing.B) {
@@ -308,6 +371,7 @@ func BenchmarkSink(b *testing.B) {
 // yuvRef rescales full planes in one go and converts them, as a reference
 // for the streaming YUV path.
 func yuvRef(t testing.TB, W, H int, yp, up, vp, ap []byte, crop image.Rectangle, dw, dh int, flip bool) *image.NRGBA {
+	t.Helper()
 	cw, ch := crop.Dx(), crop.Dy()
 	uw, cuw, cuh := (W+1)/2, (cw+1)/2, (ch+1)/2
 	plane := func(src []byte, stride, x, y, w, h int) []byte {
@@ -318,8 +382,11 @@ func yuvRef(t testing.TB, W, H int, yp, up, vp, ap []byte, crop image.Rectangle,
 		return out
 	}
 	scale := func(p []byte, w, h int) []byte {
+		t.Helper()
 		rs, err := resample.New(w, h, dw, dh, 1)
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("resample.New(%d, %d, %d, %d, 1): %v", w, h, dw, dh, err)
+		}
 		out := make([]byte, dw*dh)
 		for y := 0; y < h; y++ {
 			rs.ImportRow(p[y*w:])
@@ -379,7 +446,9 @@ func TestYUVScaling(t *testing.T) {
 		want := yuvRef(t, W, H, yp, up, vp, ap, crop, p.ScaleW, p.ScaleH, p.Flip)
 		for _, batch := range []int{0, 1, 2, 3, 16, H} {
 			s, img, err := NewSink(p)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("%dx%d: NewSink(%+v): %v", W, H, p, err)
+			}
 			ys := s.(YUVSink)
 			for y := 0; y < s.NeedRows(); {
 				n := batch
@@ -391,22 +460,35 @@ func TestYUVScaling(t *testing.T) {
 				if ap != nil {
 					a = ap[y*W:]
 				}
-				require.NoError(t, ys.CommitYUV(y, n, yp[y*W:], W, up[(y/2)*uw:], vp[(y/2)*uw:], uw, a, W))
+				if err := ys.CommitYUV(y, n, yp[y*W:], W, up[(y/2)*uw:], vp[(y/2)*uw:], uw, a, W); err != nil {
+					t.Fatalf("%dx%d %+v batch %d: CommitYUV(%d, %d): %v", W, H, p, batch, y, n, err)
+				}
 				y += n
 			}
-			require.Equal(t, want, img(), "%dx%d %+v batch %d", W, H, p, batch)
+			if got := img(); !reflect.DeepEqual(want, got) {
+				t.Fatalf("%dx%d %+v batch %d: output (Rect %v, Stride %d, len(Pix) %d) differs from the reference (Rect %v, Stride %d, len(Pix) %d)",
+					W, H, p, batch, got.Rect, got.Stride, len(got.Pix), want.Rect, want.Stride, len(want.Pix))
+			}
 		}
 	}
 }
 
 func TestYUVErrors(t *testing.T) {
 	s, _, err := NewSink(Params{SrcW: 4, SrcH: 4, ScaleW: 2, ScaleH: 2})
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewSink(4x4 -> 2x2): %v", err)
+	}
 	ys := s.(YUVSink)
 	y, uv, a := make([]byte, 16), make([]byte, 4), make([]byte, 16)
-	require.NoError(t, ys.CommitYUV(0, 1, y, 4, uv, uv, 2, a, 4))
-	assert.Error(t, ys.CommitYUV(1, 1, y, 4, uv, uv, 2, nil, 4), "alpha disappeared")
-	assert.Error(t, ys.CommitYUV(3, 1, y, 4, uv, uv, 2, a, 4), "rows skipped")
+	if err := ys.CommitYUV(0, 1, y, 4, uv, uv, 2, a, 4); err != nil {
+		t.Fatalf("CommitYUV(0, 1) with alpha: %v", err)
+	}
+	if err := ys.CommitYUV(1, 1, y, 4, uv, uv, 2, nil, 4); err == nil {
+		t.Error("CommitYUV(1, 1) without alpha after a row with alpha succeeded, want an error (alpha disappeared)")
+	}
+	if err := ys.CommitYUV(3, 1, y, 4, uv, uv, 2, a, 4); err == nil {
+		t.Error("CommitYUV(3, 1) after row 1 succeeded, want an error (rows skipped)")
+	}
 }
 
 func FuzzSink(f *testing.F) {
@@ -451,10 +533,18 @@ func TestCarry(t *testing.T) {
 	}
 	// Old carry holds rows 3,4; one consumed; batch supplies up to row 7.
 	old := [][]byte{{3}, {4}}
-	assert.Equal(t, []int{4, 5, 6}, rows(carry(old, 1, 5, 7, batch)))
+	if got, want := rows(carry(old, 1, 5, 7, batch)), []int{4, 5, 6}; !slices.Equal(want, got) {
+		t.Errorf("carry(rows 3-4, 1, 5, 7) = rows %v, want %v", got, want)
+	}
 	// Everything carried and two batch rows consumed.
-	assert.Equal(t, []int{7, 8}, rows(carry([][]byte{{3}, {4}}, 4, 5, 9, batch)))
+	if got, want := rows(carry([][]byte{{3}, {4}}, 4, 5, 9, batch)), []int{7, 8}; !slices.Equal(want, got) {
+		t.Errorf("carry(rows 3-4, 4, 5, 9) = rows %v, want %v", got, want)
+	}
 	// Nothing left.
-	assert.Empty(t, carry([][]byte{{3}}, 1, 4, 4, batch))
-	assert.Equal(t, []int{2}, rows(carry(nil, 0, 2, 3, batch)))
+	if got := carry([][]byte{{3}}, 1, 4, 4, batch); len(got) != 0 {
+		t.Errorf("carry(row 3, 1, 4, 4) = %d rows, want none", len(got))
+	}
+	if got, want := rows(carry(nil, 0, 2, 3, batch)), []int{2}; !slices.Equal(want, got) {
+		t.Errorf("carry(nil, 0, 2, 3) = rows %v, want %v", got, want)
+	}
 }

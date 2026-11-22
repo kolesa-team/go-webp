@@ -33,8 +33,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/stretchr/testify/require"
-
 	"github.com/kolesa-team/go-webp/v2/decoder"
 )
 
@@ -44,19 +42,27 @@ func dwebpYUV(t *testing.T, dir string, file []byte, w, h int, alpha bool, flags
 	t.Helper()
 	in := filepath.Join(dir, "in.webp")
 	out := filepath.Join(dir, "out.yuv")
-	require.NoError(t, os.WriteFile(in, file, 0o644))
+	if err := os.WriteFile(in, file, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	args := append([]string{in}, flags...)
 	args = append(args, "-yuv", "-quiet", "-o", out)
 	msg, err := exec.Command(tool(t, "DWEBP", "dwebp"), args...).CombinedOutput()
-	require.NoError(t, err, "dwebp %v: %s", flags, msg)
+	if err != nil {
+		t.Fatalf("dwebp %v: %v: %s", flags, err, msg)
+	}
 	data, err := os.ReadFile(out)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatal(err)
+	}
 	uw, uh := (w+1)/2, (h+1)/2
 	n := w*h + 2*uw*uh
 	if alpha {
 		n += w * h
 	}
-	require.Equal(t, n, len(data), "dwebp %v output size", flags)
+	if len(data) != n {
+		t.Fatalf("dwebp %v output size %d bytes, want %d", flags, len(data), n)
+	}
 	y, data = data[:w*h], data[w*h:]
 	u, data = data[:uw*uh], data[uw*uh:]
 	v, a = data[:uw*uh], data[uw*uh:]
@@ -103,7 +109,9 @@ func TestInteropDecodeYCbCr(t *testing.T) {
 	}
 	for _, f := range []string{"m4_q75.webp", "webp-logo-lossy.webp"} {
 		data, err := os.ReadFile("../test_data/images/" + f)
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatal(err)
+		}
 		files = append(files, struct {
 			name string
 			data []byte
@@ -111,7 +119,9 @@ func TestInteropDecodeYCbCr(t *testing.T) {
 	}
 	for _, f := range files {
 		feat, err := GetFeatures(bytes.NewReader(f.data))
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("%s: GetFeatures: %v", f.name, err)
+		}
 		for _, o := range opts {
 			name := f.name + " [dwebp " + o.flags + "]"
 			w, h := feat.Width, feat.Height
@@ -121,20 +131,38 @@ func TestInteropDecodeYCbCr(t *testing.T) {
 			y, u, v, a := dwebpYUV(t, dir, f.data, w, h, feat.HasAlpha, strings.Fields(o.flags)...)
 			oo := o.opts
 			dec, err := decoder.NewDecoder(bytes.NewReader(f.data), &oo)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("%s: NewDecoder: %v", name, err)
+			}
 			na, err := dec.DecodeNYCbCrA()
-			require.NoError(t, err, name)
-			require.Equal(t, image.Rect(0, 0, w, h), na.Rect, name)
-			require.True(t, bytes.Equal(y, na.Y), "%s: Y differs", name)
-			require.True(t, bytes.Equal(u, na.Cb), "%s: U differs", name)
-			require.True(t, bytes.Equal(v, na.Cr), "%s: V differs", name)
+			if err != nil {
+				t.Fatalf("%s: DecodeNYCbCrA: %v", name, err)
+			}
+			if want := image.Rect(0, 0, w, h); na.Rect != want {
+				t.Fatalf("%s: DecodeNYCbCrA Rect = %v, want %v", name, na.Rect, want)
+			}
+			if !bytes.Equal(y, na.Y) {
+				t.Fatalf("%s: Y differs", name)
+			}
+			if !bytes.Equal(u, na.Cb) {
+				t.Fatalf("%s: U differs", name)
+			}
+			if !bytes.Equal(v, na.Cr) {
+				t.Fatalf("%s: V differs", name)
+			}
 			if feat.HasAlpha {
-				require.True(t, bytes.Equal(a, na.A), "%s: A differs", name)
+				if !bytes.Equal(a, na.A) {
+					t.Fatalf("%s: A differs", name)
+				}
 				continue
 			}
 			ycc, err := dec.DecodeYCbCr()
-			require.NoError(t, err, name)
-			require.True(t, bytes.Equal(y, ycc.Y) && bytes.Equal(u, ycc.Cb) && bytes.Equal(v, ycc.Cr), name)
+			if err != nil {
+				t.Fatalf("%s: DecodeYCbCr: %v", name, err)
+			}
+			if !(bytes.Equal(y, ycc.Y) && bytes.Equal(u, ycc.Cb) && bytes.Equal(v, ycc.Cr)) {
+				t.Fatalf("%s: DecodeYCbCr planes differ from dwebp -yuv", name)
+			}
 		}
 	}
 }

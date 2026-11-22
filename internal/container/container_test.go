@@ -27,10 +27,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 
 	"github.com/kolesa-team/go-webp/v2/internal/status"
 	"github.com/kolesa-team/go-webp/v2/utils"
@@ -39,7 +37,9 @@ import (
 func readFixture(t testing.TB, name string) []byte {
 	t.Helper()
 	b, err := os.ReadFile(filepath.Join("testdata", name))
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("reading fixture %s: %v", name, err)
+	}
 	return b
 }
 
@@ -64,28 +64,50 @@ func TestFixtures(t *testing.T) {
 		t.Run(tt.file, func(t *testing.T) {
 			data := readFixture(t, tt.file)
 			f, err := GetFeatures(data)
-			require.NoError(t, err)
-			assert.Equal(t, tt.feat, f)
+			if err != nil {
+				t.Fatalf("GetFeatures: %v", err)
+			}
+			if f != tt.feat {
+				t.Errorf("GetFeatures = %+v, want %+v", f, tt.feat)
+			}
 
 			img, err := Parse(data)
-			require.NoError(t, err)
-			assert.Equal(t, tt.feat, img.Features)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			if img.Features != tt.feat {
+				t.Errorf("Parse: Features = %+v, want %+v", img.Features, tt.feat)
+			}
 			payload := img.Chunk()
 			if tt.feat.Format == utils.FormatLossless {
-				assert.Nil(t, img.VP8)
-				assert.Equal(t, data[tt.off:], img.VP8L)
+				if img.VP8 != nil {
+					t.Errorf("Parse: VP8 has %d bytes, want nil for a lossless image", len(img.VP8))
+				}
+				if !bytes.Equal(img.VP8L, data[tt.off:]) {
+					t.Errorf("Parse: VP8L (len %d) is not data[%d:] (len %d)", len(img.VP8L), tt.off, len(data)-tt.off)
+				}
 			} else {
-				assert.Nil(t, img.VP8L)
-				assert.Equal(t, data[tt.off:], img.VP8)
+				if img.VP8L != nil {
+					t.Errorf("Parse: VP8L has %d bytes, want nil for a lossy image", len(img.VP8L))
+				}
+				if !bytes.Equal(img.VP8, data[tt.off:]) {
+					t.Errorf("Parse: VP8 (len %d) is not data[%d:] (len %d)", len(img.VP8), tt.off, len(data)-tt.off)
+				}
 			}
-			assert.Equal(t, data[tt.off:tt.off+tt.size], payload)
+			if !bytes.Equal(payload, data[tt.off:tt.off+tt.size]) {
+				t.Errorf("Chunk (len %d) is not data[%d:%d]", len(payload), tt.off, tt.off+tt.size)
+			}
 			if tt.alphaOff < 0 {
-				assert.Nil(t, img.ALPH)
-			} else {
-				assert.Equal(t, data[tt.alphaOff:tt.alphaOff+tt.alphaN], img.ALPH)
+				if img.ALPH != nil {
+					t.Errorf("Parse: ALPH has %d bytes, want nil", len(img.ALPH))
+				}
+			} else if !bytes.Equal(img.ALPH, data[tt.alphaOff:tt.alphaOff+tt.alphaN]) {
+				t.Errorf("Parse: ALPH (len %d) is not data[%d:%d]", len(img.ALPH), tt.alphaOff, tt.alphaOff+tt.alphaN)
 			}
 			// Payloads alias the input.
-			assert.Equal(t, &data[tt.off], &payload[0])
+			if &payload[0] != &data[tt.off] {
+				t.Errorf("&Chunk()[0] = %p (%#x), want &data[%d] = %p (%#x)", &payload[0], payload[0], tt.off, &data[tt.off], data[tt.off])
+			}
 		})
 	}
 }
@@ -94,40 +116,72 @@ func TestAnimated(t *testing.T) {
 	data := readFixture(t, "anim.webp")
 	want := Features{Width: 3, Height: 7, HasAlpha: true, HasAnimation: true, Format: utils.FormatUndefined}
 	f, err := GetFeatures(data)
-	require.NoError(t, err)
-	assert.Equal(t, want, f)
+	if err != nil {
+		t.Fatalf("GetFeatures: %v", err)
+	}
+	if f != want {
+		t.Errorf("GetFeatures = %+v, want %+v", f, want)
+	}
 	img, err := Parse(data)
-	require.NoError(t, err)
-	assert.Equal(t, &Image{Features: want}, img)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if wantImg := (&Image{Features: want}); !reflect.DeepEqual(img, wantImg) {
+		t.Errorf("Parse = %+v, want %+v", img, wantImg)
+	}
 	// Header-only is enough for GetFeatures.
 	f, err = GetFeatures(data[:30])
-	require.NoError(t, err)
-	assert.Equal(t, want, f)
+	if err != nil {
+		t.Fatalf("GetFeatures(data[:30]): %v", err)
+	}
+	if f != want {
+		t.Errorf("GetFeatures(data[:30]) = %+v, want %+v", f, want)
+	}
 }
 
 func TestRawBitstreams(t *testing.T) {
 	lossy := readFixture(t, "grad_17x33_q70.webp")
 	img, err := Parse(lossy[20:])
-	require.NoError(t, err)
-	assert.Equal(t, Features{17, 33, false, false, utils.FormatLossy}, img.Features)
-	assert.Equal(t, lossy[20:], img.VP8)
+	if err != nil {
+		t.Fatalf("Parse(raw VP8): %v", err)
+	}
+	if want := (Features{17, 33, false, false, utils.FormatLossy}); img.Features != want {
+		t.Errorf("Parse(raw VP8): Features = %+v, want %+v", img.Features, want)
+	}
+	if !bytes.Equal(img.VP8, lossy[20:]) {
+		t.Errorf("Parse(raw VP8): VP8 (len %d) is not the input (len %d)", len(img.VP8), len(lossy[20:]))
+	}
 
 	ll := readFixture(t, "grada_17x33_ll.webp")
 	img, err = Parse(ll[20:])
-	require.NoError(t, err)
-	assert.Equal(t, Features{17, 33, true, false, utils.FormatLossless}, img.Features)
-	assert.Equal(t, ll[20:], img.VP8L)
+	if err != nil {
+		t.Fatalf("Parse(raw VP8L): %v", err)
+	}
+	if want := (Features{17, 33, true, false, utils.FormatLossless}); img.Features != want {
+		t.Errorf("Parse(raw VP8L): Features = %+v, want %+v", img.Features, want)
+	}
+	if !bytes.Equal(img.VP8L, ll[20:]) {
+		t.Errorf("Parse(raw VP8L): VP8L (len %d) is not the input (len %d)", len(img.VP8L), len(ll[20:]))
+	}
 
 	// "ALPH" + "VP8 " without RIFF is accepted (libwebp internal format).
 	withAlpha := readFixture(t, "grada_17x33_q70.webp")
 	img, err = Parse(withAlpha[30:])
-	require.NoError(t, err)
-	assert.Equal(t, Features{17, 33, true, false, utils.FormatLossy}, img.Features)
-	assert.Equal(t, 127, len(img.ALPH))
+	if err != nil {
+		t.Fatalf("Parse(ALPH + VP8 without RIFF): %v", err)
+	}
+	if want := (Features{17, 33, true, false, utils.FormatLossy}); img.Features != want {
+		t.Errorf("Parse(ALPH + VP8 without RIFF): Features = %+v, want %+v", img.Features, want)
+	}
+	if len(img.ALPH) != 127 {
+		t.Errorf("Parse(ALPH + VP8 without RIFF): len(ALPH) = %d, want 127", len(img.ALPH))
+	}
 
 	// VP8X without RIFF is rejected.
 	_, err = Parse(withAlpha[12:])
-	assert.Equal(t, utils.Vp8StatusBitstreamError, status.CodeOf(err))
+	if got := status.CodeOf(err); got != utils.Vp8StatusBitstreamError {
+		t.Errorf("Parse(VP8X without RIFF): status = %v, want %v (err: %v)", got, utils.Vp8StatusBitstreamError, err)
+	}
 }
 
 func code(err error) utils.VP8StatusCode { return status.CodeOf(err) }
@@ -178,16 +232,26 @@ func TestErrors(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			f, err := GetFeatures(tt.data)
-			assert.Equal(t, tt.feat, code(err), "GetFeatures: %v", err)
+			if got := code(err); got != tt.feat {
+				t.Errorf("GetFeatures: status = %v, want %v (err: %v)", got, tt.feat, err)
+			}
 			if tt.checkFeatures {
-				assert.Equal(t, 17, f.Width)
-				assert.Equal(t, 33, f.Height)
+				if f.Width != 17 {
+					t.Errorf("GetFeatures: Width = %d, want 17", f.Width)
+				}
+				if f.Height != 33 {
+					t.Errorf("GetFeatures: Height = %d, want 33", f.Height)
+				}
 			}
 			_, err = Parse(tt.data)
-			assert.Equal(t, tt.parse, code(err), "Parse: %v", err)
+			if got := code(err); got != tt.parse {
+				t.Errorf("Parse: status = %v, want %v (err: %v)", got, tt.parse, err)
+			}
 			if err != nil {
 				var se *status.Error
-				assert.True(t, errors.As(err, &se))
+				if !errors.As(err, &se) {
+					t.Errorf("Parse: error %v (%T) is not a *status.Error", err, err)
+				}
 			}
 		})
 	}
@@ -200,14 +264,20 @@ func TestWriteRoundTrip(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			data := readFixture(t, name)
 			img, err := Parse(data)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
 			var buf bytes.Buffer
 			if img.VP8L != nil {
-				require.NoError(t, WriteLossless(&buf, img.Chunk()))
-			} else {
-				require.NoError(t, WriteLossy(&buf, img.Width, img.Height, img.Chunk(), img.ALPH))
+				if err := WriteLossless(&buf, img.Chunk()); err != nil {
+					t.Fatalf("WriteLossless: %v", err)
+				}
+			} else if err := WriteLossy(&buf, img.Width, img.Height, img.Chunk(), img.ALPH); err != nil {
+				t.Fatalf("WriteLossy: %v", err)
 			}
-			assert.Equal(t, data, buf.Bytes())
+			if !bytes.Equal(buf.Bytes(), data) {
+				t.Errorf("re-muxed file (len %d) differs from the original (len %d)", buf.Len(), len(data))
+			}
 		})
 	}
 }
@@ -218,31 +288,63 @@ func TestWriteOddSizes(t *testing.T) {
 	alph := []byte{0, 1, 2} // odd ALPH payload, uncompressed
 	for _, v := range [][]byte{vp8, append(append([]byte(nil), vp8...), 0)} {
 		var buf bytes.Buffer
-		require.NoError(t, WriteLossy(&buf, 17, 33, v, alph))
+		if err := WriteLossy(&buf, 17, 33, v, alph); err != nil {
+			t.Fatalf("WriteLossy(%d-byte VP8): %v", len(v), err)
+		}
 		out := buf.Bytes()
-		assert.Equal(t, 0, len(out)&1)
-		assert.Equal(t, uint32(len(out)-8), binary.LittleEndian.Uint32(out[4:]))
+		if len(out)&1 != 0 {
+			t.Errorf("WriteLossy(%d-byte VP8): file size %d, want even", len(v), len(out))
+		}
+		if got, want := binary.LittleEndian.Uint32(out[4:]), uint32(len(out)-8); got != want {
+			t.Errorf("WriteLossy(%d-byte VP8): RIFF size = %d, want %d", len(v), got, want)
+		}
 		img, err := Parse(out)
-		require.NoError(t, err)
-		assert.Equal(t, v, img.Chunk())
-		assert.Equal(t, alph, img.ALPH)
-		assert.True(t, img.HasAlpha)
+		if err != nil {
+			t.Fatalf("Parse(WriteLossy(%d-byte VP8)): %v", len(v), err)
+		}
+		if got := img.Chunk(); !bytes.Equal(got, v) {
+			t.Errorf("Parse(WriteLossy(%d-byte VP8)): Chunk has %d bytes and differs from the VP8 payload", len(v), len(got))
+		}
+		if !bytes.Equal(img.ALPH, alph) {
+			t.Errorf("Parse(WriteLossy(%d-byte VP8)): ALPH = %v, want %v", len(v), img.ALPH, alph)
+		}
+		if !img.HasAlpha {
+			t.Errorf("Parse(WriteLossy(%d-byte VP8)): HasAlpha = false, want true", len(v))
+		}
 	}
 	var buf bytes.Buffer
-	require.NoError(t, WriteLossless(&buf, []byte{0x2f, 0, 0, 0, 0, 1, 2}))
-	assert.Equal(t, 28, buf.Len())
+	if err := WriteLossless(&buf, []byte{0x2f, 0, 0, 0, 0, 1, 2}); err != nil {
+		t.Fatalf("WriteLossless: %v", err)
+	}
+	if buf.Len() != 28 {
+		t.Errorf("WriteLossless wrote %d bytes, want 28", buf.Len())
+	}
 	f, err := GetFeatures(buf.Bytes())
-	require.NoError(t, err)
-	assert.Equal(t, Features{1, 1, false, false, utils.FormatLossless}, f)
+	if err != nil {
+		t.Fatalf("GetFeatures(WriteLossless): %v", err)
+	}
+	if want := (Features{1, 1, false, false, utils.FormatLossless}); f != want {
+		t.Errorf("GetFeatures(WriteLossless) = %+v, want %+v", f, want)
+	}
 }
 
 func TestWriteInvalid(t *testing.T) {
 	var buf bytes.Buffer
-	assert.Error(t, WriteLossy(&buf, 1, 1, nil, nil))
-	assert.Error(t, WriteLossy(&buf, 0, 1, []byte{1}, []byte{0}))
-	assert.Error(t, WriteLossy(&buf, 16384, 1, []byte{1}, []byte{0}))
-	assert.Error(t, WriteLossless(&buf, nil))
-	assert.Equal(t, 0, buf.Len())
+	if err := WriteLossy(&buf, 1, 1, nil, nil); err == nil {
+		t.Error("WriteLossy(1x1, nil VP8, nil ALPH) succeeded, want error")
+	}
+	if err := WriteLossy(&buf, 0, 1, []byte{1}, []byte{0}); err == nil {
+		t.Error("WriteLossy(0x1) succeeded, want error")
+	}
+	if err := WriteLossy(&buf, 16384, 1, []byte{1}, []byte{0}); err == nil {
+		t.Error("WriteLossy(16384x1) succeeded, want error")
+	}
+	if err := WriteLossless(&buf, nil); err == nil {
+		t.Error("WriteLossless(nil) succeeded, want error")
+	}
+	if buf.Len() != 0 {
+		t.Errorf("invalid writes wrote %d bytes, want 0", buf.Len())
+	}
 }
 
 type failWriter struct{ n int }
@@ -259,7 +361,9 @@ func TestWriteErrors(t *testing.T) {
 	vp8 := readFixture(t, "grad_17x33_q70.webp")[20:]
 	for n := 0; n < 4; n++ {
 		err := WriteLossy(&failWriter{n: n}, 17, 33, vp8, []byte{0, 1, 2})
-		assert.Error(t, err, "fail after %d writes", n)
+		if err == nil {
+			t.Errorf("WriteLossy to a writer that fails after %d writes succeeded, want error", n)
+		}
 	}
 }
 
@@ -342,8 +446,12 @@ func TestChunkSizeWrap(t *testing.T) {
 	data = append(data, make([]byte, 200)...)
 	binary.LittleEndian.PutUint32(data[4:], uint32(len(data)-8))
 	f, err := GetFeatures(data)
-	require.NoError(t, err)
-	assert.Equal(t, Features{Width: 4, Height: 7, HasAlpha: true, Format: utils.FormatUndefined}, f)
+	if err != nil {
+		t.Fatalf("GetFeatures: %v", err)
+	}
+	if want := (Features{Width: 4, Height: 7, HasAlpha: true, Format: utils.FormatUndefined}); f != want {
+		t.Errorf("GetFeatures = %+v, want %+v", f, want)
+	}
 }
 
 // TestFrameLossless checks that framing a payload in place gives exactly
@@ -355,14 +463,22 @@ func TestFrameLossless(t *testing.T) {
 			payload[i] = byte(i*7 + 1)
 		}
 		var want bytes.Buffer
-		require.NoError(t, WriteLossless(&want, payload))
+		if err := WriteLossless(&want, payload); err != nil {
+			t.Fatalf("WriteLossless(%d bytes): %v", n, err)
+		}
 		buf := append(make([]byte, LosslessHeaderSize), payload...)
 		got, err := FrameLossless(buf)
-		require.NoError(t, err)
-		assert.Equal(t, want.Bytes(), got)
+		if err != nil {
+			t.Fatalf("FrameLossless(%d bytes): %v", n, err)
+		}
+		if !bytes.Equal(got, want.Bytes()) {
+			t.Errorf("FrameLossless(%d bytes) (len %d) differs from WriteLossless (len %d)", n, len(got), want.Len())
+		}
 	}
 	_, err := FrameLossless(make([]byte, LosslessHeaderSize))
-	require.Error(t, err)
+	if err == nil {
+		t.Fatal("FrameLossless(header only) succeeded, want error")
+	}
 }
 
 // TestFrameLossy checks that framing a VP8 payload in place gives exactly
@@ -375,19 +491,29 @@ func TestFrameLossy(t *testing.T) {
 			payload[i] = byte(i*5 + 3)
 		}
 		var want bytes.Buffer
-		require.NoError(t, WriteLossy(&want, 3, 3, payload, nil))
+		if err := WriteLossy(&want, 3, 3, payload, nil); err != nil {
+			t.Fatalf("WriteLossy(n=%d): %v", n, err)
+		}
 		for _, spare := range []int{0, 1, 16} {
 			buf := make([]byte, LossyHeaderSize+n, LossyHeaderSize+n+spare)
 			copy(buf[LossyHeaderSize:], payload)
 			got, err := FrameLossy(buf)
-			require.NoError(t, err)
-			assert.Equal(t, want.Bytes(), got, "n=%d spare=%d", n, spare)
+			if err != nil {
+				t.Fatalf("FrameLossy(n=%d spare=%d): %v", n, spare, err)
+			}
+			if !bytes.Equal(got, want.Bytes()) {
+				t.Errorf("n=%d spare=%d: FrameLossy (len %d) differs from WriteLossy (len %d)", n, spare, len(got), want.Len())
+			}
 		}
 	}
 	_, err := FrameLossy(make([]byte, LossyHeaderSize))
-	require.EqualError(t, err, "VP8_STATUS_INVALID_PARAM: empty VP8 payload")
+	if want := "VP8_STATUS_INVALID_PARAM: empty VP8 payload"; err == nil || err.Error() != want {
+		t.Fatalf("FrameLossy(header only) error = %v, want %q", err, want)
+	}
 	_, err = FrameLossless(nil)
-	require.EqualError(t, err, "VP8_STATUS_INVALID_PARAM: empty VP8L payload")
+	if want := "VP8_STATUS_INVALID_PARAM: empty VP8L payload"; err == nil || err.Error() != want {
+		t.Fatalf("FrameLossless(nil) error = %v, want %q", err, want)
+	}
 }
 
 // TestGetFeaturesPrefixRawVP8 checks that for a raw VP8 bitstream (whose
@@ -397,29 +523,49 @@ func TestFrameLossy(t *testing.T) {
 // GetFeatures of the whole input.
 func TestGetFeaturesPrefixRawVP8(t *testing.T) {
 	data, err := os.ReadFile("../../test_data/images/m4_q75.webp")
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatal(err)
+	}
 	img, err := Parse(data)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
 	raw := img.Chunk()
 	part0 := int(uint32(raw[0])|uint32(raw[1])<<8|uint32(raw[2])<<16) >> 5
-	require.Greater(t, part0, 64, "the first partition must be longer than a small prefix")
+	if part0 <= 64 {
+		t.Fatalf("first partition is %d bytes, want > 64: the first partition must be longer than a small prefix", part0)
+	}
 
 	want, err := GetFeatures(raw)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("GetFeatures: %v", err)
+	}
 	for n := 1; n <= len(raw); n++ {
 		f, done, err := GetFeaturesPrefix(raw[:n])
 		if n <= part0 {
-			require.False(t, done, "prefix %d of %d (first partition %d)", n, len(raw), part0)
+			if done {
+				t.Fatalf("GetFeaturesPrefix(prefix %d of %d): done = true, want false (first partition %d)", n, len(raw), part0)
+			}
 			continue
 		}
-		require.True(t, done, "prefix %d", n)
-		require.NoError(t, err, "prefix %d", n)
-		require.Equal(t, want, f, "prefix %d", n)
+		if !done {
+			t.Fatalf("GetFeaturesPrefix(prefix %d): done = false, want true", n)
+		}
+		if err != nil {
+			t.Fatalf("GetFeaturesPrefix(prefix %d): %v", n, err)
+		}
+		if f != want {
+			t.Fatalf("GetFeaturesPrefix(prefix %d) = %+v, want %+v", n, f, want)
+		}
 	}
 	// An invalid header is final right away.
 	bad := append([]byte(nil), raw[:64]...)
 	bad[3] = 0
 	_, done, err := GetFeaturesPrefix(bad)
-	assert.True(t, done)
-	assert.Equal(t, utils.Vp8StatusBitstreamError, status.CodeOf(err))
+	if !done {
+		t.Error("GetFeaturesPrefix(invalid header): done = false, want true")
+	}
+	if got := status.CodeOf(err); got != utils.Vp8StatusBitstreamError {
+		t.Errorf("GetFeaturesPrefix(invalid header): status = %v, want %v (err: %v)", got, utils.Vp8StatusBitstreamError, err)
+	}
 }

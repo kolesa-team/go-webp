@@ -30,8 +30,6 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/stretchr/testify/require"
-
 	"github.com/kolesa-team/go-webp/v2/decoder"
 	"github.com/kolesa-team/go-webp/v2/encoder"
 	"github.com/kolesa-team/go-webp/v2/internal/alpha"
@@ -124,11 +122,17 @@ func testSizes() [][2]int {
 func encodeDecode(t *testing.T, img image.Image, o *encoder.Options) *image.NRGBA {
 	t.Helper()
 	buf := &bytes.Buffer{}
-	require.NoError(t, Encode(buf, img, o))
+	if err := Encode(buf, img, o); err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
 	out, err := Decode(bytes.NewReader(buf.Bytes()), nil)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
 	n := out.(*image.NRGBA)
-	require.Equal(t, img.Bounds().Size(), n.Bounds().Size())
+	if got, want := n.Bounds().Size(), img.Bounds().Size(); got != want {
+		t.Fatalf("decoded size %v, want %v", got, want)
+	}
 	return n
 }
 
@@ -142,16 +146,22 @@ func TestRoundtripLossless(t *testing.T) {
 					}
 					name := fmt.Sprintf("%dx%d/%s/z%d/exact%d", size[0], size[1], s.name, level, exact)
 					o, err := encoder.NewLosslessEncoderOptions(encoder.PresetDefault, level)
-					require.NoError(t, err)
+					if err != nil {
+						t.Fatalf("%s: NewLosslessEncoderOptions: %v", name, err)
+					}
 					o.Exact = exact
 					got := encodeDecode(t, s.img, o)
 					for i := 0; i < len(got.Pix); i += 4 {
 						want := s.img.Pix[i : i+4]
 						if exact == 0 && want[3] == 0 {
-							require.Equal(t, want[3], got.Pix[i+3], name)
+							if got.Pix[i+3] != want[3] {
+								t.Fatalf("%s pixel %d: alpha %d, want %d", name, i/4, got.Pix[i+3], want[3])
+							}
 							continue
 						}
-						require.Equal(t, want, got.Pix[i:i+4], "%s pixel %d", name, i/4)
+						if !bytes.Equal(want, got.Pix[i:i+4]) {
+							t.Fatalf("%s pixel %d = %v, want %v", name, i/4, got.Pix[i:i+4], want)
+						}
 					}
 				}
 			}
@@ -172,19 +182,27 @@ func TestRoundtripLossy(t *testing.T) {
 						}
 						name := fmt.Sprintf("%dx%d/%s/preset%d/q%g/m%d", size[0], size[1], s.name, preset, q, method)
 						o, err := encoder.NewLossyEncoderOptions(preset, q)
-						require.NoError(t, err)
+						if err != nil {
+							t.Fatalf("%s: NewLossyEncoderOptions: %v", name, err)
+						}
 						o.Method = method
 						o.Exact = 1
 						got := encodeDecode(t, s.img, o)
 						// alpha_quality is 100: alpha is coded losslessly.
 						for i := 3; i < len(got.Pix); i += 4 {
-							require.Equal(t, s.img.Pix[i], got.Pix[i], "%s alpha %d", name, i/4)
+							if got.Pix[i] != s.img.Pix[i] {
+								t.Fatalf("%s alpha %d = %d, want %d", name, i/4, got.Pix[i], s.img.Pix[i])
+							}
 						}
 						if s.name == "gradient" && q >= 50 && size[0] >= 17 {
-							require.Greater(t, psnr(s.img, got), 30.0, name)
+							if p := psnr(s.img, got); !(p > 30.0) {
+								t.Fatalf("%s: PSNR %.2f dB, want > 30", name, p)
+							}
 						}
 						if q >= 90 && s.name == "gradient" {
-							require.Greater(t, psnr(s.img, got), 20.0, name)
+							if p := psnr(s.img, got); !(p > 20.0) {
+								t.Fatalf("%s: PSNR %.2f dB, want > 20", name, p)
+							}
 						}
 					}
 				}
@@ -212,10 +230,14 @@ func TestRoundtripLossyOptions(t *testing.T) {
 	}
 	for name, mut := range mutations {
 		o, err := encoder.NewLossyEncoderOptions(encoder.PresetDefault, 75)
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("%s: NewLossyEncoderOptions: %v", name, err)
+		}
 		mut(o)
 		got := encodeDecode(t, img, o)
-		require.Greater(t, psnr(img, got), 25.0, name)
+		if p := psnr(img, got); !(p > 25.0) {
+			t.Fatalf("%s: PSNR %.2f dB, want > 25", name, p)
+		}
 	}
 }
 
@@ -240,15 +262,21 @@ func TestRoundtripSourceTypes(t *testing.T) {
 	for _, src := range []image.Image{rgba, gray, ycc} {
 		ref := toNRGBA(src)
 		lossless, err := encoder.NewLosslessEncoderOptions(encoder.PresetDefault, 6)
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("NewLosslessEncoderOptions: %v", err)
+		}
 		got := encodeDecode(t, src, lossless)
 		if _, isYCC := src.(*image.YCbCr); isYCC {
-			require.Greater(t, psnr(ref, got), 45.0) // YCbCr->RGB rounding
-		} else {
-			require.Equal(t, ref.Pix, got.Pix, "%T", src)
+			if p := psnr(ref, got); !(p > 45.0) { // YCbCr->RGB rounding
+				t.Fatalf("%T lossless: PSNR %.2f dB, want > 45", src, p)
+			}
+		} else if !bytes.Equal(ref.Pix, got.Pix) {
+			t.Fatalf("%T lossless: decoded pixels differ from the source (%d bytes, want %d)", src, len(got.Pix), len(ref.Pix))
 		}
 		got = encodeDecode(t, src, nil)
-		require.Greater(t, psnr(ref, got), 30.0, "%T", src)
+		if p := psnr(ref, got); !(p > 30.0) {
+			t.Fatalf("%T lossy: PSNR %.2f dB, want > 30", src, p)
+		}
 	}
 }
 
@@ -265,34 +293,54 @@ func TestAlphaDithering(t *testing.T) {
 			plane[y*w+x] = a
 		}
 	}
-	require.NoError(t, alpha.QuantizeLevels(plane, w, h, w, 4))
+	if err := alpha.QuantizeLevels(plane, w, h, w, 4); err != nil {
+		t.Fatalf("QuantizeLevels: %v", err)
+	}
 	quantized := bytes.Clone(plane)
 	enc, err := vp8lenc.EncodeAlpha(plane, w, h, w, 4, 50)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("EncodeAlpha: %v", err)
+	}
 	alph := append([]byte{alpha.Header{Compression: alpha.CompressionLossless, PreProcessing: alpha.PreprocessingLevels}.Byte()}, enc...)
 	pic := vp8enc.FromNRGBA(img, false, true)
 	vp8, err := vp8enc.Encode(pic, nil)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("vp8enc.Encode: %v", err)
+	}
 	buf := &bytes.Buffer{}
-	require.NoError(t, container.WriteLossy(buf, w, h, vp8, alph))
+	if err := container.WriteLossy(buf, w, h, vp8, alph); err != nil {
+		t.Fatalf("WriteLossy: %v", err)
+	}
 
 	for _, strength := range []int{0, 50, 100, 1000} {
 		out, err := Decode(bytes.NewReader(buf.Bytes()), &decoder.Options{AlphaDitheringStrength: strength})
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("strength %d: Decode: %v", strength, err)
+		}
 		want := bytes.Clone(quantized)
 		if strength > 0 {
-			require.NoError(t, alpha.Dequantize(want, w, h, w, min(strength, 100)))
+			if err := alpha.Dequantize(want, w, h, w, min(strength, 100)); err != nil {
+				t.Fatalf("strength %d: Dequantize: %v", strength, err)
+			}
 		}
 		n := out.(*image.NRGBA)
 		for i := range want {
-			require.Equal(t, want[i], n.Pix[4*i+3], "strength %d pixel %d", strength, i)
+			if n.Pix[4*i+3] != want[i] {
+				t.Fatalf("strength %d pixel %d: alpha %d, want %d", strength, i, n.Pix[4*i+3], want[i])
+			}
 		}
 	}
 
 	f, err := GetFeatures(bytes.NewReader(buf.Bytes()))
-	require.NoError(t, err)
-	require.Equal(t, utils.FormatLossy, f.Format)
-	require.True(t, f.HasAlpha)
+	if err != nil {
+		t.Fatalf("GetFeatures: %v", err)
+	}
+	if f.Format != utils.FormatLossy {
+		t.Fatalf("Format = %v, want %v (lossy)", f.Format, utils.FormatLossy)
+	}
+	if !f.HasAlpha {
+		t.Fatal("HasAlpha = false, want true")
+	}
 }
 
 // TestDecodeScaledAlpha decodes a lossy picture with alpha through the YUV
@@ -300,14 +348,20 @@ func TestAlphaDithering(t *testing.T) {
 func TestDecodeScaledAlpha(t *testing.T) {
 	img := synthImages(80, 60)[2].img
 	buf := &bytes.Buffer{}
-	require.NoError(t, Encode(buf, img, nil))
+	if err := Encode(buf, img, nil); err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
 	for _, o := range []*decoder.Options{
 		{Scale: image.Rectangle{Max: image.Pt(40, 30)}},
 		{Scale: image.Rectangle{Max: image.Pt(160, 90)}, Flip: true},
 		{Scale: image.Rectangle{Max: image.Pt(33, 21)}, Crop: image.Rectangle{Min: image.Pt(9, 5), Max: image.Pt(50, 40)}},
 	} {
 		out, err := Decode(bytes.NewReader(buf.Bytes()), o)
-		require.NoError(t, err)
-		require.Equal(t, o.Scale.Max, out.Bounds().Max)
+		if err != nil {
+			t.Fatalf("Decode(%+v): %v", o, err)
+		}
+		if got := out.Bounds().Max; got != o.Scale.Max {
+			t.Fatalf("Decode(%+v): Bounds().Max = %v, want %v", o, got, o.Scale.Max)
+		}
 	}
 }

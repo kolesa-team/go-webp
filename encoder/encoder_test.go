@@ -31,9 +31,6 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-
 	"github.com/kolesa-team/go-webp/v2/internal/alpha"
 	"github.com/kolesa-team/go-webp/v2/internal/container"
 	"github.com/kolesa-team/go-webp/v2/internal/vp8l"
@@ -50,36 +47,68 @@ func TestNewEncoder(t *testing.T) {
 		img := image.NewNRGBA(image.Rect(0, 0, 100, 150))
 
 		options, err := NewLossyEncoderOptions(PresetDefault, 0.75)
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("NewLossyEncoderOptions: %v", err)
+		}
 
 		e, err := NewEncoder(img, options)
-		require.NoError(t, err)
-		require.NoError(t, e.Encode(out))
+		if err != nil {
+			t.Fatalf("NewEncoder: %v", err)
+		}
+		if err := e.Encode(out); err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
 
 		parsed, err := container.Parse(out.Bytes())
-		require.NoError(t, err)
-		assert.Equal(t, 100, parsed.Width)
-		assert.Equal(t, 150, parsed.Height)
-		assert.True(t, parsed.HasAlpha, "a fully transparent image needs an ALPH chunk")
-		assert.NotNil(t, parsed.VP8)
-		assert.NotNil(t, parsed.ALPH)
+		if err != nil {
+			t.Fatalf("container.Parse: %v", err)
+		}
+		if parsed.Width != 100 {
+			t.Errorf("Width = %d, want 100", parsed.Width)
+		}
+		if parsed.Height != 150 {
+			t.Errorf("Height = %d, want 150", parsed.Height)
+		}
+		if !parsed.HasAlpha {
+			t.Error("HasAlpha = false, want true: a fully transparent image needs an ALPH chunk")
+		}
+		if parsed.VP8 == nil {
+			t.Error("VP8 = nil, want a lossy bitstream")
+		}
+		if parsed.ALPH == nil {
+			t.Error("ALPH = nil, want an ALPH chunk")
+		}
 	})
 	t.Run("encode nrgba image with lossless preset", func(t *testing.T) {
 		out := &bytes.Buffer{}
 		img := image.NewNRGBA(image.Rect(0, 0, 100, 150))
 
 		options, err := NewLosslessEncoderOptions(PresetDefault, 1)
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("NewLosslessEncoderOptions: %v", err)
+		}
 
 		e, err := NewEncoder(img, options)
-		require.NoError(t, err)
-		require.NoError(t, e.Encode(out))
+		if err != nil {
+			t.Fatalf("NewEncoder: %v", err)
+		}
+		if err := e.Encode(out); err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
 
 		parsed, err := container.Parse(out.Bytes())
-		require.NoError(t, err)
-		assert.Equal(t, 100, parsed.Width)
-		assert.Equal(t, 150, parsed.Height)
-		assert.NotNil(t, parsed.VP8L)
+		if err != nil {
+			t.Fatalf("container.Parse: %v", err)
+		}
+		if parsed.Width != 100 {
+			t.Errorf("Width = %d, want 100", parsed.Width)
+		}
+		if parsed.Height != 150 {
+			t.Errorf("Height = %d, want 150", parsed.Height)
+		}
+		if parsed.VP8L == nil {
+			t.Error("VP8L = nil, want a lossless bitstream")
+		}
 	})
 }
 
@@ -89,28 +118,44 @@ func TestNewEncoder_NilOptions(t *testing.T) {
 		img := image.NewNRGBA(image.Rect(0, 0, 100, 150))
 
 		e, err := NewEncoder(img, nil)
-		require.NoError(t, err)
-		require.NoError(t, e.Encode(out))
+		if err != nil {
+			t.Fatalf("NewEncoder: %v", err)
+		}
+		if err := e.Encode(out); err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
 
 		parsed, err := container.Parse(out.Bytes())
-		require.NoError(t, err)
-		assert.NotNil(t, parsed.VP8, "nil options must encode lossy")
+		if err != nil {
+			t.Fatalf("container.Parse: %v", err)
+		}
+		if parsed.VP8 == nil {
+			t.Error("VP8 = nil: nil options must encode lossy")
+		}
 	})
 }
 
 func TestEncoder_BadDimensions(t *testing.T) {
 	options, err := NewLosslessEncoderOptions(PresetDefault, 4)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewLosslessEncoderOptions: %v", err)
+	}
 	for _, r := range []image.Rectangle{
 		image.Rect(0, 0, 0, 0),
 		image.Rect(0, 0, 16384, 1),
 		image.Rect(0, 0, 1, 20000),
 	} {
 		e, err := NewEncoder(image.NewNRGBA(r), options)
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("NewEncoder(%v): %v", r, err)
+		}
 		err = e.Encode(io.Discard)
-		require.EqualError(t, err, "cannot encode webppicture") // exactly v1's message
-		require.Error(t, errors.Unwrap(err), "the detailed cause is wrapped")
+		if err == nil || err.Error() != "cannot encode webppicture" { // exactly v1's message
+			t.Fatalf("Encode(%v) = %v, want %q", r, err, "cannot encode webppicture")
+		}
+		if errors.Unwrap(err) == nil {
+			t.Fatalf("Encode(%v): errors.Unwrap(err) = nil, want the detailed cause wrapped", r)
+		}
 	}
 }
 
@@ -126,38 +171,58 @@ func TestEncoder_Writer(t *testing.T) {
 	img := image.NewNRGBA(image.Rect(0, 0, 8, 8))
 	img.Pix[3] = 0x80 // forces VP8X + ALPH + VP8
 	e, err := NewEncoder(img, nil)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewEncoder: %v", err)
+	}
 
 	cw := &countWriter{}
-	require.NoError(t, e.Encode(cw))
-	assert.Equal(t, 1, cw.calls, "the file must be written with a single Write call")
+	if err := e.Encode(cw); err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	if cw.calls != 1 {
+		t.Errorf("Encode made %d Write calls, want 1: the file must be written with a single Write call", cw.calls)
+	}
 
-	assert.EqualError(t, e.Encode(failWriter{}), "boom")
+	if err := e.Encode(failWriter{}); err == nil || err.Error() != "boom" {
+		t.Errorf("Encode(failWriter) = %v, want %q", err, "boom")
+	}
 }
 
 func TestEncoder_InvalidAlphaCompression(t *testing.T) {
 	img := image.NewNRGBA(image.Rect(0, 0, 8, 8))
 	options, err := NewLossyEncoderOptions(PresetDefault, 75)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewLossyEncoderOptions: %v", err)
+	}
 	options.AlphaCompression = 2
 	e, err := NewEncoder(img, options)
-	require.NoError(t, err)
-	require.EqualError(t, e.Encode(io.Discard), "cannot encode webppicture")
+	if err != nil {
+		t.Fatalf("NewEncoder: %v", err)
+	}
+	if err := e.Encode(io.Discard); err == nil || err.Error() != "cannot encode webppicture" {
+		t.Fatalf("Encode = %v, want %q", err, "cannot encode webppicture")
+	}
 }
 
 // decodeALPH decodes the ALPH chunk of a lossy file.
 func decodeALPH(t *testing.T, data []byte, w, h int) (alpha.Header, []byte) {
 	t.Helper()
 	parsed, err := container.Parse(data)
-	require.NoError(t, err)
-	require.NotNil(t, parsed.ALPH)
+	if err != nil {
+		t.Fatalf("container.Parse: %v", err)
+	}
+	if parsed.ALPH == nil {
+		t.Fatal("ALPH = nil, want an ALPH chunk")
+	}
 	hdr, err := alpha.ParseHeader(parsed.ALPH[0])
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("alpha.ParseHeader: %v", err)
+	}
 	plane := make([]byte, w*h)
 	if hdr.Compression == alpha.CompressionNone {
 		copy(plane, parsed.ALPH[1:])
-	} else {
-		require.NoError(t, vp8l.DecodeAlpha(parsed.ALPH[1:], w, h, plane))
+	} else if err := vp8l.DecodeAlpha(parsed.ALPH[1:], w, h, plane); err != nil {
+		t.Fatalf("vp8l.DecodeAlpha: %v", err)
 	}
 	alpha.Unfilter(hdr.Filter, plane, w, h, w)
 	return hdr, plane
@@ -182,35 +247,53 @@ func TestEncoder_Alpha(t *testing.T) {
 		for _, filtering := range []int{0, 1, 2, 5} {
 			for _, method := range []int{0, 4, 6} {
 				options, err := NewLossyEncoderOptions(PresetDefault, 80)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("NewLossyEncoderOptions: %v", err)
+				}
 				options.AlphaCompression = compression
 				options.AlphaFiltering = filtering
 				options.Method = method
 				buf := &bytes.Buffer{}
-				require.NoError(t, encodeTo(t, img, options, buf))
-				hdr, plane := decodeALPH(t, buf.Bytes(), w, h)
-				assert.Equal(t, 0, hdr.PreProcessing)
-				if compression == 0 {
-					assert.Equal(t, alpha.FilterNone, hdr.Filter)
+				if err := encodeTo(t, img, options, buf); err != nil {
+					t.Fatalf("compression %d filtering %d method %d: encode: %v", compression, filtering, method, err)
 				}
-				assert.Equal(t, want, plane, "compression %d filtering %d method %d", compression, filtering, method)
+				hdr, plane := decodeALPH(t, buf.Bytes(), w, h)
+				if hdr.PreProcessing != 0 {
+					t.Errorf("compression %d filtering %d method %d: PreProcessing = %d, want 0", compression, filtering, method, hdr.PreProcessing)
+				}
+				if compression == 0 {
+					if hdr.Filter != alpha.FilterNone {
+						t.Errorf("compression 0 filtering %d method %d: Filter = %d, want %d (FilterNone)", filtering, method, hdr.Filter, alpha.FilterNone)
+					}
+				}
+				if !bytes.Equal(plane, want) {
+					t.Errorf("compression %d filtering %d method %d: the decoded alpha plane (%d bytes) differs from the source alpha (%d bytes)", compression, filtering, method, len(plane), len(want))
+				}
 			}
 		}
 	}
 
 	t.Run("quantized alpha", func(t *testing.T) {
 		options, err := NewLossyEncoderOptions(PresetDefault, 80)
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("NewLossyEncoderOptions: %v", err)
+		}
 		options.alphaQuality = 10 // 4 levels
 		buf := &bytes.Buffer{}
-		require.NoError(t, encodeTo(t, img, options, buf))
+		if err := encodeTo(t, img, options, buf); err != nil {
+			t.Fatalf("encode: %v", err)
+		}
 		hdr, plane := decodeALPH(t, buf.Bytes(), w, h)
-		assert.Equal(t, alpha.PreprocessingLevels, hdr.PreProcessing)
+		if hdr.PreProcessing != alpha.PreprocessingLevels {
+			t.Errorf("PreProcessing = %d, want %d (PreprocessingLevels)", hdr.PreProcessing, alpha.PreprocessingLevels)
+		}
 		levels := map[byte]bool{}
 		for _, v := range plane {
 			levels[v] = true
 		}
-		assert.LessOrEqual(t, len(levels), alpha.AlphaLevels(10))
+		if limit := alpha.AlphaLevels(10); len(levels) > limit {
+			t.Errorf("%d alpha levels, want at most %d", len(levels), limit)
+		}
 	})
 }
 
@@ -258,8 +341,12 @@ func TestToNRGBA(t *testing.T) {
 
 	for _, src := range []image.Image{rgba, gray, ycc, nycca, pal, gray16} {
 		got := toNRGBA(src)
-		require.Equal(t, r.Dx(), got.Rect.Dx())
-		require.Equal(t, r.Dy(), got.Rect.Dy())
+		if got.Rect.Dx() != r.Dx() {
+			t.Fatalf("%T: width = %d, want %d", src, got.Rect.Dx(), r.Dx())
+		}
+		if got.Rect.Dy() != r.Dy() {
+			t.Fatalf("%T: height = %d, want %d", src, got.Rect.Dy(), r.Dy())
+		}
 		for y := r.Min.Y; y < r.Max.Y; y++ {
 			for x := r.Min.X; x < r.Max.X; x++ {
 				want := color.NRGBAModel.Convert(src.At(x, y)).(color.NRGBA)
@@ -274,13 +361,23 @@ func TestToNRGBA(t *testing.T) {
 				if src == ycc || src == nycca {
 					// color.YCbCrToRGB vs the 16-bit YCbCr.RGBA path may
 					// differ by one.
-					require.InDelta(t, want.R, have.R, 1)
-					require.InDelta(t, want.G, have.G, 1)
-					require.InDelta(t, want.B, have.B, 1)
-					require.Equal(t, want.A, have.A)
+					if d := int(want.R) - int(have.R); d < -1 || d > 1 {
+						t.Fatalf("%T at %d,%d: R = %d, want %d ± 1", src, x, y, have.R, want.R)
+					}
+					if d := int(want.G) - int(have.G); d < -1 || d > 1 {
+						t.Fatalf("%T at %d,%d: G = %d, want %d ± 1", src, x, y, have.G, want.G)
+					}
+					if d := int(want.B) - int(have.B); d < -1 || d > 1 {
+						t.Fatalf("%T at %d,%d: B = %d, want %d ± 1", src, x, y, have.B, want.B)
+					}
+					if have.A != want.A {
+						t.Fatalf("%T at %d,%d: A = %d, want %d", src, x, y, have.A, want.A)
+					}
 					continue
 				}
-				require.Equal(t, want, have, "%T at %d,%d", src, x, y)
+				if have != want {
+					t.Fatalf("%T at %d,%d: got %v, want %v", src, x, y, have, want)
+				}
 			}
 		}
 	}
@@ -307,8 +404,12 @@ func TestToNRGBAOpaqueRGBACopies(t *testing.T) {
 		rgba.Pix[i] = 0xff
 	}
 	got := toNRGBA(rgba)
-	require.NotSame(t, &rgba.Pix[0], &got.Pix[0])
-	require.Equal(t, r.Size(), got.Rect.Size())
+	if &rgba.Pix[0] == &got.Pix[0] {
+		t.Fatal("toNRGBA shares the pixels of an opaque *image.RGBA, want a copy")
+	}
+	if got.Rect.Size() != r.Size() {
+		t.Fatalf("size = %v, want %v", got.Rect.Size(), r.Size())
+	}
 
 	nrgba := image.NewNRGBA(image.Rect(0, 0, r.Dx(), r.Dy()))
 	for y := 0; y < r.Dy(); y++ {
@@ -322,15 +423,27 @@ func TestToNRGBAOpaqueRGBACopies(t *testing.T) {
 		} else {
 			o, err = NewLossyEncoderOptions(PresetDefault, 75)
 		}
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("lossless=%v: options: %v", lossless, err)
+		}
 		var a, b bytes.Buffer
 		e1, err := NewEncoder(rgba, o)
-		require.NoError(t, err)
-		require.NoError(t, e1.Encode(&a))
+		if err != nil {
+			t.Fatalf("lossless=%v: NewEncoder(RGBA): %v", lossless, err)
+		}
+		if err := e1.Encode(&a); err != nil {
+			t.Fatalf("lossless=%v: Encode(RGBA): %v", lossless, err)
+		}
 		e2, err := NewEncoder(nrgba, o)
-		require.NoError(t, err)
-		require.NoError(t, e2.Encode(&b))
-		require.Equal(t, b.Bytes(), a.Bytes(), "lossless=%v", lossless)
+		if err != nil {
+			t.Fatalf("lossless=%v: NewEncoder(NRGBA): %v", lossless, err)
+		}
+		if err := e2.Encode(&b); err != nil {
+			t.Fatalf("lossless=%v: Encode(NRGBA): %v", lossless, err)
+		}
+		if !bytes.Equal(a.Bytes(), b.Bytes()) {
+			t.Fatalf("lossless=%v: the opaque *image.RGBA encodes differently from the equivalent *image.NRGBA (%d bytes, want %d)", lossless, a.Len(), b.Len())
+		}
 	}
 }
 
@@ -372,27 +485,45 @@ func TestNewEncoderSnapshot(t *testing.T) {
 		{"Gray", gray, func() { clear(gray.Pix) }},
 	}
 	lossy, err := NewLossyEncoderOptions(PresetDefault, 75)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewLossyEncoderOptions: %v", err)
+	}
 	lossless, err := NewLosslessEncoderOptions(PresetDefault, 6)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewLosslessEncoderOptions: %v", err)
+	}
 	for _, src := range sources {
 		for _, o := range []*Options{lossy, lossless} {
 			var want bytes.Buffer
 			e0, err := NewEncoder(src.img, o)
-			require.NoError(t, err)
-			require.NoError(t, e0.Encode(&want))
+			if err != nil {
+				t.Fatalf("%s lossless=%v: NewEncoder: %v", src.name, o.Lossless, err)
+			}
+			if err := e0.Encode(&want); err != nil {
+				t.Fatalf("%s lossless=%v: Encode: %v", src.name, o.Lossless, err)
+			}
 
 			e, err := NewEncoder(src.img, o)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("%s lossless=%v: NewEncoder: %v", src.name, o.Lossless, err)
+			}
 			saved := snapshotPix(src.img)
 			src.mutate()
 			var got bytes.Buffer
-			require.NoError(t, e.Encode(&got))
-			assert.Equal(t, want.Bytes(), got.Bytes(), "%s lossless=%v: source changed after NewEncoder", src.name, o.Lossless)
+			if err := e.Encode(&got); err != nil {
+				t.Fatalf("%s lossless=%v: Encode after the source changed: %v", src.name, o.Lossless, err)
+			}
+			if !bytes.Equal(got.Bytes(), want.Bytes()) {
+				t.Errorf("%s lossless=%v: source changed after NewEncoder: output differs (%d bytes, want %d)", src.name, o.Lossless, got.Len(), want.Len())
+			}
 			// Encode can be called again (the snapshot is not released).
 			got.Reset()
-			require.NoError(t, e.Encode(&got))
-			assert.Equal(t, want.Bytes(), got.Bytes(), "%s lossless=%v: second Encode", src.name, o.Lossless)
+			if err := e.Encode(&got); err != nil {
+				t.Fatalf("%s lossless=%v: second Encode: %v", src.name, o.Lossless, err)
+			}
+			if !bytes.Equal(got.Bytes(), want.Bytes()) {
+				t.Errorf("%s lossless=%v: second Encode: output differs (%d bytes, want %d)", src.name, o.Lossless, got.Len(), want.Len())
+			}
 			restorePix(src.img, saved)
 		}
 	}
@@ -401,13 +532,21 @@ func TestNewEncoderSnapshot(t *testing.T) {
 		n := image.NewNRGBA(image.Rect(0, 0, w, h))
 		rng.Read(n.Pix)
 		e, err := NewEncoder(n, lossless)
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("NewEncoder: %v", err)
+		}
 		var before bytes.Buffer
-		require.NoError(t, e.Encode(&before))
+		if err := e.Encode(&before); err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
 		clear(n.Pix)
 		var after bytes.Buffer
-		require.NoError(t, e.Encode(&after))
-		assert.NotEqual(t, before.Bytes(), after.Bytes())
+		if err := e.Encode(&after); err != nil {
+			t.Fatalf("Encode after clearing the source: %v", err)
+		}
+		if bytes.Equal(before.Bytes(), after.Bytes()) {
+			t.Error("clearing the *image.NRGBA source did not change the output, want its pixels used in place")
+		}
 	})
 }
 
@@ -457,12 +596,18 @@ func TestEncodeNaN(t *testing.T) {
 		} else {
 			o, err = NewLossyEncoderOptions(PresetDefault, 75)
 		}
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("lossless=%v: options: %v", lossless, err)
+		}
 		f(o)
 		var buf bytes.Buffer
-		require.NoError(t, encodeTo(t, img, o, &buf))
+		if err := encodeTo(t, img, o, &buf); err != nil {
+			t.Fatalf("lossless=%v: encode: %v", lossless, err)
+		}
 		_, err = container.Parse(buf.Bytes())
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("lossless=%v: container.Parse: %v", lossless, err)
+		}
 		return buf.Bytes()
 	}
 	for m := 0; m <= 6; m++ {
@@ -472,13 +617,17 @@ func TestEncodeNaN(t *testing.T) {
 			// switch, off for both); methods 0-1 also use (int)quality in
 			// the analysis.
 			want := encode(func(o *Options) { o.Quality, o.Method = 100, m }, false)
-			assert.Equal(t, want, got, "method %d: NaN quality", m)
+			if !bytes.Equal(got, want) {
+				t.Errorf("method %d: NaN quality: output differs from quality 100 (%d bytes, want %d)", m, len(got), len(want))
+			}
 		}
 	}
 	for _, pass := range []int{1, 3} {
 		want := encode(func(o *Options) { o.Pass = pass }, false)
 		got := encode(func(o *Options) { o.TargetPsnr, o.Pass = nan, pass }, false)
-		assert.Equal(t, want, got, "pass %d: NaN target PSNR", pass)
+		if !bytes.Equal(got, want) {
+			t.Errorf("pass %d: NaN target PSNR: output differs from no target (%d bytes, want %d)", pass, len(got), len(want))
+		}
 	}
 	// Searching with a NaN quality must terminate.
 	encode(func(o *Options) { o.Quality, o.TargetSize, o.Pass = nan, 500, 10 }, false)

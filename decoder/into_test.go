@@ -25,11 +25,9 @@ import (
 	"bytes"
 	"image"
 	"math"
+	"reflect"
 	"runtime"
 	"testing"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 
 	"github.com/kolesa-team/go-webp/v2/internal/status"
 	"github.com/kolesa-team/go-webp/v2/utils"
@@ -67,7 +65,9 @@ func dirty(c int) *image.NRGBA {
 func newDec(t testing.TB, data []byte, o *Options) *Decoder {
 	t.Helper()
 	d, err := NewDecoder(bytes.NewReader(data), o)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewDecoder(%+v): %v", o, err)
+	}
 	return d
 }
 
@@ -94,13 +94,25 @@ func TestDecodeIntoMatchesDecode(t *testing.T) {
 				c := n + extra
 				dst := dirty(c)
 				got, err := newDec(t, data, o).DecodeInto(dst)
-				require.NoError(t, err, "%s %+v", file, o)
-				require.Same(t, dst, got)
-				require.Equal(t, want.Rect, got.Rect, "%s %+v", file, o)
-				require.Equal(t, want.Stride, got.Stride)
-				require.True(t, bytes.Equal(want.Pix, got.Pix), "%s %+v cap %d", file, o, c)
+				if err != nil {
+					t.Fatalf("%s %+v: DecodeInto: %v", file, o, err)
+				}
+				if got != dst {
+					t.Fatalf("%s %+v cap %d: DecodeInto returned %p, want dst %p", file, o, c, got, dst)
+				}
+				if got.Rect != want.Rect {
+					t.Fatalf("%s %+v: Rect = %v, want %v", file, o, got.Rect, want.Rect)
+				}
+				if got.Stride != want.Stride {
+					t.Fatalf("%s %+v: Stride = %d, want %d", file, o, got.Stride, want.Stride)
+				}
+				if !bytes.Equal(want.Pix, got.Pix) {
+					t.Fatalf("%s %+v cap %d: pixels differ from Decode", file, o, c)
+				}
 				if c >= n {
-					assert.Equal(t, c, cap(got.Pix), "%s %+v: buffer not reused", file, o)
+					if cap(got.Pix) != c {
+						t.Errorf("%s %+v: buffer not reused: cap %d, want %d", file, o, cap(got.Pix), c)
+					}
 				}
 			}
 		}
@@ -117,11 +129,19 @@ func TestDecodeIntoReuse(t *testing.T) {
 	var dst *image.NRGBA
 	var err error
 	dst, err = newDec(t, small, nil).DecodeInto(dst)
-	require.NoError(t, err)
-	require.Equal(t, image.Rect(0, 0, 675, 900), dst.Rect)
+	if err != nil {
+		t.Fatalf("DecodeInto (675x900): %v", err)
+	}
+	if want := image.Rect(0, 0, 675, 900); dst.Rect != want {
+		t.Fatalf("Rect = %v, want %v", dst.Rect, want)
+	}
 	dst, err = newDec(t, big, nil).DecodeInto(dst)
-	require.NoError(t, err)
-	require.Equal(t, image.Rect(0, 0, 3000, 2000), dst.Rect)
+	if err != nil {
+		t.Fatalf("DecodeInto (3000x2000): %v", err)
+	}
+	if want := image.Rect(0, 0, 3000, 2000); dst.Rect != want {
+		t.Fatalf("Rect = %v, want %v", dst.Rect, want)
+	}
 	p0 := &dst.Pix[0]
 	for _, c := range []struct {
 		data []byte
@@ -149,23 +169,37 @@ func TestDecodeIntoReuse(t *testing.T) {
 		var least uint64 = math.MaxUint64
 		for attempt := 0; attempt < attempts && least >= reuseAllocLimit; attempt++ {
 			_, err := newDec(t, c.data, c.o).DecodeInto(dst) // warm the internal pools
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("%+v: warm-up DecodeInto: %v", c.o, err)
+			}
 			d := newDec(t, c.data, c.o)
 			var m0, m1 runtime.MemStats
 			runtime.ReadMemStats(&m0)
 			got, err := d.DecodeInto(dst)
 			runtime.ReadMemStats(&m1)
-			require.NoError(t, err)
-			require.Equal(t, c.rect, got.Rect)
-			require.Same(t, p0, &got.Pix[0])
-			require.Equal(t, 3000*2000*4, cap(got.Pix))
-			require.True(t, bytes.Equal(want.Pix, got.Pix))
+			if err != nil {
+				t.Fatalf("%+v: DecodeInto: %v", c.o, err)
+			}
+			if got.Rect != c.rect {
+				t.Fatalf("%+v: Rect = %v, want %v", c.o, got.Rect, c.rect)
+			}
+			if &got.Pix[0] != p0 {
+				t.Fatalf("%+v: DecodeInto did not reuse the pixel buffer", c.o)
+			}
+			if wantCap := 3000 * 2000 * 4; cap(got.Pix) != wantCap {
+				t.Fatalf("%+v: cap(Pix) = %d, want %d", c.o, cap(got.Pix), wantCap)
+			}
+			if !bytes.Equal(want.Pix, got.Pix) {
+				t.Fatalf("%+v: pixels differ from Decode", c.o)
+			}
 			least = min(least, m1.TotalAlloc-m0.TotalAlloc)
 		}
 		// The output alone would be 2.4-24 MB. (With the race detector
 		// sync.Pool drops objects at random.)
 		if !raceEnabled {
-			assert.Less(t, least, uint64(reuseAllocLimit), "%+v", c.o)
+			if least >= reuseAllocLimit {
+				t.Errorf("%+v: DecodeInto allocated %d bytes, want < %d", c.o, least, reuseAllocLimit)
+			}
 		}
 	}
 }
@@ -178,8 +212,12 @@ const reuseAllocLimit = 2 << 20
 func TestDecodeIntoNil(t *testing.T) {
 	data := readFile(t, "100x150_lossy.webp")
 	got, err := newDec(t, data, nil).DecodeInto(nil)
-	require.NoError(t, err)
-	assert.Equal(t, decode(t, data, nil), got)
+	if err != nil {
+		t.Fatalf("DecodeInto(nil): %v", err)
+	}
+	if want := decode(t, data, nil); !reflect.DeepEqual(want, got) {
+		t.Error("DecodeInto(nil) differs from Decode")
+	}
 }
 
 // TestDecodeIntoErrors checks that a failed decode reports the same error
@@ -204,12 +242,22 @@ func TestDecodeIntoErrors(t *testing.T) {
 			dst := dirty(size)
 			before := *dst
 			_, wantErr := newDec(t, c.data, c.o).Decode()
-			require.Error(t, wantErr)
+			if wantErr == nil {
+				t.Fatalf("%+v: Decode: no error, want %v", c.o, c.code)
+			}
 			got, err := newDec(t, c.data, c.o).DecodeInto(dst)
-			assert.Nil(t, got)
-			require.EqualError(t, err, wantErr.Error())
-			assert.Equal(t, c.code, status.CodeOf(err))
-			assert.Equal(t, before, *dst, "dst fields must be unchanged on error")
+			if got != nil {
+				t.Errorf("%+v size %d: DecodeInto returned an image, want nil", c.o, size)
+			}
+			if err == nil || err.Error() != wantErr.Error() {
+				t.Fatalf("%+v size %d: DecodeInto error %v, want %q", c.o, size, err, wantErr.Error())
+			}
+			if code := status.CodeOf(err); code != c.code {
+				t.Errorf("%+v size %d: code %v, want %v", c.o, size, code, c.code)
+			}
+			if !reflect.DeepEqual(before, *dst) {
+				t.Errorf("%+v size %d: dst fields must be unchanged on error", c.o, size)
+			}
 		}
 	}
 }

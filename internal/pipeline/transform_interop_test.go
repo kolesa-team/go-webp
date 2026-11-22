@@ -46,21 +46,24 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/stretchr/testify/require"
-
 	"github.com/kolesa-team/go-webp/v2/internal/container"
 	"github.com/kolesa-team/go-webp/v2/utils"
 )
 
 // readPAM parses the RGBA PAM files written by "dwebp -pam".
 func readPAM(t testing.TB, path string) *image.NRGBA {
+	t.Helper()
 	data, err := os.ReadFile(path)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("readPAM: %v", err)
+	}
 	br := bufio.NewReader(bytes.NewReader(data))
 	w, h, off := 0, 0, 0
 	for {
 		line, err := br.ReadString('\n')
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("readPAM(%s): reading the header: %v", path, err)
+		}
 		off += len(line)
 		f := strings.Fields(line)
 		if len(f) == 2 && f[0] == "WIDTH" {
@@ -74,12 +77,15 @@ func readPAM(t testing.TB, path string) *image.NRGBA {
 		}
 	}
 	img := image.NewNRGBA(image.Rect(0, 0, w, h))
-	require.Equal(t, len(img.Pix), len(data)-off)
+	if len(img.Pix) != len(data)-off {
+		t.Fatalf("readPAM(%s): %d bytes of %dx%d pixels, want %d", path, len(data)-off, w, h, len(img.Pix))
+	}
 	copy(img.Pix, data[off:])
 	return img
 }
 
 func dwebp(t testing.TB, dir, in string, args ...string) *image.NRGBA {
+	t.Helper()
 	out := filepath.Join(dir, fmt.Sprintf("out%d.pam", rand.Int()))
 	bin := os.Getenv("INTEROP_DWEBP")
 	if bin == "" {
@@ -87,7 +93,9 @@ func dwebp(t testing.TB, dir, in string, args ...string) *image.NRGBA {
 	}
 	cmd := exec.Command(bin, append([]string{in, "-pam", "-o", out}, args...)...)
 	b, err := cmd.CombinedOutput()
-	require.NoError(t, err, string(b))
+	if err != nil {
+		t.Fatalf("%v: %v\n%s", cmd, err, b)
+	}
 	return readPAM(t, out)
 }
 
@@ -111,6 +119,7 @@ func diffStats(a, b *image.NRGBA) (maxd int, mean float64, n int) {
 }
 
 func corpus(t *testing.T, dir string) []string {
+	t.Helper()
 	files, _ := filepath.Glob("../../test_data/images/*.webp")
 	var out []string
 	for _, f := range files {
@@ -127,7 +136,9 @@ func corpus(t *testing.T, dir string) []string {
 		dst := filepath.Join(dir, fmt.Sprintf("enc%d.webp", len(out)))
 		cmd := exec.Command("cwebp", append(append([]string{"-quiet"}, args...), "../../test_data/images/logo.jpg", "-o", dst)...)
 		b, err := cmd.CombinedOutput()
-		require.NoError(t, err, string(b))
+		if err != nil {
+			t.Fatalf("%v: %v\n%s", cmd, err, b)
+		}
 		out = append(out, dst)
 	}
 	if extra := os.Getenv("INTEROP_CORPUS"); extra != "" {
@@ -163,7 +174,9 @@ func TestInteropTransforms(t *testing.T) {
 	}
 	for _, file := range corpus(t, dir) {
 		data, err := os.ReadFile(file)
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("ReadFile: %v", err)
+		}
 		feat, err := container.GetFeatures(data)
 		if err != nil || feat.HasAnimation {
 			continue
@@ -197,17 +210,23 @@ func TestInteropTransforms(t *testing.T) {
 			}
 			want := dwebp(t, dir, file, args...)
 			s, img, err := NewSink(p)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("%s: NewSink(%+v): %v", file, p, err)
+			}
 			feed(t, s, src, 16, r, false)
 			m, mean, n := diffStats(img(), want)
 			add(kind+" crop", m, mean, n)
-			require.Equal(t, 0, m, "%s crop %v flip %v", file, crop, flip)
+			if m != 0 {
+				t.Fatalf("%s crop %v flip %v: max abs diff = %d, want 0", file, crop, flip, m)
+			}
 
 			if !lossless {
 				// With fancy upsampling libwebp upsamples chroma inside the crop window only.
 				want := dwebp(t, dir, file, args[:len(args)-1]...)
 				s, img, err := NewSink(p)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("%s: NewSink(%+v): %v", file, p, err)
+				}
 				feed(t, s, full, 16, r, false)
 				m, mean, n := diffStats(img(), want)
 				add(kind+" crop (fancy upsampling)", m, mean, n)
@@ -238,7 +257,9 @@ func TestInteropTransforms(t *testing.T) {
 			p.Premultiply = lossless
 			want = dwebp(t, dir, file, rargs...)
 			s, img, err = NewSink(p)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("%s: NewSink(%+v): %v", file, p, err)
+			}
 			feed(t, s, fullNoFancy, 16, r, false)
 			m, mean, n = diffStats(img(), want)
 			k := kind + " resize"
@@ -246,11 +267,11 @@ func TestInteropTransforms(t *testing.T) {
 			if os.Getenv("INTEROP_VERBOSE") != "" && !lossless {
 				t.Logf("%s %dx%d crop %v -> %dx%d: max %d mean %.3f", filepath.Base(file), W, H, p.Crop, sw, sh, m, mean)
 			}
-			if lossless && os.Getenv("INTEROP_EXACT_RESCALE") == "1" {
-				require.Equal(t, 0, m, "%s resize %v -> %dx%d", file, p.Crop, sw, sh)
+			if lossless && os.Getenv("INTEROP_EXACT_RESCALE") == "1" && m != 0 {
+				t.Fatalf("%s resize %v -> %dx%d: max abs diff = %d, want 0", file, p.Crop, sw, sh, m)
 			}
-			if lossless {
-				require.Less(t, mean, 0.01, "%s resize %v -> %dx%d", file, p.Crop, sw, sh)
+			if lossless && !(mean < 0.01) {
+				t.Fatalf("%s resize %v -> %dx%d: mean abs diff = %g, want < 0.01", file, p.Crop, sw, sh, mean)
 			}
 		}
 	}
@@ -261,17 +282,24 @@ func TestInteropTransforms(t *testing.T) {
 
 // dwebpYUV decodes file to raw Y, U, V (and A) planes with "dwebp -yuv".
 func dwebpYUV(t testing.TB, dir, in string, w, h int, alpha bool, args ...string) (y, u, v, a []byte) {
+	t.Helper()
 	out := filepath.Join(dir, fmt.Sprintf("out%d.yuv", rand.Int()))
 	b, err := exec.Command("dwebp", append([]string{in, "-yuv", "-o", out}, args...)...).CombinedOutput()
-	require.NoError(t, err, string(b))
+	if err != nil {
+		t.Fatalf("dwebp %s -yuv %v: %v\n%s", in, args, err, b)
+	}
 	data, err := os.ReadFile(out)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("dwebpYUV: %v", err)
+	}
 	uw, uh := (w+1)/2, (h+1)/2
 	want := w*h + 2*uw*uh
 	if alpha {
 		want += w * h
 	}
-	require.Equal(t, want, len(data))
+	if want != len(data) {
+		t.Fatalf("dwebp %s -yuv %v: %d bytes for %dx%d (alpha %v), want %d", in, args, len(data), w, h, alpha, want)
+	}
 	y, data = data[:w*h], data[w*h:]
 	u, data = data[:uw*uh], data[uw*uh:]
 	v, data = data[:uw*uh], data[uw*uh:]
@@ -293,14 +321,18 @@ func TestInteropYUVScaling(t *testing.T) {
 	worst, cases := 0, 0
 	for _, file := range corpus(t, dir) {
 		data, err := os.ReadFile(file)
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("ReadFile: %v", err)
+		}
 		feat, err := container.GetFeatures(data)
 		if err != nil || feat.HasAnimation || feat.Format != utils.FormatLossy {
 			continue
 		}
 		W, H := feat.Width, feat.Height
 		img, err := container.Parse(data)
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("%s: container.Parse: %v", file, err)
+		}
 		hasAlpha := img.ALPH != nil
 		yp, up, vp, ap := dwebpYUV(t, dir, file, W, H, hasAlpha, "-nofilter")
 		for i := 0; i < 6; i++ {
@@ -327,9 +359,13 @@ func TestInteropYUVScaling(t *testing.T) {
 			}
 			want := dwebp(t, dir, file, args...)
 			s, out, err := NewSink(p)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("%s: NewSink(%+v): %v", file, p, err)
+			}
 			ys, ok := s.(YUVSink)
-			require.True(t, ok)
+			if !ok {
+				t.Fatalf("%s: NewSink(%+v) = %T, want a YUVSink", file, p, s)
+			}
 			uw := (W + 1) / 2
 			for y := 0; y < s.NeedRows(); {
 				n := min(H-y, []int{16, 1 + r.Intn(20), 2, 7}[i%4])
@@ -337,19 +373,27 @@ func TestInteropYUVScaling(t *testing.T) {
 				if hasAlpha {
 					a = ap[y*W:]
 				}
-				require.NoError(t, ys.CommitYUV(y, n, yp[y*W:], W, up[(y/2)*uw:], vp[(y/2)*uw:], uw, a, W))
+				if err := ys.CommitYUV(y, n, yp[y*W:], W, up[(y/2)*uw:], vp[(y/2)*uw:], uw, a, W); err != nil {
+					t.Fatalf("%s %+v: CommitYUV(%d, %d): %v", file, p, y, n, err)
+				}
 				y += n
 			}
 			m, mean, _ := diffStats(out(), want)
 			worst = max(worst, m)
 			cases++
 			if os.Getenv("INTEROP_EXACT_RESCALE") == "1" {
-				require.Equal(t, 0, m, "%s %+v (mean %.4f)", file, p, mean)
+				if m != 0 {
+					t.Fatalf("%s %+v (mean %.4f): max abs diff = %d, want 0", file, p, mean, m)
+				}
 			} else {
 				// libwebp's NEON rescaler rounds +-1 differently in rare
 				// cases; the YUV->RGB conversion amplifies that a little.
-				require.LessOrEqual(t, m, 4, "%s %+v (mean %.4f)", file, p, mean)
-				require.Less(t, mean, 0.001, "%s %+v", file, p)
+				if m > 4 {
+					t.Fatalf("%s %+v (mean %.4f): max abs diff = %d, want <= 4", file, p, mean, m)
+				}
+				if !(mean < 0.001) {
+					t.Fatalf("%s %+v: mean abs diff = %g, want < 0.001", file, p, mean)
+				}
 			}
 		}
 	}

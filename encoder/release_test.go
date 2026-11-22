@@ -34,8 +34,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/require"
-
 	"github.com/kolesa-team/go-webp/v2/internal/bufpool"
 )
 
@@ -72,10 +70,15 @@ func sourceImages(w, h int, seed int64) []image.Image {
 }
 
 func lossyLossless(t testing.TB) []*Options {
+	t.Helper()
 	lossy, err := NewLossyEncoderOptions(PresetDefault, 75)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewLossyEncoderOptions: %v", err)
+	}
 	lossless, err := NewLosslessEncoderOptions(PresetDefault, 6)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewLosslessEncoderOptions: %v", err)
+	}
 	return []*Options{lossy, lossless}
 }
 
@@ -86,24 +89,42 @@ func TestRelease(t *testing.T) {
 		for _, src := range sourceImages(37, 29, 1) {
 			name := fmt.Sprintf("%T lossless=%v", src, o.Lossless)
 			e, err := NewEncoder(src, o)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("%s: NewEncoder: %v", name, err)
+			}
 			var want bytes.Buffer
-			require.NoError(t, e.Encode(&want), name)
+			if err := e.Encode(&want); err != nil {
+				t.Fatalf("%s: Encode: %v", name, err)
+			}
 			e.Release()
 			var cw countWriter
-			require.ErrorIs(t, e.Encode(&cw), ErrReleased, name)
-			require.ErrorIs(t, e.EncodeContext(ctx, &cw), ErrReleased, name)
-			require.Zero(t, cw.calls, name)
+			if err := e.Encode(&cw); !errors.Is(err, ErrReleased) {
+				t.Fatalf("%s: Encode after Release = %v, want %v", name, err, ErrReleased)
+			}
+			if err := e.EncodeContext(ctx, &cw); !errors.Is(err, ErrReleased) {
+				t.Fatalf("%s: EncodeContext after Release = %v, want %v", name, err, ErrReleased)
+			}
+			if cw.calls != 0 {
+				t.Fatalf("%s: %d Write calls after Release, want 0", name, cw.calls)
+			}
 			e.Release() // no-op
-			require.Nil(t, e.img, name)
-			require.Nil(t, e.pic, name)
+			if e.img != nil {
+				t.Fatalf("%s: img = %p after Release, want nil", name, e.img)
+			}
+			if e.pic != nil {
+				t.Fatalf("%s: pic = %p after Release, want nil", name, e.pic)
+			}
 		}
 	}
 	// No snapshot to release.
 	e, err := NewEncoder(image.NewNRGBA(image.Rect(0, 0, 0, 7)), nil)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewEncoder(0x7): %v", err)
+	}
 	e.Release()
-	require.ErrorIs(t, e.Encode(&bytes.Buffer{}), ErrReleased)
+	if err := e.Encode(&bytes.Buffer{}); !errors.Is(err, ErrReleased) {
+		t.Fatalf("Encode(0x7) after Release = %v, want %v", err, ErrReleased)
+	}
 	var nilEncoder *Encoder
 	nilEncoder.Release()
 }
@@ -122,9 +143,13 @@ func TestReleaseRecycles(t *testing.T) {
 		want := make([][]byte, len(srcs))
 		for i, src := range srcs {
 			e, err := NewEncoder(src, o)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("%T %v lossless=%v: NewEncoder: %v", src, src.Bounds(), o.Lossless, err)
+			}
 			var buf bytes.Buffer
-			require.NoError(t, e.Encode(&buf))
+			if err := e.Encode(&buf); err != nil {
+				t.Fatalf("%T %v lossless=%v: Encode: %v", src, src.Bounds(), o.Lossless, err)
+			}
 			want[i] = buf.Bytes() // e is not released: fresh storage for all
 		}
 		// Now with recycling, twice in different orders.
@@ -132,11 +157,17 @@ func TestReleaseRecycles(t *testing.T) {
 		for round := 0; round < 2; round++ {
 			for _, i := range rnd.Perm(len(srcs)) {
 				e, err := NewEncoder(srcs[i], o)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("%T %v lossless=%v: NewEncoder: %v", srcs[i], srcs[i].Bounds(), o.Lossless, err)
+				}
 				for k := 0; k < 2; k++ { // Encode can be called again
 					var buf bytes.Buffer
-					require.NoError(t, e.Encode(&buf))
-					require.Equal(t, want[i], buf.Bytes(), "%T %v lossless=%v", srcs[i], srcs[i].Bounds(), o.Lossless)
+					if err := e.Encode(&buf); err != nil {
+						t.Fatalf("%T %v lossless=%v: Encode: %v", srcs[i], srcs[i].Bounds(), o.Lossless, err)
+					}
+					if !bytes.Equal(buf.Bytes(), want[i]) {
+						t.Fatalf("%T %v lossless=%v: output with recycled storage differs (%d bytes, want %d)", srcs[i], srcs[i].Bounds(), o.Lossless, buf.Len(), len(want[i]))
+					}
 				}
 				e.Release()
 			}
@@ -150,10 +181,14 @@ func TestReleaseWaitsForEncode(t *testing.T) {
 	src := sourceImages(200, 150, 3)[1] // *image.RGBA: pooled snapshot
 	for _, o := range lossyLossless(t) {
 		want, err := encodeOnce(src, o)
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("lossless=%v: encode: %v", o.Lossless, err)
+		}
 		for i := 0; i < 10; i++ {
 			e, err := NewEncoder(src, o)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("lossless=%v: NewEncoder: %v", o.Lossless, err)
+			}
 			var wg sync.WaitGroup
 			results := make([]error, 3)
 			outs := make([][]byte, 3)
@@ -171,8 +206,12 @@ func TestReleaseWaitsForEncode(t *testing.T) {
 				if errors.Is(err, ErrReleased) {
 					continue
 				}
-				require.NoError(t, err)
-				require.Equal(t, want, outs[g])
+				if err != nil {
+					t.Fatalf("lossless=%v round %d: Encode %d: %v", o.Lossless, i, g, err)
+				}
+				if !bytes.Equal(outs[g], want) {
+					t.Fatalf("lossless=%v round %d: Encode %d: output differs (%d bytes, want %d)", o.Lossless, i, g, len(outs[g]), len(want))
+				}
 			}
 		}
 	}
@@ -198,8 +237,12 @@ func TestCleanupRecyclesSnapshot(t *testing.T) {
 	bufpool.Trim() // drain
 	func() {
 		e, err := NewEncoder(src, nil)
-		require.NoError(t, err)
-		require.NoError(t, e.Encode(&bytes.Buffer{}))
+		if err != nil {
+			t.Fatalf("NewEncoder: %v", err)
+		}
+		if err := e.Encode(&bytes.Buffer{}); err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
 	}()
 	want := toNRGBA(src).Pix
 	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
@@ -249,15 +292,25 @@ func TestCleanupNotEarly(t *testing.T) {
 	for _, o := range lossyLossless(t) {
 		for _, src := range srcs {
 			e, err := NewEncoder(src, o)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("%T lossless=%v: NewEncoder: %v", src, o.Lossless, err)
+			}
 			var ref bytes.Buffer
-			require.NoError(t, e.Encode(&ref))
+			if err := e.Encode(&ref); err != nil {
+				t.Fatalf("%T lossless=%v: Encode: %v", src, o.Lossless, err)
+			}
 			for i := 0; i < 10; i++ {
 				e, err := NewEncoder(src, o) // never released
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("%T lossless=%v: NewEncoder: %v", src, o.Lossless, err)
+				}
 				var buf bytes.Buffer
-				require.NoError(t, e.Encode(&buf))
-				require.Equal(t, ref.Bytes(), buf.Bytes(), "%T lossless=%v", src, o.Lossless)
+				if err := e.Encode(&buf); err != nil {
+					t.Fatalf("%T lossless=%v: Encode: %v", src, o.Lossless, err)
+				}
+				if !bytes.Equal(buf.Bytes(), ref.Bytes()) {
+					t.Fatalf("%T lossless=%v: output differs (%d bytes, want %d)", src, o.Lossless, buf.Len(), ref.Len())
+				}
 			}
 		}
 	}

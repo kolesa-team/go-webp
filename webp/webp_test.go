@@ -24,16 +24,15 @@ package webp
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"image"
 	"image/color"
 	"image/jpeg"
 	"io"
 	"os"
+	"reflect"
 	"testing"
 	"testing/iotest"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 
 	"github.com/kolesa-team/go-webp/v2/decoder"
 	"github.com/kolesa-team/go-webp/v2/encoder"
@@ -43,10 +42,14 @@ import (
 func loadJPEG(t testing.TB, name string) image.Image {
 	t.Helper()
 	r, err := os.Open("../test_data/images/" + name)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer r.Close()
 	img, err := jpeg.Decode(r)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("jpeg.Decode(%s): %v", name, err)
+	}
 	return img
 }
 
@@ -55,28 +58,46 @@ func TestEncode(t *testing.T) {
 		img := loadJPEG(t, "source.jpg")
 
 		options, err := encoder.NewLossyEncoderOptions(encoder.PresetDefault, 75)
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("NewLossyEncoderOptions: %v", err)
+		}
 
 		buf := &bytes.Buffer{}
-		require.NoError(t, Encode(buf, img, options))
+		if err := Encode(buf, img, options); err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
 
 		out, err := Decode(bytes.NewReader(buf.Bytes()), nil)
-		require.NoError(t, err)
-		require.Equal(t, img.Bounds().Size(), out.Bounds().Size())
-		assert.Greater(t, psnr(toNRGBA(img), out.(*image.NRGBA)), 30.0)
+		if err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+		if got, want := out.Bounds().Size(), img.Bounds().Size(); got != want {
+			t.Fatalf("decoded size %v, want %v", got, want)
+		}
+		if p := psnr(toNRGBA(img), out.(*image.NRGBA)); !(p > 30.0) {
+			t.Errorf("PSNR %.2f dB, want > 30", p)
+		}
 	})
 	t.Run("encode lossless", func(t *testing.T) {
 		img := loadJPEG(t, "source.jpg")
 
 		options, err := encoder.NewLosslessEncoderOptions(encoder.PresetDefault, 4)
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("NewLosslessEncoderOptions: %v", err)
+		}
 
 		buf := &bytes.Buffer{}
-		require.NoError(t, Encode(buf, img, options))
+		if err := Encode(buf, img, options); err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
 
 		out, err := Decode(bytes.NewReader(buf.Bytes()), nil)
-		require.NoError(t, err)
-		require.Equal(t, toNRGBA(img).Pix, out.(*image.NRGBA).Pix)
+		if err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+		if want, got := toNRGBA(img).Pix, out.(*image.NRGBA).Pix; !bytes.Equal(want, got) {
+			t.Fatalf("decoded pixels differ from the source (%d bytes, want %d)", len(got), len(want))
+		}
 	})
 	t.Run("failed encoding with large size", func(t *testing.T) {
 		img := image.NewNRGBA(image.Rectangle{
@@ -152,23 +173,39 @@ func TestDecode(t *testing.T) {
 	})
 	t.Run("decode lossy image via standard image.Decode", func(t *testing.T) {
 		r, err := os.Open("../test_data/images/webp-logo-lossy.webp")
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatal(err)
+		}
 		defer r.Close()
 		img, format, err := image.Decode(r)
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("image.Decode: %v", err)
+		}
 
-		require.Equal(t, "webp", format)
-		require.Equal(t, color.NRGBAModel, img.ColorModel())
+		if format != "webp" {
+			t.Fatalf("image.Decode format = %q, want %q", format, "webp")
+		}
+		if !reflect.DeepEqual(color.NRGBAModel, img.ColorModel()) {
+			t.Fatalf("ColorModel = %v, want color.NRGBAModel (%v)", img.ColorModel(), color.NRGBAModel)
+		}
 	})
 	t.Run("decode lossless image via standard image.Decode", func(t *testing.T) {
 		r, err := os.Open("../test_data/images/webp-logo-lossless.webp")
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatal(err)
+		}
 		defer r.Close()
 		img, format, err := image.Decode(r)
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("image.Decode: %v", err)
+		}
 
-		require.Equal(t, "webp", format)
-		require.Equal(t, color.NRGBAModel, img.ColorModel())
+		if format != "webp" {
+			t.Fatalf("image.Decode format = %q, want %q", format, "webp")
+		}
+		if !reflect.DeepEqual(color.NRGBAModel, img.ColorModel()) {
+			t.Fatalf("ColorModel = %v, want color.NRGBAModel (%v)", img.ColorModel(), color.NRGBAModel)
+		}
 	})
 }
 
@@ -189,37 +226,67 @@ func TestDecodeConfig(t *testing.T) {
 	}
 	for _, tt := range tests {
 		data, err := os.ReadFile("../test_data/images/" + tt.file)
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatal(err)
+		}
 
 		cfg, format, err := image.DecodeConfig(bytes.NewReader(data))
-		require.NoError(t, err)
-		assert.Equal(t, "webp", format)
-		assert.Equal(t, tt.w, cfg.Width)
-		assert.Equal(t, tt.h, cfg.Height)
-		assert.Equal(t, color.RGBAModel, cfg.ColorModel) // as in v1
+		if err != nil {
+			t.Fatalf("%s: image.DecodeConfig: %v", tt.file, err)
+		}
+		if format != "webp" {
+			t.Errorf("%s: image.DecodeConfig format = %q, want %q", tt.file, format, "webp")
+		}
+		if cfg.Width != tt.w {
+			t.Errorf("%s: image.DecodeConfig Width = %d, want %d", tt.file, cfg.Width, tt.w)
+		}
+		if cfg.Height != tt.h {
+			t.Errorf("%s: image.DecodeConfig Height = %d, want %d", tt.file, cfg.Height, tt.h)
+		}
+		if !reflect.DeepEqual(color.RGBAModel, cfg.ColorModel) { // as in v1
+			t.Errorf("%s: image.DecodeConfig ColorModel = %v, want color.RGBAModel (%v)", tt.file, cfg.ColorModel, color.RGBAModel)
+		}
 
 		// Only the headers are needed.
 		r := &countingReader{r: bytes.NewReader(data)}
 		cfg, err = DecodeConfig(r, nil)
-		require.NoError(t, err)
-		assert.Equal(t, tt.w, cfg.Width)
-		assert.LessOrEqual(t, r.n, tt.maxRead, tt.file)
+		if err != nil {
+			t.Fatalf("%s: DecodeConfig: %v", tt.file, err)
+		}
+		if cfg.Width != tt.w {
+			t.Errorf("%s: DecodeConfig Width = %d, want %d", tt.file, cfg.Width, tt.w)
+		}
+		if r.n > tt.maxRead {
+			t.Errorf("%s: DecodeConfig read %d bytes, want <= %d", tt.file, r.n, tt.maxRead)
+		}
 	}
 
 	_, err := DecodeConfig(bytes.NewReader(nil), nil)
-	require.EqualError(t, err, "data is empty")
+	if want := "data is empty"; err == nil || err.Error() != want {
+		t.Fatalf("DecodeConfig(empty) error = %v, want %q", err, want)
+	}
 	_, err = DecodeConfig(bytes.NewReader([]byte("RIFF\x16\x00\x00\x00WEBPVP8 \x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")), nil)
-	require.EqualError(t, err, "cannot fetch features: VP8_STATUS_BITSTREAM_ERROR")
+	if want := "cannot fetch features: VP8_STATUS_BITSTREAM_ERROR"; err == nil || err.Error() != want {
+		t.Fatalf("DecodeConfig(zeroed VP8 frame) error = %v, want %q", err, want)
+	}
 	_, err = DecodeConfig(bytes.NewReader([]byte("RIFF\x10\x00\x00\x00WEBP")), nil)
-	require.EqualError(t, err, "cannot fetch features: VP8_STATUS_NOT_ENOUGH_DATA")
+	if want := "cannot fetch features: VP8_STATUS_NOT_ENOUGH_DATA"; err == nil || err.Error() != want {
+		t.Fatalf("DecodeConfig(RIFF header only) error = %v, want %q", err, want)
+	}
 }
 
 func TestGetFeatures(t *testing.T) {
 	data, err := os.ReadFile("../test_data/images/webp-logo-lossy.webp")
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatal(err)
+	}
 	f, err := GetFeatures(bytes.NewReader(data))
-	require.NoError(t, err)
-	assert.Equal(t, utils.BitstreamFeatures{Width: 3000, Height: 2000, HasAlpha: true, Format: utils.FormatLossy}, f)
+	if err != nil {
+		t.Fatalf("GetFeatures: %v", err)
+	}
+	if want := (utils.BitstreamFeatures{Width: 3000, Height: 2000, HasAlpha: true, Format: utils.FormatLossy}); f != want {
+		t.Errorf("GetFeatures = %+v, want %+v", f, want)
+	}
 }
 
 type countingReader struct {
@@ -314,7 +381,9 @@ func BenchmarkEncodeLosslessFast(b *testing.B) {
 func TestDecodeConfigMatchesNewDecoder(t *testing.T) {
 	for _, name := range []string{"webp-logo-lossy.webp", "100x150_lossy.webp", "100x150_lossless.webp", "m4_q75.webp"} {
 		data, err := os.ReadFile("../test_data/images/" + name)
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatal(err)
+		}
 		var muts [][]byte
 		for off := 0; off < 48 && off < len(data); off++ {
 			for b := 0; b < 8; b++ {
@@ -333,11 +402,15 @@ func TestDecodeConfigMatchesNewDecoder(t *testing.T) {
 				t.Fatalf("%s mutant %d: DecodeConfig err %v, NewDecoder err %v", name, i, cerr, derr)
 			}
 			if cerr != nil {
-				assert.Equal(t, derr.Error(), cerr.Error(), "%s mutant %d", name, i)
+				if cerr.Error() != derr.Error() {
+					t.Errorf("%s mutant %d: DecodeConfig error %q, want NewDecoder's %q", name, i, cerr.Error(), derr.Error())
+				}
 				continue
 			}
 			f := d.GetFeatures()
-			assert.Equal(t, [2]int{f.Width, f.Height}, [2]int{cfg.Width, cfg.Height}, "%s mutant %d", name, i)
+			if want, got := [2]int{f.Width, f.Height}, [2]int{cfg.Width, cfg.Height}; got != want {
+				t.Errorf("%s mutant %d: DecodeConfig size %v, want NewDecoder's %v", name, i, got, want)
+			}
 		}
 	}
 }
@@ -346,7 +419,9 @@ func TestDecodeConfigMatchesNewDecoder(t *testing.T) {
 func rawPayload(t *testing.T, data []byte, tag string) []byte {
 	t.Helper()
 	i := bytes.Index(data, []byte(tag))
-	require.GreaterOrEqual(t, i, 0, "no %q chunk", tag)
+	if i < 0 {
+		t.Fatalf("no %q chunk", tag)
+	}
 	n := int(binary.LittleEndian.Uint32(data[i+4:]))
 	return data[i+8 : i+8+n]
 }
@@ -369,26 +444,46 @@ func TestDecodeConfigRawBitstream(t *testing.T) {
 	}
 	for _, tt := range tests {
 		data, err := os.ReadFile("../test_data/images/" + tt.file)
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatal(err)
+		}
 		raw := rawPayload(t, data, tt.tag)
 
 		d, err := decoder.NewDecoder(bytes.NewReader(raw), nil)
-		require.NoError(t, err, tt.file)
-		require.Equal(t, tt.want.Width, d.GetFeatures().Width, tt.file)
-		require.Equal(t, tt.want.Format, d.GetFeatures().Format, tt.file)
+		if err != nil {
+			t.Fatalf("%s: NewDecoder: %v", tt.file, err)
+		}
+		if got := d.GetFeatures().Width; got != tt.want.Width {
+			t.Fatalf("%s: NewDecoder Width = %d, want %d", tt.file, got, tt.want.Width)
+		}
+		if got := d.GetFeatures().Format; got != tt.want.Format {
+			t.Fatalf("%s: NewDecoder Format = %v, want %v", tt.file, got, tt.want.Format)
+		}
 
 		for _, r := range []io.Reader{bytes.NewReader(raw), iotest.OneByteReader(bytes.NewReader(raw))} {
 			cfg, err := DecodeConfig(r, nil)
-			require.NoError(t, err, tt.file)
-			assert.Equal(t, image.Config{ColorModel: color.RGBAModel, Width: tt.want.Width, Height: tt.want.Height}, cfg, tt.file)
+			if err != nil {
+				t.Fatalf("%s: DecodeConfig(%T): %v", tt.file, r, err)
+			}
+			if want := (image.Config{ColorModel: color.RGBAModel, Width: tt.want.Width, Height: tt.want.Height}); !reflect.DeepEqual(want, cfg) {
+				t.Errorf("%s: DecodeConfig(%T) = %+v, want %+v", tt.file, r, cfg, want)
+			}
 		}
 		f, err := GetFeatures(bytes.NewReader(raw))
-		require.NoError(t, err, tt.file)
-		assert.Equal(t, d.GetFeatures(), f, tt.file)
-		assert.Equal(t, tt.want.HasAlpha, f.HasAlpha, tt.file)
+		if err != nil {
+			t.Fatalf("%s: GetFeatures: %v", tt.file, err)
+		}
+		if want := d.GetFeatures(); f != want {
+			t.Errorf("%s: GetFeatures = %+v, want NewDecoder's %+v", tt.file, f, want)
+		}
+		if f.HasAlpha != tt.want.HasAlpha {
+			t.Errorf("%s: GetFeatures HasAlpha = %v, want %v", tt.file, f.HasAlpha, tt.want.HasAlpha)
+		}
 
 		_, _, err = image.DecodeConfig(bytes.NewReader(raw))
-		assert.ErrorIs(t, err, image.ErrFormat, tt.file)
+		if !errors.Is(err, image.ErrFormat) {
+			t.Errorf("%s: image.DecodeConfig error = %v, want %v", tt.file, err, image.ErrFormat)
+		}
 
 		// Truncations (shorter than the first partition for VP8) are
 		// reported like NewDecoder does.
@@ -399,9 +494,11 @@ func TestDecodeConfigRawBitstream(t *testing.T) {
 			_, cerr := DecodeConfig(bytes.NewReader(raw[:n]), nil)
 			_, derr := decoder.NewDecoder(bytes.NewReader(raw[:n]), nil)
 			if derr == nil {
-				assert.NoError(t, cerr, "%s[:%d]", tt.file, n)
-			} else {
-				assert.EqualError(t, cerr, derr.Error(), "%s[:%d]", tt.file, n)
+				if cerr != nil {
+					t.Errorf("%s[:%d]: DecodeConfig: %v, want no error as NewDecoder", tt.file, n, cerr)
+				}
+			} else if cerr == nil || cerr.Error() != derr.Error() {
+				t.Errorf("%s[:%d]: DecodeConfig error = %v, want NewDecoder's %q", tt.file, n, cerr, derr.Error())
 			}
 		}
 	}

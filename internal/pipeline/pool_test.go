@@ -22,12 +22,10 @@
 package pipeline
 
 import (
+	"bytes"
 	"image"
 	"math/rand"
 	"testing"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // TestScaleSinkReleasesWork checks that a scaling sink returns its
@@ -46,36 +44,62 @@ func TestScaleSinkReleasesWork(t *testing.T) {
 
 	// RGBA path, then late RGBA and YUV calls.
 	s, img, err := NewSink(p)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewSink(%+v): %v", p, err)
+	}
 	feed(t, s, src, 7, r, true)
 	ss := s.(*scaleSink)
-	assert.Nil(t, ss.work)
+	if ss.work != nil {
+		t.Errorf("RGBA path: work = %p after the last row, want nil (released)", ss.work)
+	}
 	want := clonePix(img())
 	// Another sink takes (and scribbles over) the pooled buffer.
 	o, _, err := NewSink(other)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewSink(%+v): %v", other, err)
+	}
 	feed(t, o, randomImage(r, 300, 20), 3, r, true)
 	s.Buffer(H-1, 1)
-	require.NoError(t, s.Commit(H-1, 1))
-	require.NoError(t, s.(YUVSink).CommitYUV(0, 2, yp, W, uv, uv, W/2, nil, 0))
-	assert.Equal(t, want, img().Pix)
+	if err := s.Commit(H-1, 1); err != nil {
+		t.Fatalf("RGBA path: late Commit(%d, 1): %v", H-1, err)
+	}
+	if err := s.(YUVSink).CommitYUV(0, 2, yp, W, uv, uv, W/2, nil, 0); err != nil {
+		t.Fatalf("RGBA path: late CommitYUV(0, 2): %v", err)
+	}
+	if got := img().Pix; !bytes.Equal(want, got) {
+		t.Errorf("RGBA path: late calls changed the output (len %d, want len %d)", len(got), len(want))
+	}
 
 	// YUV path, then late YUV and RGBA calls.
 	s, img, err = NewSink(Params{SrcW: W, SrcH: H, ScaleW: 13, ScaleH: 7})
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewSink(%dx%d -> 13x7): %v", W, H, err)
+	}
 	ys := s.(YUVSink)
 	for y := 0; y < H; y += 6 {
-		require.NoError(t, ys.CommitYUV(y, min(6, H-y), yp[y*W:], W, uv[(y/2)*(W/2):], uv[(y/2)*(W/2):], W/2, nil, 0))
+		if err := ys.CommitYUV(y, min(6, H-y), yp[y*W:], W, uv[(y/2)*(W/2):], uv[(y/2)*(W/2):], W/2, nil, 0); err != nil {
+			t.Fatalf("YUV path: CommitYUV(%d, %d): %v", y, min(6, H-y), err)
+		}
 	}
-	assert.Nil(t, s.(*scaleSink).work)
+	if work := s.(*scaleSink).work; work != nil {
+		t.Errorf("YUV path: work = %p after the last row, want nil (released)", work)
+	}
 	want = clonePix(img())
 	o, _, err = NewSink(other)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewSink(%+v): %v", other, err)
+	}
 	feed(t, o, randomImage(r, 300, 20), 3, r, true)
-	require.NoError(t, ys.CommitYUV(H-2, 2, yp[(H-2)*W:], W, uv[(H/2-1)*(W/2):], uv[(H/2-1)*(W/2):], W/2, nil, 0))
+	if err := ys.CommitYUV(H-2, 2, yp[(H-2)*W:], W, uv[(H/2-1)*(W/2):], uv[(H/2-1)*(W/2):], W/2, nil, 0); err != nil {
+		t.Fatalf("YUV path: late CommitYUV(%d, 2): %v", H-2, err)
+	}
 	s.Buffer(0, 2)
-	require.NoError(t, s.Commit(0, 2))
-	assert.Equal(t, want, img().Pix)
+	if err := s.Commit(0, 2); err != nil {
+		t.Fatalf("YUV path: late Commit(0, 2): %v", err)
+	}
+	if got := img().Pix; !bytes.Equal(want, got) {
+		t.Errorf("YUV path: late calls changed the output (len %d, want len %d)", len(got), len(want))
+	}
 }
 
 func clonePix(img *image.NRGBA) []byte { return append([]byte(nil), img.Pix...) }
