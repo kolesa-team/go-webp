@@ -72,11 +72,13 @@ jobs:
         # step: under -race every update of the (then atomic) coverage
         # counters goes through the race runtime, and with the encoders'
         # helper goroutines updating the same counters in their hot loops
-        # that made some packages ~300x slower and time out.
+        # that made some packages ~300x slower and time out. -coverpkg counts
+        # code that other packages' tests exercise too (internal/status is
+        # only tested through them); it does not slow the tests down.
         shell: bash
         run: |
           if [ "$RUNNER_OS" = Linux ] && [ "$RUNNER_ARCH" = X64 ] && [ "${{ matrix.go }}" = stable ]; then
-            go test -coverprofile=coverage.txt ./...
+            go test -coverpkg=./... -coverprofile=coverage.txt ./...
           else
             go test ./...
           fi

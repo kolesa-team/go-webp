@@ -1,9 +1,13 @@
 ![logo](test_data/images/logo.jpg)
 # go-webp
-[![CI](https://github.com/kolesa-team/go-webp/actions/workflows/ci.yml/badge.svg)](https://github.com/kolesa-team/go-webp/actions/workflows/ci.yml)
+
+[![Release](https://img.shields.io/github/v/release/kolesa-team/go-webp)](https://github.com/kolesa-team/go-webp/releases/latest)
 [![Go Reference](https://pkg.go.dev/badge/github.com/kolesa-team/go-webp/v2.svg)](https://pkg.go.dev/github.com/kolesa-team/go-webp/v2)
-[![Go Report](https://goreportcard.com/badge/github.com/kolesa-team/go-webp)](https://goreportcard.com/report/github.com/kolesa-team/go-webp)
-[![codecov](https://codecov.io/gh/kolesa-team/go-webp/branch/master/graph/badge.svg)](https://codecov.io/gh/kolesa-team/go-webp)
+[![CI](https://github.com/kolesa-team/go-webp/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/kolesa-team/go-webp/actions/workflows/ci.yml?query=branch%3Amaster)
+[![Coverage](https://codecov.io/gh/kolesa-team/go-webp/graph/badge.svg?branch=master)](https://app.codecov.io/gh/kolesa-team/go-webp)
+[![Go version](https://img.shields.io/github/go-mod/go-version/kolesa-team/go-webp)](go.mod)
+[![License: MIT](https://img.shields.io/github/license/kolesa-team/go-webp)](LICENSE)
+[![Mentioned in Awesome Go](https://awesome.re/mentioned-badge.svg)](https://github.com/avelino/awesome-go)
 
 WebP encoder and decoder written in Go — **no cgo**, no libwebp; the only
 dependency outside the standard library is `golang.org/x/sys` (CPU feature
@@ -863,7 +867,12 @@ go test ./...                              # unit, round-trip and conformance te
 go test -tags purego ./...                 # the same on the pure Go code path
 go test -tags interop ./...                # also compare with cwebp/dwebp (libwebp tools in PATH)
 go test -run '^$' -fuzz FuzzDecode ./decoder
+make cover                                 # coverage of the whole module, as CI reports it
+go tool cover -html=coverage.txt           # browse that coverage report
 ```
+
+CI uploads the coverage of its linux/amd64 run to
+[Codecov](https://app.codecov.io/gh/kolesa-team/go-webp).
 
 ## License
 MIT licensed. See the LICENSE file for details.

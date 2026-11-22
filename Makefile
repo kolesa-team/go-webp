@@ -1,4 +1,4 @@
-.PHONY: test race vet bench bench-compare interop fuzz
+.PHONY: test race vet cover bench bench-compare interop fuzz
 
 GO ?= go
 
@@ -10,6 +10,12 @@ race:
 
 vet:
 	$(GO) vet ./...
+
+# Coverage of the whole module, as CI uploads it to Codecov: code that any
+# package's tests run counts. Browse it with go tool cover -html=coverage.txt.
+cover:
+	$(GO) test -coverpkg=./... -coverprofile=coverage.txt ./...
+	$(GO) tool cover -func=coverage.txt | tail -1
 
 bench:
 	$(GO) test -run '^$$' -bench . -benchmem ./webp
