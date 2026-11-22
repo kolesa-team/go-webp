@@ -154,6 +154,10 @@ jobs:
         uses: codecov/codecov-action@v4
         with:
           files: coverage.txt
+          # master is a protected branch, for which Codecov refuses
+          # tokenless uploads. Pull requests from forks get no secrets and
+          # upload without a token, which Codecov accepts for them.
+          token: ${{ secrets.CODECOV_TOKEN }}
         continue-on-error: true
 
   interop:
