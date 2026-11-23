@@ -24,13 +24,13 @@ package webp
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"image"
 	"os"
+	"reflect"
 	"testing"
 	"time"
-
-	"github.com/stretchr/testify/require"
 
 	"github.com/kolesa-team/go-webp/v2/decoder"
 	"github.com/kolesa-team/go-webp/v2/encoder"
@@ -46,13 +46,19 @@ func encodedSynth(t *testing.T, w, h int) map[string][]byte {
 	t.Helper()
 	out := map[string][]byte{}
 	lossless, err := encoder.NewLosslessEncoderOptions(encoder.PresetDefault, 6)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewLosslessEncoderOptions: %v", err)
+	}
 	lossy, err := encoder.NewLossyEncoderOptions(encoder.PresetDefault, 75)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewLossyEncoderOptions: %v", err)
+	}
 	for _, s := range synthImages(w, h) {
 		for name, o := range map[string]*encoder.Options{"lossy": lossy, "lossless": lossless} {
 			buf := &bytes.Buffer{}
-			require.NoError(t, Encode(buf, s.img, o))
+			if err := Encode(buf, s.img, o); err != nil {
+				t.Fatalf("Encode(%s %s %dx%d): %v", s.name, name, w, h, err)
+			}
 			out[fmt.Sprintf("%s-%s-%dx%d", s.name, name, w, h)] = buf.Bytes()
 		}
 	}
@@ -90,12 +96,22 @@ func TestDecodeIntoOddSizes(t *testing.T) {
 		for name, data := range encodedSynth(t, sz[0], sz[1]) {
 			for _, o := range decodeOptionsFor(sz[0], sz[1]) {
 				want, err := Decode(bytes.NewReader(data), o)
-				require.NoError(t, err, "%s %+v", name, o)
+				if err != nil {
+					t.Fatalf("Decode(%s %+v): %v", name, o, err)
+				}
 				got, err := DecodeInto(bytes.NewReader(data), dst, o)
-				require.NoError(t, err, "%s %+v", name, o)
-				require.Same(t, dst, got)
-				require.Equal(t, want, got, "%s %+v", name, o)
-				require.Equal(t, 60000, cap(got.Pix), "buffer not reused")
+				if err != nil {
+					t.Fatalf("DecodeInto(%s %+v): %v", name, o, err)
+				}
+				if got != dst {
+					t.Fatalf("DecodeInto(%s %+v) returned %p, want dst %p", name, o, got, dst)
+				}
+				if !reflect.DeepEqual(want, got) {
+					t.Fatalf("DecodeInto(%s %+v) = %v (len(Pix) %d), differs from Decode = %v", name, o, got.Rect, len(got.Pix), want.Bounds())
+				}
+				if c := cap(got.Pix); c != 60000 {
+					t.Fatalf("%s %+v: cap(Pix) = %d, want 60000: buffer not reused", name, o, c)
+				}
 			}
 		}
 	}
@@ -103,30 +119,54 @@ func TestDecodeIntoOddSizes(t *testing.T) {
 
 func TestDecodeContext(t *testing.T) {
 	data, err := os.ReadFile("../test_data/images/m4_q75.webp")
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatal(err)
+	}
 	want, err := Decode(bytes.NewReader(data), nil)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
 	got, err := DecodeContext(context.Background(), bytes.NewReader(data), nil)
-	require.NoError(t, err)
-	require.Equal(t, want, got)
+	if err != nil {
+		t.Fatalf("DecodeContext: %v", err)
+	}
+	if !reflect.DeepEqual(want, got) {
+		t.Fatalf("DecodeContext = %v, differs from Decode = %v", got.Bounds(), want.Bounds())
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	r := &countingReader{r: bytes.NewReader(data)}
 	_, err = DecodeContext(ctx, r, nil)
-	require.ErrorIs(t, err, context.Canceled)
-	require.Zero(t, r.n, "the reader must not be read once cancelled")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("DecodeContext(canceled) error = %v, want %v", err, context.Canceled)
+	}
+	if r.n != 0 {
+		t.Fatalf("DecodeContext(canceled) read %d bytes, want 0: the reader must not be read once cancelled", r.n)
+	}
 
 	dctx, dcancel := context.WithTimeout(context.Background(), -time.Second)
 	defer dcancel()
 	dec, err := decoder.NewDecoder(bytes.NewReader(data), &decoder.Options{UseThreads: true})
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewDecoder: %v", err)
+	}
 	dst := &image.NRGBA{}
 	_, err = dec.DecodeIntoContext(dctx, dst)
-	require.ErrorIs(t, err, context.DeadlineExceeded)
-	require.Equal(t, &image.NRGBA{}, dst)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("DecodeIntoContext(expired) error = %v, want %v", err, context.DeadlineExceeded)
+	}
+	if !reflect.DeepEqual(&image.NRGBA{}, dst) {
+		t.Fatalf("DecodeIntoContext(expired) changed dst: Rect %v, Stride %d, len(Pix) %d, want a zero image.NRGBA", dst.Rect, dst.Stride, len(dst.Pix))
+	}
 	img, err := dec.DecodeIntoContext(context.Background(), dst)
-	require.NoError(t, err)
-	require.Same(t, dst, img)
-	require.Equal(t, want, img)
+	if err != nil {
+		t.Fatalf("DecodeIntoContext: %v", err)
+	}
+	if img != dst {
+		t.Fatalf("DecodeIntoContext returned %p, want dst %p", img, dst)
+	}
+	if !reflect.DeepEqual(want, img) {
+		t.Fatalf("DecodeIntoContext = %v (len(Pix) %d), differs from Decode = %v", img.Rect, len(img.Pix), want.Bounds())
+	}
 }

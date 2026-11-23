@@ -25,10 +25,8 @@ import (
 	"bytes"
 	"fmt"
 	"image"
+	"reflect"
 	"testing"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 
 	"github.com/kolesa-team/go-webp/v2/internal/workers"
 )
@@ -88,7 +86,9 @@ func TestAlphaRing(t *testing.T) {
 		for oi, o := range ringOptions(w, h) {
 			setRing(t, 0)
 			want := decodeOutcome(t, data, o)
-			require.Empty(t, want.err, name)
+			if want.err != "" {
+				t.Fatalf("%s opts%d: whole-plane decode: %s", name, oi, want.err)
+			}
 			wantNA, naErr := newDec(t, data, o).DecodeNYCbCrA()
 			for _, rows := range rings {
 				for _, threads := range []bool{false, true} {
@@ -99,20 +99,30 @@ func TestAlphaRing(t *testing.T) {
 						ot.UseThreads = threads
 						defer func(old int) { workers.SetLimitForTest(old) }(workers.SetLimitForTest(8))
 						got := decodeOutcome(t, data, &ot)
-						require.Equal(t, want, got)
+						if !reflect.DeepEqual(want, got) {
+							t.Fatalf("got error %q, want %q (pixels equal: %v)", got.err, want.err, bytes.Equal(got.pix, want.pix))
+						}
 						na, err := newDec(t, data, &ot).DecodeNYCbCrA()
 						if naErr != nil {
-							require.Error(t, err)
+							if err == nil {
+								t.Fatalf("DecodeNYCbCrA: no error, want one (whole-plane decode: %v)", naErr)
+							}
 							return
 						}
-						require.NoError(t, err)
-						require.Equal(t, wantNA, na)
+						if err != nil {
+							t.Fatalf("DecodeNYCbCrA: %v", err)
+						}
+						if !reflect.DeepEqual(wantNA, na) {
+							t.Fatal("DecodeNYCbCrA differs from the whole-plane decode")
+						}
 					})
 				}
 			}
 		}
 	}
-	assert.Equal(t, 0, workers.InUse())
+	if n := workers.InUse(); n != 0 {
+		t.Errorf("workers.InUse() = %d, want 0", n)
+	}
 }
 
 // TestAlphaRingErrors corrupts and truncates the ALPH data in many places
@@ -161,14 +171,20 @@ func TestAlphaRingErrors(t *testing.T) {
 					restore := budgets[2].set()
 					got := decodeOutcome(t, v.data, &ot)
 					restore()
-					require.Equal(t, want, got, "%s %+v ring %d threads %v", v.name, o, rows, threads)
+					if !reflect.DeepEqual(want, got) {
+						t.Fatalf("%s %+v ring %d threads %v: got error %q, want %q (pixels equal: %v)", v.name, o, rows, threads, got.err, want.err, bytes.Equal(got.pix, want.pix))
+					}
 				}
 			}
 		}
 	}
 	t.Logf("%d variants, %d failing decodes", len(variants), failures)
-	assert.Positive(t, failures)
-	assert.Equal(t, 0, workers.InUse())
+	if failures <= 0 {
+		t.Errorf("%d failing decodes, want > 0", failures)
+	}
+	if n := workers.InUse(); n != 0 {
+		t.Errorf("workers.InUse() = %d, want 0", n)
+	}
 }
 
 // TestAlphaRingSize checks the buffers of a large lossy+alpha decode: a
@@ -181,19 +197,31 @@ func TestAlphaRingSize(t *testing.T) {
 	a := &lazyAlpha{alph: alph, w: w, h: h, crop: frame}
 	a.hdr.Filter = 1
 	r := a.ringRows(false)
-	assert.Equal(t, (alphaRingBytes+w-1)/w, r)
+	if want := (alphaRingBytes + w - 1) / w; r != want {
+		t.Errorf("ringRows(false) = %d, want %d", r, want)
+	}
 	rh := a.ringRows(true)
-	assert.Less(t, rh*w, w*h/2, "helper ring of %d rows", rh)
-	assert.Greater(t, rh, r)
+	if rh*w >= w*h/2 {
+		t.Errorf("helper ring of %d rows: %d bytes, want < %d", rh, rh*w, w*h/2)
+	}
+	if rh <= r {
+		t.Errorf("ringRows(true) = %d, want > ringRows(false) = %d", rh, r)
+	}
 	a.alloc(false)
-	assert.Equal(t, (r+alphaTailRows)*w, len(a.buf))
-	assert.Zero(t, (h+a.off)%a.ring, "the last row must end the ring")
+	if want := (r + alphaTailRows) * w; len(a.buf) != want {
+		t.Errorf("len(buf) = %d, want %d", len(a.buf), want)
+	}
+	if rem := (h + a.off) % a.ring; rem != 0 {
+		t.Errorf("the last row must end the ring: (h+off)%%ring = %d, want 0", rem)
+	}
 	a.release()
 
 	a = &lazyAlpha{alph: alph, w: w, h: h, crop: frame, dithering: 50}
 	a.hdr.PreProcessing = 1
 	a.alloc(false)
-	assert.Equal(t, w*h, len(a.buf))
+	if len(a.buf) != w*h {
+		t.Errorf("with alpha dithering: len(buf) = %d, want %d (the whole plane)", len(a.buf), w*h)
+	}
 	a.release()
 }
 

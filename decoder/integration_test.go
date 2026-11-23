@@ -22,15 +22,15 @@
 package decoder
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"image"
+	"os"
+	"reflect"
 	"runtime"
 	"sync"
 	"testing"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 
 	"github.com/kolesa-team/go-webp/v2/internal/workers"
 )
@@ -67,21 +67,35 @@ func TestUseThreadsAllPathsAllBudgets(t *testing.T) {
 				base := workers.InUse()
 
 				got := decode(t, data, o)
-				assert.Equal(t, want, got, name)
+				if !reflect.DeepEqual(want, got) {
+					t.Errorf("%s: Decode differs from the sequential decode", name)
+				}
 
 				dst := dirty(4 * want.Rect.Dx() * want.Rect.Dy())
 				into, err := newDec(t, data, o).DecodeInto(dst)
-				require.NoError(t, err, name)
-				assert.Same(t, dst, into, name)
-				assert.Equal(t, want.Pix, into.Pix, name)
+				if err != nil {
+					t.Fatalf("%s: DecodeInto: %v", name, err)
+				}
+				if into != dst {
+					t.Errorf("%s: DecodeInto returned %p, want dst %p", name, into, dst)
+				}
+				if !bytes.Equal(want.Pix, into.Pix) {
+					t.Errorf("%s: DecodeInto pixels differ from the sequential decode", name)
+				}
 
 				ctx, cancel := context.WithCancel(context.Background())
 				img, err := newDec(t, data, o).DecodeContext(ctx)
 				cancel()
-				require.NoError(t, err, name)
-				assert.Equal(t, want, img, name)
+				if err != nil {
+					t.Fatalf("%s: DecodeContext: %v", name, err)
+				}
+				if !reflect.DeepEqual(want, img) {
+					t.Errorf("%s: DecodeContext differs from the sequential decode", name)
+				}
 
-				assert.Equal(t, base, workers.InUse(), "%s: helper slots left taken", name)
+				if inUse := workers.InUse(); inUse != base {
+					t.Errorf("%s: helper slots left taken: workers.InUse() = %d, want %d", name, inUse, base)
+				}
 				restore()
 			}
 		}
@@ -110,9 +124,24 @@ func TestUseThreadsConcurrentSharedBudget(t *testing.T) {
 		wg.Go(func() {
 			for r := 0; r < rounds; r++ {
 				f := files[(k+r)%len(files)]
-				got, err := newDec(t, readFile(t, f), &Options{UseThreads: true}).Decode()
-				if assert.NoError(t, err, f) {
-					assert.Equal(t, want[f], got, f)
+				// Not readFile and newDec: they call t.Fatal, which must
+				// not run on this goroutine.
+				data, err := os.ReadFile("../test_data/images/" + f)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				o := &Options{UseThreads: true}
+				d, err := NewDecoder(bytes.NewReader(data), o)
+				if err != nil {
+					t.Errorf("%s: NewDecoder(%+v): %v", f, o, err)
+					return
+				}
+				got, err := d.Decode()
+				if err != nil {
+					t.Errorf("%s: Decode: %v", f, err)
+				} else if !reflect.DeepEqual(want[f], got) {
+					t.Errorf("%s: Decode differs from the sequential decode", f)
 				}
 			}
 		})

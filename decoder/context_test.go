@@ -26,13 +26,11 @@ import (
 	"context"
 	"errors"
 	"image"
+	"reflect"
 	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 
 	"github.com/kolesa-team/go-webp/v2/internal/pipeline"
 	"github.com/kolesa-team/go-webp/v2/internal/status"
@@ -70,16 +68,28 @@ func waitGoroutines(t *testing.T, n int) {
 	for runtime.NumGoroutine() > n && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	assert.LessOrEqual(t, runtime.NumGoroutine(), n, "goroutine leak")
-	assert.Equal(t, 0, workers.InUse(), "helper slots still taken")
+	if got := runtime.NumGoroutine(); got > n {
+		t.Errorf("goroutine leak: %d goroutines, want <= %d", got, n)
+	}
+	if inUse := workers.InUse(); inUse != 0 {
+		t.Errorf("helper slots still taken: workers.InUse() = %d, want 0", inUse)
+	}
 }
 
 func checkAbort(t *testing.T, err error, want error, msg string) {
 	t.Helper()
-	require.Error(t, err, msg)
-	assert.True(t, errors.Is(err, want), "%s: %v", msg, err)
-	assert.Equal(t, utils.Vp8StatusUserAbort, status.CodeOf(err), msg)
-	assert.Equal(t, "cannot decode picture: VP8_STATUS_USER_ABORT: "+want.Error(), err.Error(), msg)
+	if err == nil {
+		t.Fatalf("%s: no error, want %v", msg, want)
+	}
+	if !errors.Is(err, want) {
+		t.Errorf("%s: %v, want an error matching %v", msg, err, want)
+	}
+	if code := status.CodeOf(err); code != utils.Vp8StatusUserAbort {
+		t.Errorf("%s: code %v, want %v", msg, code, utils.Vp8StatusUserAbort)
+	}
+	if got, wantMsg := err.Error(), "cannot decode picture: VP8_STATUS_USER_ABORT: "+want.Error(); got != wantMsg {
+		t.Errorf("%s: error %q, want %q", msg, got, wantMsg)
+	}
 }
 
 var ctxOptions = []*Options{
@@ -111,9 +121,13 @@ func TestDecodeContextCancel(t *testing.T) {
 				dst := dirty(1000)
 				before := *dst
 				img, err := newDec(t, data, o).DecodeIntoContext(newCountdown(n), dst)
-				assert.Nil(t, img)
+				if img != nil {
+					t.Errorf("%s %+v cancelled after %d checks: DecodeIntoContext returned an image, want nil", file, o, n)
+				}
 				checkAbort(t, err, context.Canceled, file)
-				assert.Equal(t, before, *dst)
+				if !reflect.DeepEqual(before, *dst) {
+					t.Errorf("%s %+v cancelled after %d checks: dst changed", file, o, n)
+				}
 			}
 
 			// Not cancelled: same result as Decode.
@@ -122,11 +136,19 @@ func TestDecodeContextCancel(t *testing.T) {
 			}
 			want := decode(t, data, o)
 			got, err := newDec(t, data, o).DecodeContext(newCountdown(1 << 30))
-			require.NoError(t, err)
-			assert.Equal(t, want, got)
+			if err != nil {
+				t.Fatalf("%s %+v: DecodeContext: %v", file, o, err)
+			}
+			if !reflect.DeepEqual(want, got) {
+				t.Errorf("%s %+v: DecodeContext differs from Decode", file, o)
+			}
 			got, err = newDec(t, data, o).DecodeContext(context.Background())
-			require.NoError(t, err)
-			assert.Equal(t, want, got)
+			if err != nil {
+				t.Fatalf("%s %+v: DecodeContext(context.Background()): %v", file, o, err)
+			}
+			if !reflect.DeepEqual(want, got) {
+				t.Errorf("%s %+v: DecodeContext(context.Background()) differs from Decode", file, o)
+			}
 		}
 	}
 	waitGoroutines(t, g)
@@ -177,14 +199,22 @@ func TestDecodeContextAlphaHelper(t *testing.T) {
 					dst := dirty(len(want.Pix))
 					before := *dst
 					img, err := newDec(t, data, o).DecodeIntoContext(newCountdown(n), dst)
-					assert.Nil(t, img)
+					if img != nil {
+						t.Errorf("%s %+v budget %s cancelled after %d checks: DecodeIntoContext returned an image, want nil", name, o, b.name, n)
+					}
 					checkAbort(t, err, context.Canceled, name)
-					assert.Equal(t, before, *dst, "%s %+v budget %s", name, o, b.name)
+					if !reflect.DeepEqual(before, *dst) {
+						t.Errorf("%s %+v budget %s: dst changed", name, o, b.name)
+					}
 				}
 				got, err := newDec(t, data, o).DecodeIntoContext(newCountdown(1<<30), dirty(len(want.Pix)))
 				restore()
-				require.NoError(t, err, "%s %+v budget %s", name, o, b.name)
-				require.Equal(t, want, got, "%s %+v budget %s", name, o, b.name)
+				if err != nil {
+					t.Fatalf("%s %+v budget %s: DecodeIntoContext: %v", name, o, b.name, err)
+				}
+				if !reflect.DeepEqual(want, got) {
+					t.Fatalf("%s %+v budget %s: DecodeIntoContext differs from the sequential decode", name, o, b.name)
+				}
 			}
 		}
 	}
@@ -200,14 +230,18 @@ func TestDecodeContextStopsEarly(t *testing.T) {
 		for _, o := range []*Options{nil, {UseThreads: true}, {Scale: image.Rect(0, 0, 100, 100)}} {
 			full := newCountdown(1 << 30)
 			_, err := newDec(t, data, o).DecodeContext(full)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("%s %+v: DecodeContext: %v", file, o, err)
+			}
 			checks := (1 << 30) - full.n.Load()
 
 			ctx := newCountdown(3)
 			_, err = newDec(t, data, o).DecodeContext(ctx)
 			checkAbort(t, err, context.Canceled, file)
 			used := 3 - ctx.n.Load()
-			assert.Less(t, used, checks/2, "%s %+v: %d of %d checks", file, o, used, checks)
+			if used >= checks/2 {
+				t.Errorf("%s %+v: %d of %d checks, want < %d", file, o, used, checks, checks/2)
+			}
 		}
 	}
 }
@@ -221,19 +255,33 @@ func TestCtxSinkForwardsPremultiplied(t *testing.T) {
 	cl := call{ctx: ctx}
 
 	scaled, _, err := pipeline.NewSink(pipeline.Params{SrcW: 64, SrcH: 32, ScaleW: 16, ScaleH: 8, Premultiply: true})
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewSink (scaled): %v", err)
+	}
 	w := cl.wrap(scaled)
 	_, isCtx := w.(*ctxSink)
-	require.True(t, isCtx, "a cancellable call must wrap the sink")
+	if !isCtx {
+		t.Fatalf("a cancellable call must wrap the sink: wrap returned %T, want *ctxSink", w)
+	}
 	ps, ok := w.(pipeline.PremultipliedSink)
-	require.True(t, ok)
-	assert.True(t, ps.AcceptPremultiplied(), "scaling sink must accept premultiplied rows through the wrapper")
+	if !ok {
+		t.Fatalf("wrapped scaling sink %T is not a pipeline.PremultipliedSink", w)
+	}
+	if !ps.AcceptPremultiplied() {
+		t.Error("scaling sink must accept premultiplied rows through the wrapper")
+	}
 
 	direct, _, err := pipeline.NewSink(pipeline.Params{SrcW: 64, SrcH: 32, Premultiply: true})
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewSink (direct): %v", err)
+	}
 	ps, ok = cl.wrap(direct).(pipeline.PremultipliedSink)
-	require.True(t, ok)
-	assert.False(t, ps.AcceptPremultiplied(), "a sink without the interface must refuse")
+	if !ok {
+		t.Fatal("wrapped direct sink is not a pipeline.PremultipliedSink")
+	}
+	if ps.AcceptPremultiplied() {
+		t.Error("a sink without the interface must refuse")
+	}
 }
 
 // TestDecodeContextScalePalette: a cancellable scaled decode of a palette
@@ -249,7 +297,11 @@ func TestDecodeContextScalePalette(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		got, err := newDec(t, data, o).DecodeContext(ctx)
 		cancel()
-		require.NoError(t, err)
-		assert.Equal(t, want, got, "%+v", o)
+		if err != nil {
+			t.Fatalf("%+v: DecodeContext: %v", o, err)
+		}
+		if !reflect.DeepEqual(want, got) {
+			t.Errorf("%+v: DecodeContext differs from Decode", o)
+		}
 	}
 }

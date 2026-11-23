@@ -22,11 +22,10 @@
 package resample
 
 import (
+	"bytes"
+	"errors"
 	"math/rand"
 	"testing"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestScaledDimensions(t *testing.T) {
@@ -39,19 +38,27 @@ func TestScaledDimensions(t *testing.T) {
 	}
 	for _, tt := range tests {
 		w, h, ok := ScaledDimensions(tt.sw, tt.sh, tt.w, tt.h)
-		assert.True(t, ok)
-		assert.Equal(t, [2]int{tt.ew, tt.eh}, [2]int{w, h}, "%+v", tt)
+		if !ok {
+			t.Errorf("ScaledDimensions(%d, %d, %d, %d) failed", tt.sw, tt.sh, tt.w, tt.h)
+		}
+		if w != tt.ew || h != tt.eh {
+			t.Errorf("ScaledDimensions(%d, %d, %d, %d) = %dx%d, want %dx%d", tt.sw, tt.sh, tt.w, tt.h, w, h, tt.ew, tt.eh)
+		}
 	}
 	for _, bad := range [][4]int{{10, 10, 0, 0}, {10, 10, -1, 5}, {0, 10, 5, 5}, {10, 10, 1 << 30, 5}} {
 		_, _, ok := ScaledDimensions(bad[0], bad[1], bad[2], bad[3])
-		assert.False(t, ok, "%v", bad)
+		if ok {
+			t.Errorf("ScaledDimensions(%d, %d, %d, %d) succeeded, want failure", bad[0], bad[1], bad[2], bad[3])
+		}
 	}
 }
 
 func TestInitInvalid(t *testing.T) {
 	for _, d := range [][5]int{{0, 1, 1, 1, 4}, {1, 0, 1, 1, 4}, {1, 1, 0, 1, 4}, {1, 1, 1, 0, 4}, {1, 1, 1, 1, 0}, {1, 1, 1, 1, 5}} {
 		_, err := New(d[0], d[1], d[2], d[3], d[4])
-		assert.ErrorIs(t, err, ErrInvalid, "%v", d)
+		if !errors.Is(err, ErrInvalid) {
+			t.Errorf("New(%d, %d, %d, %d, %d) = %v, want %v", d[0], d[1], d[2], d[3], d[4], err, ErrInvalid)
+		}
 	}
 }
 
@@ -67,7 +74,9 @@ func TestConstantImage(t *testing.T) {
 			}
 			out := rescaleAll(t, src, sw, sh, dw, dh, 4)
 			for j, v := range out {
-				require.Equal(t, []byte{17, 200, 0, 255}[j%4], v, "%dx%d -> %dx%d", sw, sh, dw, dh)
+				if want := []byte{17, 200, 0, 255}[j%4]; want != v {
+					t.Fatalf("%dx%d -> %dx%d: out[%d] = %d, want %d", sw, sh, dw, dh, j, v, want)
+				}
 			}
 		}
 	})
@@ -82,7 +91,9 @@ func TestReuseWork(t *testing.T) {
 		want := rescaleAll(t, src, 30, 20, 7, 5, 1)
 		var rs Rescaler
 		work := make([]uint32, 100)
-		require.NoError(t, rs.Init(30, 20, 7, 5, 1, work))
+		if err := rs.Init(30, 20, 7, 5, 1, work); err != nil {
+			t.Fatalf("Init(30, 20, 7, 5, 1) with a caller's work buffer: %v", err)
+		}
 		out := make([]byte, 7*5)
 		for y := 0; y < 20; y++ {
 			rs.ImportRow(src[y*30:])
@@ -90,12 +101,24 @@ func TestReuseWork(t *testing.T) {
 				rs.ExportRow(out[rs.DstY()*7:])
 			}
 		}
-		assert.Equal(t, want, out)
-		assert.False(t, rs.ExportRow(out))
-		assert.True(t, rs.InputDone())
-		assert.True(t, rs.OutputDone())
-		assert.Equal(t, 7, rs.DstWidth())
-		assert.Equal(t, 5, rs.DstHeight())
+		if !bytes.Equal(want, out) {
+			t.Errorf("output with a caller's work buffer = %v, want %v", out, want)
+		}
+		if rs.ExportRow(out) {
+			t.Error("ExportRow after the last row = true, want false")
+		}
+		if !rs.InputDone() {
+			t.Error("InputDone() = false, want true")
+		}
+		if !rs.OutputDone() {
+			t.Error("OutputDone() = false, want true")
+		}
+		if got := rs.DstWidth(); got != 7 {
+			t.Errorf("DstWidth() = %d, want 7", got)
+		}
+		if got := rs.DstHeight(); got != 5 {
+			t.Errorf("DstHeight() = %d, want 5", got)
+		}
 	})
 }
 
@@ -103,9 +126,13 @@ func TestPremultiply(t *testing.T) {
 	forEachLevel(t, func(t *testing.T) {
 		row := []byte{200, 100, 50, 255, 200, 100, 50, 0, 200, 100, 50, 128}
 		PremultiplyRGBA(row)
-		assert.Equal(t, []byte{200, 100, 50, 255, 0, 0, 0, 0, 100, 50, 25, 128}, row)
+		if want := []byte{200, 100, 50, 255, 0, 0, 0, 0, 100, 50, 25, 128}; !bytes.Equal(want, row) {
+			t.Errorf("after PremultiplyRGBA: row = %v, want %v", row, want)
+		}
 		UnpremultiplyRGBA(row)
-		assert.Equal(t, []byte{200, 100, 50, 255, 0, 0, 0, 0, 199, 100, 50, 128}, row)
+		if want := []byte{200, 100, 50, 255, 0, 0, 0, 0, 199, 100, 50, 128}; !bytes.Equal(want, row) {
+			t.Errorf("after UnpremultiplyRGBA: row = %v, want %v", row, want)
+		}
 	})
 }
 

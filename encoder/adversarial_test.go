@@ -28,11 +28,10 @@ import (
 	"fmt"
 	"image"
 	"image/draw"
+	"reflect"
 	"runtime"
 	"sync"
 	"testing"
-
-	"github.com/stretchr/testify/require"
 
 	"github.com/kolesa-team/go-webp/v2/internal/bufpool"
 	"github.com/kolesa-team/go-webp/v2/internal/workers"
@@ -56,15 +55,21 @@ func TestParallelAlphaSubImage(t *testing.T) {
 	for _, src := range srcs {
 		for _, af := range filters {
 			o, err := NewLossyEncoderOptions(PresetDefault, 75)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("NewLossyEncoderOptions: %v", err)
+			}
 			o.AlphaFiltering = af
 			want := encodeBytes(t, src, o)
 			o.ThreadLevel = true
 			for _, b := range budgets {
 				withBudget(t, b, func() {
-					require.Equal(t, want, encodeBytes(t, src, o), "%T filter %d budget %s", src, af, b)
+					if got := encodeBytes(t, src, o); !bytes.Equal(got, want) {
+						t.Fatalf("%T filter %d budget %s: ThreadLevel output differs from the sequential one (%d bytes, want %d)", src, af, b, len(got), len(want))
+					}
 				})
-				require.Zero(t, workers.InUse())
+				if n := workers.InUse(); n != 0 {
+					t.Fatalf("%T filter %d budget %s: workers.InUse() = %d, want 0", src, af, b, n)
+				}
 			}
 		}
 	}
@@ -81,7 +86,9 @@ func TestReleaseWaitsForParallelAlpha(t *testing.T) {
 	rgba := image.NewRGBA(img.Rect)
 	draw.Draw(rgba, rgba.Rect, img, image.Point{}, draw.Src)
 	o, err := NewLossyEncoderOptions(PresetDefault, 75)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewLossyEncoderOptions: %v", err)
+	}
 	o.Method = 0
 	want := encodeBytes(t, rgba, o)
 	o.ThreadLevel = true
@@ -102,7 +109,9 @@ func TestReleaseWaitsForParallelAlpha(t *testing.T) {
 	}
 	for i := 0; i < rounds; i++ {
 		e, err := NewEncoder(rgba, o)
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("NewEncoder: %v", err)
+		}
 		var wg sync.WaitGroup
 		results := make([]error, 2)
 		outs := make([][]byte, 2)
@@ -120,8 +129,12 @@ func TestReleaseWaitsForParallelAlpha(t *testing.T) {
 			if errors.Is(err, ErrReleased) {
 				continue
 			}
-			require.NoError(t, err)
-			require.Equal(t, want, outs[g])
+			if err != nil {
+				t.Fatalf("round %d: Encode %d: %v", i, g, err)
+			}
+			if !bytes.Equal(outs[g], want) {
+				t.Fatalf("round %d: Encode %d: output differs from the sequential one (%d bytes, want %d)", i, g, len(outs[g]), len(want))
+			}
 		}
 	}
 }
@@ -134,12 +147,18 @@ func TestReleaseWaitsForParallelAlpha(t *testing.T) {
 func TestEncodeContextThreadsAll(t *testing.T) {
 	checkNoLeak(t)
 	lossy, err := NewLossyEncoderOptions(PresetDefault, 75)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewLossyEncoderOptions: %v", err)
+	}
 	bestFilter, err := NewLossyEncoderOptions(PresetDefault, 75)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewLossyEncoderOptions: %v", err)
+	}
 	bestFilter.AlphaFiltering = 2
 	ll, err := NewLosslessEncoderOptions(PresetDefault, 6)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewLosslessEncoderOptions: %v", err)
+	}
 	// 65780 pixels: the alpha plane is coded on a helper when one is free.
 	transparent := alphaImage(260, 253, 14)
 	cases := []struct {
@@ -175,12 +194,18 @@ func TestEncodeContextThreadsAll(t *testing.T) {
 		for _, b := range budgets {
 			withBudget(t, b, func() {
 				e, err := NewEncoder(tc.img, &o)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("%s budget %s: NewEncoder: %v", tc.name, b, err)
+				}
 				defer e.Release()
 				never := newPollCtx(0)
 				var got bytes.Buffer
-				require.NoError(t, e.EncodeContext(never, &got))
-				require.Equal(t, want, got.Bytes(), "%s budget %s", tc.name, b)
+				if err := e.EncodeContext(never, &got); err != nil {
+					t.Fatalf("%s budget %s: EncodeContext: %v", tc.name, b, err)
+				}
+				if !bytes.Equal(got.Bytes(), want) {
+					t.Fatalf("%s budget %s: EncodeContext output differs from the sequential one (%d bytes, want %d)", tc.name, b, got.Len(), len(want))
+				}
 				n := never.polls.Load()
 				for _, k := range sample(n) {
 					name := fmt.Sprintf("%s budget %s poll %d of %d", tc.name, b, k, n)
@@ -189,11 +214,17 @@ func TestEncodeContextThreadsAll(t *testing.T) {
 					if err == nil { // the helpers polled less often this time
 						continue
 					}
-					require.Equal(t, context.Canceled, err, name)
-					require.Zero(t, cw.calls, name)
+					if !reflect.DeepEqual(err, context.Canceled) {
+						t.Fatalf("%s: EncodeContext = %v, want %v", name, err, context.Canceled)
+					}
+					if cw.calls != 0 {
+						t.Fatalf("%s: %d Write calls, want 0", name, cw.calls)
+					}
 				}
 			})
-			require.Zero(t, workers.InUse(), tc.name)
+			if n := workers.InUse(); n != 0 {
+				t.Fatalf("%s budget %s: workers.InUse() = %d, want 0", tc.name, b, n)
+			}
 		}
 	}
 }
@@ -208,19 +239,33 @@ func TestPooledNRGBAAnySize(t *testing.T) {
 	bufpool.Trim()
 	defer bufpool.Trim()
 	img, pix := pooledNRGBA(1449, 1449) // above v2.0's 2 MP pooling limit
-	require.Len(t, img.Pix, 4*1449*1449)
+	if len(img.Pix) != 4*1449*1449 {
+		t.Fatalf("1449x1449: len(Pix) = %d, want %d", len(img.Pix), 4*1449*1449)
+	}
 	putPix(pix)
-	require.GreaterOrEqual(t, bufpool.Retained(), int64(4*1449*1449), "the large buffer was not pooled")
+	if got := bufpool.Retained(); got < int64(4*1449*1449) {
+		t.Fatalf("the large buffer was not pooled: bufpool.Retained() = %d, want >= %d", got, int64(4*1449*1449))
+	}
 	img2, pix2 := pooledNRGBA(1449, 1449)
-	require.Same(t, &pix[0], &pix2[0], "the pooled buffer was not reused")
-	require.Equal(t, 4*1449, img2.Stride)
+	if &pix[0] != &pix2[0] {
+		t.Fatal("the pooled buffer was not reused")
+	}
+	if img2.Stride != 4*1449 {
+		t.Fatalf("1449x1449: Stride = %d, want %d", img2.Stride, 4*1449)
+	}
 	putPix(pix2)
 
 	// A smaller request reuses a large enough buffer of its size class.
 	small, pix3 := pooledNRGBA(63, 64)
-	require.Len(t, small.Pix, 4*63*64)
-	require.Equal(t, 4*63, small.Stride)
-	require.Equal(t, image.Rect(0, 0, 63, 64), small.Rect)
+	if len(small.Pix) != 4*63*64 {
+		t.Fatalf("63x64: len(Pix) = %d, want %d", len(small.Pix), 4*63*64)
+	}
+	if small.Stride != 4*63 {
+		t.Fatalf("63x64: Stride = %d, want %d", small.Stride, 4*63)
+	}
+	if want := image.Rect(0, 0, 63, 64); small.Rect != want {
+		t.Fatalf("63x64: Rect = %v, want %v", small.Rect, want)
+	}
 	putPix(pix3)
 	putPix(nil) // no-op
 }

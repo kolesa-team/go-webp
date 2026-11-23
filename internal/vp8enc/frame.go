@@ -44,6 +44,12 @@ const (
 // variable so that tests can reach that path with small pictures.
 var partition0SizeLimit = uint64(maxPartition0Size-2048) << 11
 
+// maxTokens is the largest number of tokens a coding pass may record: the
+// macroblocks' token offsets (mbTokStart) are int32. A pass that needs more
+// fails with ErrTooManyTokens. It is a variable so that tests can reach that
+// path with small pictures.
+var maxTokens = math.MaxInt32
+
 type passStats struct {
 	isFirst      bool
 	dq           float32
@@ -219,7 +225,7 @@ func (e *encoder) tokenLoop() error {
 		if err != nil {
 			return err
 		}
-		e.mbTokStart[nbMBs] = int32(e.tokens.len())
+		e.mbTokStart[nbMBs] = int32(e.tokens.len()) // <= maxTokens: codePass checked it
 		sizeP0 += uint64(e.segHdrSize)
 		if stats.doSizeSearch {
 			size := uint64(e.proba.finalizeTokenProbas())
@@ -305,8 +311,11 @@ func (e *encoder) codePass(isLastPass bool, maxCount int) (sizeP0, distortion ui
 			}
 		}
 		it.decimate(rd, rdOpt)
-		e.mbTokStart[it.mbIdx] = int32(e.tokens.len())
+		e.mbTokStart[it.mbIdx] = int32(e.tokens.len()) // <= maxTokens, checked below
 		it.recordTokens(rd, &e.tokens, &e.proba.stats)
+		if e.tokens.len() > maxTokens {
+			return 0, 0, ErrTooManyTokens
+		}
 		sizeP0 += uint64(rd.H)
 		distortion += uint64(rd.D)
 		if isLastPass {

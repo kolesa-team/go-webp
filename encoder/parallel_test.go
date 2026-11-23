@@ -32,8 +32,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/require"
-
 	"github.com/kolesa-team/go-webp/v2/internal/vp8enc"
 	"github.com/kolesa-team/go-webp/v2/internal/workers"
 )
@@ -66,10 +64,14 @@ func alphaImage(w, h int, seed int64) *image.NRGBA {
 func encodeBytes(t testing.TB, img image.Image, o *Options) []byte {
 	t.Helper()
 	e, err := NewEncoder(img, o)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewEncoder: %v", err)
+	}
 	defer e.Release()
 	var buf bytes.Buffer
-	require.NoError(t, e.Encode(&buf))
+	if err := e.Encode(&buf); err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
 	return buf.Bytes()
 }
 
@@ -93,12 +95,18 @@ func withBudget(t testing.TB, mode string, f func()) {
 		defer workers.SetLimitForTest(prev)
 		block := make(chan struct{})
 		task := workers.Spawn(func() error { <-block; return nil })
-		require.NotNil(t, task)
+		if task == nil {
+			t.Fatal("workers.Spawn = nil with a helper slot free, want a task")
+		}
 		defer func() {
 			close(block)
-			require.NoError(t, task.Wait())
+			if err := task.Wait(); err != nil {
+				t.Fatalf("Wait for the blocking task: %v", err)
+			}
 		}()
-		require.Nil(t, workers.Spawn(func() error { return nil }), "the budget must be exhausted")
+		if extra := workers.Spawn(func() error { return nil }); extra != nil {
+			t.Fatal("the budget must be exhausted: workers.Spawn returned a task, want nil")
+		}
 	default:
 		t.Fatalf("unknown budget %q", mode)
 	}
@@ -127,7 +135,9 @@ func checkNoLeak(t *testing.T) {
 			}
 			time.Sleep(time.Millisecond)
 		}
-		require.Zero(t, workers.InUse(), "helper slots still taken")
+		if n := workers.InUse(); n != 0 {
+			t.Fatalf("helper slots still taken: workers.InUse() = %d, want 0", n)
+		}
 	})
 }
 
@@ -170,21 +180,31 @@ func TestParallelAlphaIdentical(t *testing.T) {
 				continue
 			}
 			o, err := NewLossyEncoderOptions(PresetDefault, 75)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("NewLossyEncoderOptions: %v", err)
+			}
 			v.mut(o)
 			onHelper.Store(false)
 			want := encodeBytes(t, img, o)
-			require.False(t, onHelper.Load())
+			if onHelper.Load() {
+				t.Fatalf("%dx%d/%s: the sequential encode coded the alpha plane on a helper", size[0], size[1], v.name)
+			}
 			o.ThreadLevel = true
 			for _, b := range budgets {
 				name := fmt.Sprintf("%dx%d/%s/budget %s", size[0], size[1], v.name, b)
 				onHelper.Store(false)
 				withBudget(t, b, func() {
-					require.Equal(t, want, encodeBytes(t, img, o), name)
+					if got := encodeBytes(t, img, o); !bytes.Equal(got, want) {
+						t.Fatalf("%s: ThreadLevel output differs from the sequential one (%d bytes, want %d)", name, len(got), len(want))
+					}
 				})
 				expect := b != "exhausted" && size[0]*size[1] >= minParallelAlphaPixels && o.AlphaCompression == 1
-				require.Equal(t, expect, onHelper.Load(), "%s: alpha coded on a helper", name)
-				require.Zero(t, workers.InUse(), name)
+				if got := onHelper.Load(); got != expect {
+					t.Fatalf("%s: alpha coded on a helper = %v, want %v", name, got, expect)
+				}
+				if n := workers.InUse(); n != 0 {
+					t.Fatalf("%s: workers.InUse() = %d, want 0", name, n)
+				}
 			}
 		}
 	}
@@ -193,10 +213,14 @@ func TestParallelAlphaIdentical(t *testing.T) {
 func lossyAlphaEncoder(t *testing.T, threads bool) *Encoder {
 	t.Helper()
 	o, err := NewLossyEncoderOptions(PresetDefault, 75)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewLossyEncoderOptions: %v", err)
+	}
 	o.ThreadLevel = threads
 	e, err := NewEncoder(alphaImage(300, 260, 1), o)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewEncoder: %v", err)
+	}
 	return e
 }
 
@@ -240,9 +264,15 @@ func TestParallelAlphaVP8Error(t *testing.T) {
 	withBudget(t, "1", func() {
 		var cw countWriter
 		err := e.Encode(&cw)
-		require.ErrorIs(t, err, errVP8)
-		require.EqualError(t, err, "cannot encode webppicture")
-		require.Zero(t, cw.calls)
+		if !errors.Is(err, errVP8) {
+			t.Fatalf("Encode = %v, want an error wrapping %v", err, errVP8)
+		}
+		if err == nil || err.Error() != "cannot encode webppicture" {
+			t.Fatalf("Encode = %v, want %q", err, "cannot encode webppicture")
+		}
+		if cw.calls != 0 {
+			t.Fatalf("%d Write calls, want 0", cw.calls)
+		}
 	})
 	select {
 	case <-returned:
@@ -282,7 +312,9 @@ func TestParallelAlphaErrorPrecedence(t *testing.T) {
 				withBudget(t, b, func() {
 					e := lossyAlphaEncoder(t, threads)
 					defer e.Release()
-					require.ErrorIs(t, e.Encode(&bytes.Buffer{}), tc.want, "threads %v budget %s", threads, b)
+					if err := e.Encode(&bytes.Buffer{}); !errors.Is(err, tc.want) {
+						t.Fatalf("threads %v budget %s: Encode = %v, want an error wrapping %v", threads, b, err, tc.want)
+					}
 				})
 			}
 		}
@@ -303,15 +335,23 @@ func TestParallelAlphaPanics(t *testing.T) {
 			defer e.Release()
 			v := recoverValue(func() { e.Encode(&bytes.Buffer{}) })
 			pe, ok := v.(*workers.PanicError)
-			require.True(t, ok, "got %T %v", v, v)
-			require.Equal(t, "alpha boom", pe.Value)
+			if !ok {
+				t.Fatalf("recovered %T %v, want a *workers.PanicError", v, v)
+			}
+			if pe.Value != "alpha boom" {
+				t.Fatalf("PanicError.Value = %v (%T), want %q", pe.Value, pe.Value, "alpha boom")
+			}
 		})
 		withBudget(t, "exhausted", func() {
 			e := lossyAlphaEncoder(t, true)
 			defer e.Release()
-			require.Equal(t, "alpha boom", recoverValue(func() { e.Encode(&bytes.Buffer{}) }))
+			if v := recoverValue(func() { e.Encode(&bytes.Buffer{}) }); v != "alpha boom" {
+				t.Fatalf("recovered %v (%T), want %q", v, v, "alpha boom")
+			}
 		})
-		require.Zero(t, workers.InUse())
+		if n := workers.InUse(); n != 0 {
+			t.Fatalf("workers.InUse() = %d, want 0", n)
+		}
 	})
 
 	t.Run("vp8 frame", func(t *testing.T) {
@@ -325,14 +365,18 @@ func TestParallelAlphaPanics(t *testing.T) {
 		withBudget(t, "1", func() {
 			e := lossyAlphaEncoder(t, true)
 			defer e.Release()
-			require.Equal(t, "vp8 boom", recoverValue(func() { e.Encode(&bytes.Buffer{}) }))
+			if v := recoverValue(func() { e.Encode(&bytes.Buffer{}) }); v != "vp8 boom" {
+				t.Fatalf("recovered %v (%T), want %q", v, v, "vp8 boom")
+			}
 		})
 		select {
 		case <-returned:
 		default:
 			t.Fatal("the panic left the alpha helper running")
 		}
-		require.Zero(t, workers.InUse())
+		if n := workers.InUse(); n != 0 {
+			t.Fatalf("workers.InUse() = %d, want 0", n)
+		}
 	})
 }
 

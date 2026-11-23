@@ -22,12 +22,12 @@
 package encoder
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"image"
+	"reflect"
 	"testing"
-
-	"github.com/stretchr/testify/require"
 
 	"github.com/kolesa-team/go-webp/v2/internal/workers"
 )
@@ -61,19 +61,27 @@ func TestWavefrontIdentical(t *testing.T) {
 				continue // slow alpha plane, nothing more to check
 			}
 			o, err := NewLossyEncoderOptions(PresetDefault, 75)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("NewLossyEncoderOptions: %v", err)
+			}
 			o.Method = m
 			want := encodeBytes(t, img, o)
 			o.ThreadLevel = true
 			for _, limit := range []int{1, 3, 8} {
 				name := fmt.Sprintf("alpha=%v m%d budget %d", alpha, m, limit)
 				prev := workers.SetLimitForTest(limit)
-				require.Equal(t, want, encodeBytes(t, img, o), name)
+				if got := encodeBytes(t, img, o); !bytes.Equal(got, want) {
+					t.Fatalf("%s: ThreadLevel output differs from the sequential one (%d bytes, want %d)", name, len(got), len(want))
+				}
 				workers.SetLimitForTest(prev)
-				require.Zero(t, workers.InUse(), name)
+				if n := workers.InUse(); n != 0 {
+					t.Fatalf("%s: workers.InUse() = %d, want 0", name, n)
+				}
 			}
 			withBudget(t, "exhausted", func() {
-				require.Equal(t, want, encodeBytes(t, img, o), "alpha=%v m%d no budget", alpha, m)
+				if got := encodeBytes(t, img, o); !bytes.Equal(got, want) {
+					t.Fatalf("alpha=%v m%d no budget: ThreadLevel output differs from the sequential one (%d bytes, want %d)", alpha, m, len(got), len(want))
+				}
 			})
 		}
 	}
@@ -87,29 +95,43 @@ func TestWavefrontContextCancel(t *testing.T) {
 	for _, alpha := range []bool{false, true} {
 		img := wavefrontImage(alpha)
 		o, err := NewLossyEncoderOptions(PresetDefault, 75)
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("NewLossyEncoderOptions: %v", err)
+		}
 		o.ThreadLevel = true
 		want := encodeBytes(t, img, o)
 		for _, limit := range []int{1, 4} {
 			prev := workers.SetLimitForTest(limit)
 			e, err := NewEncoder(img, o)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("alpha=%v budget %d: NewEncoder: %v", alpha, limit, err)
+			}
 			ctx := newPollCtx(0)
 			var got countWriter
-			require.NoError(t, e.EncodeContext(ctx, &got))
+			if err := e.EncodeContext(ctx, &got); err != nil {
+				t.Fatalf("alpha=%v budget %d: EncodeContext: %v", alpha, limit, err)
+			}
 			n := ctx.polls.Load()
 			for _, k := range pollPoints(n) {
 				var cw countWriter
 				err := e.EncodeContext(newPollCtx(k), &cw)
-				require.Zero(t, workers.InUse(), "helpers running after EncodeContext returned")
+				if inUse := workers.InUse(); inUse != 0 {
+					t.Fatalf("alpha=%v budget %d poll %d/%d: helpers running after EncodeContext returned: workers.InUse() = %d, want 0", alpha, limit, k, n, inUse)
+				}
 				if err == nil && k == n {
 					continue // the last poll may come after the frame is coded
 				}
-				require.Equal(t, context.Canceled, err, "alpha=%v budget %d poll %d/%d", alpha, limit, k, n)
-				require.Zero(t, cw.calls)
+				if !reflect.DeepEqual(err, context.Canceled) {
+					t.Fatalf("alpha=%v budget %d poll %d/%d: EncodeContext = %v, want %v", alpha, limit, k, n, err, context.Canceled)
+				}
+				if cw.calls != 0 {
+					t.Fatalf("alpha=%v budget %d poll %d/%d: %d Write calls, want 0", alpha, limit, k, n, cw.calls)
+				}
 			}
 			// The encoder is reusable after a cancellation.
-			require.Equal(t, want, encodeBytesWith(t, e))
+			if out := encodeBytesWith(t, e); !bytes.Equal(out, want) {
+				t.Fatalf("alpha=%v budget %d: Encode after a cancellation differs from the first encode (%d bytes, want %d)", alpha, limit, len(out), len(want))
+			}
 			e.Release()
 			workers.SetLimitForTest(prev)
 		}
@@ -119,6 +141,8 @@ func TestWavefrontContextCancel(t *testing.T) {
 func encodeBytesWith(t *testing.T, e *Encoder) []byte {
 	t.Helper()
 	var buf sliceWriter
-	require.NoError(t, e.Encode(&buf))
+	if err := e.Encode(&buf); err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
 	return buf.b
 }

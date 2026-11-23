@@ -33,9 +33,6 @@ import (
 	"testing"
 	"testing/iotest"
 
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-
 	"github.com/kolesa-team/go-webp/v2/internal/status"
 	"github.com/kolesa-team/go-webp/v2/utils"
 )
@@ -84,20 +81,32 @@ func TestNewDecoder(t *testing.T) {
 				},
 			},
 		})
-		require.EqualError(t, err, "data is empty")
+		if want := "data is empty"; err == nil || err.Error() != want {
+			t.Fatalf("NewDecoder(invalid.webp): error %v, want %q", err, want)
+		}
 	})
 	t.Run("not a webp file", func(t *testing.T) {
 		data, err := os.ReadFile("../test_data/images/logo.jpg")
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatal(err)
+		}
 		_, err = NewDecoder(bytes.NewReader(data), nil)
-		require.EqualError(t, err, "cannot fetch features: VP8_STATUS_BITSTREAM_ERROR")
-		assert.Equal(t, utils.Vp8StatusBitstreamError, status.CodeOf(err))
+		if want := "cannot fetch features: VP8_STATUS_BITSTREAM_ERROR"; err == nil || err.Error() != want {
+			t.Fatalf("NewDecoder(logo.jpg): error %v, want %q", err, want)
+		}
+		if code := status.CodeOf(err); code != utils.Vp8StatusBitstreamError {
+			t.Errorf("NewDecoder(logo.jpg): code %v, want %v", code, utils.Vp8StatusBitstreamError)
+		}
 	})
 	t.Run("reader without size", func(t *testing.T) {
 		data := readFile(t, "m4_q75.webp")
 		d, err := NewDecoder(iotest.HalfReader(bytes.NewReader(data)), nil)
-		require.NoError(t, err)
-		assert.Equal(t, 675, d.GetFeatures().Width)
+		if err != nil {
+			t.Fatalf("NewDecoder(HalfReader): %v", err)
+		}
+		if got := d.GetFeatures().Width; got != 675 {
+			t.Errorf("Width = %d, want 675", got)
+		}
 	})
 }
 
@@ -141,39 +150,61 @@ func TestDecoder_GetFeatures(t *testing.T) {
 	}
 	for _, tt := range tests {
 		dec, err := NewDecoder(bytes.NewReader(readFile(t, tt.file)), nil)
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("NewDecoder(%s): %v", tt.file, err)
+		}
 		f := dec.GetFeatures()
-		assert.Equal(t, tt.want.Width, f.Width, tt.file)
-		assert.Equal(t, tt.want.Height, f.Height, tt.file)
-		assert.Equal(t, tt.want.Format, f.Format, tt.file)
+		if f.Width != tt.want.Width {
+			t.Errorf("%s: Width = %d, want %d", tt.file, f.Width, tt.want.Width)
+		}
+		if f.Height != tt.want.Height {
+			t.Errorf("%s: Height = %d, want %d", tt.file, f.Height, tt.want.Height)
+		}
+		if f.Format != tt.want.Format {
+			t.Errorf("%s: Format = %v, want %v", tt.file, f.Format, tt.want.Format)
+		}
 	}
 }
 
 func TestDecoder_NilOptions(t *testing.T) {
 	file, err := os.Open("../test_data/images/m4_q75.webp")
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer file.Close()
 
 	d, err := NewDecoder(file, nil)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewDecoder(m4_q75.webp, nil): %v", err)
+	}
 	img, err := d.Decode()
-	require.NoError(t, err)
-	assert.Equal(t, image.Rect(0, 0, 675, 900), img.Bounds())
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if got, want := img.Bounds(), image.Rect(0, 0, 675, 900); got != want {
+		t.Errorf("Bounds = %v, want %v", got, want)
+	}
 }
 
 func readFile(t testing.TB, name string) []byte {
 	t.Helper()
 	data, err := os.ReadFile("../test_data/images/" + name)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return data
 }
 
 func decode(t testing.TB, data []byte, o *Options) *image.NRGBA {
 	t.Helper()
 	d, err := NewDecoder(bytes.NewReader(data), o)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewDecoder(%+v): %v", o, err)
+	}
 	img, err := d.Decode()
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("Decode(%+v): %v", o, err)
+	}
 	return img.(*image.NRGBA)
 }
 
@@ -183,7 +214,9 @@ func optionsFromDwebp(t *testing.T, flags string) *Options {
 	f := strings.Fields(flags)
 	atoi := func(s string) int {
 		v, err := strconv.Atoi(s)
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("flags %q: %v", flags, err)
+		}
 		return v
 	}
 	for i := 0; i < len(f); i++ {
@@ -242,7 +275,9 @@ func TestConformance(t *testing.T) {
 		t.Run(g.file+g.flags, func(t *testing.T) {
 			img := decode(t, readFile(t, g.file+".webp"), optionsFromDwebp(t, g.flags))
 			sum := sha256.Sum256(img.Pix)
-			assert.Equal(t, g.sum, hex.EncodeToString(sum[:]))
+			if got := hex.EncodeToString(sum[:]); got != g.sum {
+				t.Errorf("SHA-256 of the pixels = %s, want %s", got, g.sum)
+			}
 		})
 	}
 }
@@ -255,34 +290,48 @@ func TestDecoder_Transforms(t *testing.T) {
 
 		t.Run(file+" flip", func(t *testing.T) {
 			flipped := decode(t, data, &Options{NoFancyUpsampling: true, Flip: true})
-			require.Equal(t, b, flipped.Bounds())
+			if flipped.Bounds() != b {
+				t.Fatalf("flipped Bounds = %v, want %v", flipped.Bounds(), b)
+			}
 			for y := 0; y < b.Dy(); y++ {
-				require.Equal(t, full.Pix[y*full.Stride:][:4*b.Dx()], flipped.Pix[(b.Dy()-1-y)*flipped.Stride:][:4*b.Dx()])
+				if !bytes.Equal(full.Pix[y*full.Stride:][:4*b.Dx()], flipped.Pix[(b.Dy()-1-y)*flipped.Stride:][:4*b.Dx()]) {
+					t.Fatalf("row %d of the flipped picture differs from row %d of the picture", b.Dy()-1-y, y)
+				}
 			}
 		})
 		t.Run(file+" crop", func(t *testing.T) {
 			// Without fancy upsampling a crop with an even corner equals
 			// the same rectangle of the full picture, for both formats.
 			crop := decode(t, data, &Options{NoFancyUpsampling: true, Crop: image.Rectangle{Min: image.Pt(64, 32), Max: image.Pt(101, 77)}})
-			require.Equal(t, image.Rect(0, 0, 101, 77), crop.Bounds())
+			if want := image.Rect(0, 0, 101, 77); crop.Bounds() != want {
+				t.Fatalf("cropped Bounds = %v, want %v", crop.Bounds(), want)
+			}
 			sub := full.SubImage(image.Rect(64, 32, 64+101, 32+77)).(*image.NRGBA)
 			for y := 0; y < 77; y++ {
-				require.Equal(t, sub.Pix[y*sub.Stride:][:4*101], crop.Pix[y*crop.Stride:][:4*101])
+				if !bytes.Equal(sub.Pix[y*sub.Stride:][:4*101], crop.Pix[y*crop.Stride:][:4*101]) {
+					t.Fatalf("row %d of the crop differs from the same rectangle of the picture", y)
+				}
 			}
 		})
 		t.Run(file+" scale", func(t *testing.T) {
 			img := decode(t, data, &Options{Scale: image.Rectangle{Max: image.Pt(123, 45)}})
-			assert.Equal(t, image.Rect(0, 0, 123, 45), img.Bounds())
+			if want := image.Rect(0, 0, 123, 45); img.Bounds() != want {
+				t.Errorf("scaled Bounds = %v, want %v", img.Bounds(), want)
+			}
 			img = decode(t, data, &Options{
 				Crop:  image.Rectangle{Min: image.Pt(10, 10), Max: image.Pt(200, 100)},
 				Scale: image.Rectangle{Max: image.Pt(400, 50)},
 				Flip:  true,
 			})
-			assert.Equal(t, image.Rect(0, 0, 400, 50), img.Bounds())
+			if want := image.Rect(0, 0, 400, 50); img.Bounds() != want {
+				t.Errorf("cropped, scaled and flipped Bounds = %v, want %v", img.Bounds(), want)
+			}
 		})
 		t.Run(file+" threads", func(t *testing.T) {
 			img := decode(t, data, &Options{NoFancyUpsampling: true, UseThreads: true})
-			require.Equal(t, full.Pix, img.Pix)
+			if !bytes.Equal(full.Pix, img.Pix) {
+				t.Fatalf("UseThreads pixels (%d bytes) differ from the sequential decode (%d bytes)", len(img.Pix), len(full.Pix))
+			}
 		})
 	}
 }
@@ -298,7 +347,10 @@ func TestDecoder_Errors(t *testing.T) {
 		}
 		img, err := d.Decode()
 		if err == nil {
-			assert.NotNil(t, img)
+			// A typed nil pointer in the interface counts as nil too.
+			if p, ok := img.(*image.NRGBA); img == nil || ok && p == nil {
+				t.Errorf("Decode(%+v) returned a nil image and no error", o)
+			}
 		}
 		return err
 	}
@@ -306,15 +358,21 @@ func TestDecoder_Errors(t *testing.T) {
 	t.Run("crop outside of the picture", func(t *testing.T) {
 		for _, data := range [][]byte{m4, lossless} {
 			err := decodeErr(data, &Options{Crop: image.Rectangle{Min: image.Pt(2990, 0), Max: image.Pt(100, 100)}})
-			require.EqualError(t, err, "cannot decode picture: VP8_STATUS_INVALID_PARAM")
+			if want := "cannot decode picture: VP8_STATUS_INVALID_PARAM"; err == nil || err.Error() != want {
+				t.Fatalf("error %v, want %q", err, want)
+			}
 			var se *status.Error
-			require.True(t, errors.As(err, &se))
+			if !errors.As(err, &se) {
+				t.Fatalf("error %v (%T) does not wrap a *status.Error", err, err)
+			}
 		}
 	})
 	t.Run("truncated", func(t *testing.T) {
 		for _, data := range [][]byte{m4, lossless} {
 			err := decodeErr(data[:len(data)/2], nil)
-			require.EqualError(t, err, "cannot decode picture: VP8_STATUS_NOT_ENOUGH_DATA")
+			if want := "cannot decode picture: VP8_STATUS_NOT_ENOUGH_DATA"; err == nil || err.Error() != want {
+				t.Fatalf("error %v, want %q", err, want)
+			}
 		}
 	})
 	t.Run("corrupted", func(t *testing.T) {
@@ -331,11 +389,19 @@ func TestDecoder_Errors(t *testing.T) {
 		anim := []byte("RIFF\x00\x00\x00\x00WEBPVP8X\x0a\x00\x00\x00\x02\x00\x00\x00\x09\x00\x00\x09\x00\x00ANIM\x06\x00\x00\x00\x00\x00\x00\x00\x00\x00")
 		anim[4] = byte(len(anim) - 8)
 		d, err := NewDecoder(bytes.NewReader(anim), nil)
-		require.NoError(t, err)
-		assert.True(t, d.GetFeatures().HasAnimation)
-		assert.Equal(t, 10, d.GetFeatures().Width)
+		if err != nil {
+			t.Fatalf("NewDecoder: %v", err)
+		}
+		if !d.GetFeatures().HasAnimation {
+			t.Error("HasAnimation = false, want true")
+		}
+		if got := d.GetFeatures().Width; got != 10 {
+			t.Errorf("Width = %d, want 10", got)
+		}
 		_, err = d.Decode()
-		require.EqualError(t, err, "cannot decode picture: VP8_STATUS_UNSUPPORTED_FEATURE")
+		if want := "cannot decode picture: VP8_STATUS_UNSUPPORTED_FEATURE"; err == nil || err.Error() != want {
+			t.Fatalf("Decode: error %v, want %q", err, want)
+		}
 	})
 }
 

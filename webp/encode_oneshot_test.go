@@ -28,8 +28,6 @@ import (
 	"image/draw"
 	"testing"
 
-	"github.com/stretchr/testify/require"
-
 	"github.com/kolesa-team/go-webp/v2/encoder"
 )
 
@@ -44,21 +42,37 @@ func TestEncodeOneShotIdentical(t *testing.T) {
 	gray := image.NewGray(image.Rect(0, 0, 1, 77))
 	draw.Draw(gray, gray.Rect, jpg, image.Point{300, 300}, draw.Src)
 	lossy, err := encoder.NewLossyEncoderOptions(encoder.PresetDefault, 75)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewLossyEncoderOptions: %v", err)
+	}
 	lossless, err := encoder.NewLosslessEncoderOptions(encoder.PresetDefault, 2)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewLosslessEncoderOptions: %v", err)
+	}
 	for round := 0; round < 2; round++ { // the second round reuses pooled storage
 		for _, src := range []image.Image{jpg, rgba, gray} {
 			for _, o := range []*encoder.Options{lossy, lossless} {
 				e, err := encoder.NewEncoder(src, o)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("NewEncoder(%T lossless=%v): %v", src, o.Lossless, err)
+				}
 				var want, got bytes.Buffer
-				require.NoError(t, e.Encode(&want))
-				require.NoError(t, Encode(&got, src, o))
-				require.Equal(t, want.Bytes(), got.Bytes(), "%T lossless=%v", src, o.Lossless)
+				if err := e.Encode(&want); err != nil {
+					t.Fatalf("Encoder.Encode(%T lossless=%v): %v", src, o.Lossless, err)
+				}
+				if err := Encode(&got, src, o); err != nil {
+					t.Fatalf("Encode(%T lossless=%v): %v", src, o.Lossless, err)
+				}
+				if !bytes.Equal(want.Bytes(), got.Bytes()) {
+					t.Fatalf("%T lossless=%v: Encode output (%d bytes) differs from the Encoder's (%d bytes)", src, o.Lossless, got.Len(), want.Len())
+				}
 				got.Reset()
-				require.NoError(t, EncodeContext(context.Background(), &got, src, o))
-				require.Equal(t, want.Bytes(), got.Bytes(), "%T lossless=%v", src, o.Lossless)
+				if err := EncodeContext(context.Background(), &got, src, o); err != nil {
+					t.Fatalf("EncodeContext(%T lossless=%v): %v", src, o.Lossless, err)
+				}
+				if !bytes.Equal(want.Bytes(), got.Bytes()) {
+					t.Fatalf("%T lossless=%v: EncodeContext output (%d bytes) differs from the Encoder's (%d bytes)", src, o.Lossless, got.Len(), want.Len())
+				}
 			}
 		}
 	}

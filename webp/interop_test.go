@@ -39,8 +39,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/stretchr/testify/require"
-
 	"github.com/kolesa-team/go-webp/v2/decoder"
 	"github.com/kolesa-team/go-webp/v2/encoder"
 )
@@ -61,7 +59,9 @@ func tool(t *testing.T, env, name string) string {
 func readPAM(t *testing.T, data []byte) *image.NRGBA {
 	t.Helper()
 	end := bytes.Index(data, []byte("ENDHDR\n"))
-	require.True(t, end > 0, "not a PAM file")
+	if end <= 0 {
+		t.Fatalf("not a PAM file: ENDHDR at %d, want > 0", end)
+	}
 	var w, h int
 	for _, line := range strings.Split(string(data[:end]), "\n") {
 		f := strings.Fields(line)
@@ -73,7 +73,9 @@ func readPAM(t *testing.T, data []byte) *image.NRGBA {
 		}
 	}
 	pix := data[end+7:]
-	require.Equal(t, 4*w*h, len(pix))
+	if len(pix) != 4*w*h {
+		t.Fatalf("PAM %dx%d: %d pixel bytes, want %d", w, h, len(pix), 4*w*h)
+	}
 	return &image.NRGBA{Pix: pix, Stride: 4 * w, Rect: image.Rect(0, 0, w, h)}
 }
 
@@ -81,14 +83,20 @@ func dwebp(t *testing.T, dir string, file []byte, flags ...string) *image.NRGBA 
 	t.Helper()
 	in := filepath.Join(dir, "in.webp")
 	out := filepath.Join(dir, "out.pam")
-	require.NoError(t, os.WriteFile(in, file, 0o644))
+	if err := os.WriteFile(in, file, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	args := append([]string{in}, flags...)
 	args = append(args, "-pam", "-quiet", "-o", out)
 	cmd := exec.Command(tool(t, "DWEBP", "dwebp"), args...)
 	msg, err := cmd.CombinedOutput()
-	require.NoError(t, err, "dwebp %v: %s", flags, msg)
+	if err != nil {
+		t.Fatalf("dwebp %v: %v: %s", flags, err, msg)
+	}
 	data, err := os.ReadFile(out)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return readPAM(t, data)
 }
 
@@ -97,28 +105,42 @@ func cwebp(t *testing.T, dir string, img image.Image, flags ...string) []byte {
 	in := filepath.Join(dir, "in.png")
 	out := filepath.Join(dir, "out.webp")
 	f, err := os.Create(in)
-	require.NoError(t, err)
-	require.NoError(t, png.Encode(f, img))
-	require.NoError(t, f.Close())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := png.Encode(f, img); err != nil {
+		t.Fatalf("png.Encode: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
 	args := append([]string{"-quiet"}, flags...)
 	args = append(args, in, "-o", out)
 	msg, err := exec.Command(tool(t, "CWEBP", "cwebp"), args...).CombinedOutput()
-	require.NoError(t, err, "cwebp %v: %s", flags, msg)
+	if err != nil {
+		t.Fatalf("cwebp %v: %v: %s", flags, err, msg)
+	}
 	data, err := os.ReadFile(out)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return data
 }
 
 func decodeWith(t *testing.T, file []byte, o *decoder.Options) *image.NRGBA {
 	t.Helper()
 	img, err := Decode(bytes.NewReader(file), o)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("Decode(%+v): %v", o, err)
+	}
 	return img.(*image.NRGBA)
 }
 
 func requireSamePixels(t *testing.T, want, got *image.NRGBA, tolerance int, msg string) {
 	t.Helper()
-	require.Equal(t, want.Rect.Size(), got.Rect.Size(), msg)
+	if ws, gs := want.Rect.Size(), got.Rect.Size(); ws != gs {
+		t.Fatalf("%s: size: libwebp %v, ours %v", msg, ws, gs)
+	}
 	w, h := want.Rect.Dx(), want.Rect.Dy()
 	for y := 0; y < h; y++ {
 		a := want.Pix[y*want.Stride:][:4*w]
@@ -184,7 +206,9 @@ func TestInteropEncode(t *testing.T) {
 			for _, c := range cfgs {
 				name := fmt.Sprintf("%dx%d %s %s", size[0], size[1], s.name, c.name)
 				buf := &bytes.Buffer{}
-				require.NoError(t, Encode(buf, s.img, c.opts()), name)
+				if err := Encode(buf, s.img, c.opts()); err != nil {
+					t.Fatalf("%s: Encode: %v", name, err)
+				}
 				ref := dwebp(t, dir, buf.Bytes())
 				ours := decodeWith(t, buf.Bytes(), nil)
 				requireSamePixels(t, ref, ours, 0, name)
@@ -248,7 +272,9 @@ func TestInteropDecode(t *testing.T) {
 	// Repository fixtures.
 	for _, f := range []string{"m4_q75.webp", "webp-logo-lossy.webp", "webp-logo-lossless.webp"} {
 		data, err := os.ReadFile("../test_data/images/" + f)
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatal(err)
+		}
 		for _, o := range opts {
 			if strings.Contains(o.flags, "resize") {
 				continue
@@ -268,17 +294,25 @@ func TestInteropQuality(t *testing.T) {
 		for _, m := range []int{0, 4, 6} {
 			ref := cwebp(t, dir, img, "-q", fmt.Sprint(q), "-m", fmt.Sprint(m))
 			o, err := encoder.NewLossyEncoderOptions(encoder.PresetDefault, q)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("NewLossyEncoderOptions(%g): %v", q, err)
+			}
 			o.Method = m
 			buf := &bytes.Buffer{}
-			require.NoError(t, Encode(buf, img, o))
+			if err := Encode(buf, img, o); err != nil {
+				t.Fatalf("q%g m%d: Encode: %v", q, m, err)
+			}
 
 			refPSNR := psnr(img, dwebp(t, dir, ref))
 			ourPSNR := psnr(img, dwebp(t, dir, buf.Bytes()))
 			ratio := float64(buf.Len()) / float64(len(ref))
 			t.Logf("q%g m%d: libwebp %d bytes %.2f dB, ours %d bytes %.2f dB (size x%.3f)", q, m, len(ref), refPSNR, buf.Len(), ourPSNR, ratio)
-			require.Greater(t, ourPSNR, refPSNR-0.5)
-			require.Less(t, ratio, 1.10)
+			if !(ourPSNR > refPSNR-0.5) {
+				t.Fatalf("q%g m%d: PSNR %.2f dB, want > %.2f (libwebp %.2f dB - 0.5)", q, m, ourPSNR, refPSNR-0.5, refPSNR)
+			}
+			if !(ratio < 1.10) {
+				t.Fatalf("q%g m%d: size x%.3f of libwebp's, want < 1.10", q, m, ratio)
+			}
 		}
 	}
 }
@@ -293,12 +327,18 @@ func TestInteropPhotoPreset(t *testing.T) {
 		for _, q := range []float32{75, 95, 100} {
 			ref := cwebp(t, dir, img, "-preset", "photo", "-q", fmt.Sprint(q))
 			o, err := encoder.NewLossyEncoderOptions(encoder.PresetPhoto, q)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("NewLossyEncoderOptions(PresetPhoto, %g): %v", q, err)
+			}
 			buf := &bytes.Buffer{}
-			require.NoError(t, Encode(buf, img, o))
+			if err := Encode(buf, img, o); err != nil {
+				t.Fatalf("%s q%g: Encode: %v", name, q, err)
+			}
 			ratio := float64(buf.Len()) / float64(len(ref))
 			t.Logf("%s photo q%g: libwebp %d bytes, ours %d bytes (x%.3f)", name, q, len(ref), buf.Len(), ratio)
-			require.Less(t, ratio, 1.05, "%s q%g", name, q)
+			if !(ratio < 1.05) {
+				t.Fatalf("%s q%g: size x%.3f of libwebp's, want < 1.05", name, q, ratio)
+			}
 		}
 	}
 }

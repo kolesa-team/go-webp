@@ -3,3 +3,4 @@
 .DS_Store
 /example/output*
 /benchmarks/out
+/coverage.txt

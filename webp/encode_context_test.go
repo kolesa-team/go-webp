@@ -26,12 +26,11 @@ import (
 	"fmt"
 	"image"
 	"io"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/stretchr/testify/require"
 
 	"github.com/kolesa-team/go-webp/v2/encoder"
 )
@@ -41,7 +40,9 @@ import (
 func BenchmarkEncodeContext(b *testing.B) {
 	img := loadJPEG(b, "source.jpg")
 	o, err := encoder.NewLossyEncoderOptions(encoder.PresetDefault, 75)
-	require.NoError(b, err)
+	if err != nil {
+		b.Fatal(err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	b.ReportAllocs()
@@ -61,16 +62,30 @@ func TestEncodeContext(t *testing.T) {
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
 	var cw countingWriter
-	require.Equal(t, context.Canceled, EncodeContext(canceled, &cw, img, nil))
-	require.Zero(t, cw.n)
+	if err := EncodeContext(canceled, &cw, img, nil); !reflect.DeepEqual(context.Canceled, err) {
+		t.Fatalf("EncodeContext(canceled) = %v, want %v", err, context.Canceled)
+	}
+	if cw.n != 0 {
+		t.Fatalf("EncodeContext(canceled) wrote %d bytes, want 0", cw.n)
+	}
 
 	// Option and source errors are reported as by Encode.
 	bad := &encoder.Options{Quality: 200}
-	require.EqualError(t, EncodeContext(context.Background(), &cw, img, bad), Encode(&cw, img, bad).Error())
-	require.EqualError(t, EncodeContext(context.Background(), &cw, nil, nil), Encode(&cw, nil, nil).Error())
+	err := EncodeContext(context.Background(), &cw, img, bad)
+	if want := Encode(&cw, img, bad).Error(); err == nil || err.Error() != want {
+		t.Fatalf("EncodeContext(Quality 200) error = %v, want %q", err, want)
+	}
+	err = EncodeContext(context.Background(), &cw, nil, nil)
+	if want := Encode(&cw, nil, nil).Error(); err == nil || err.Error() != want {
+		t.Fatalf("EncodeContext(nil image) error = %v, want %q", err, want)
+	}
 	big := image.NewNRGBA(image.Rect(0, 0, 20000, 1))
-	require.EqualError(t, EncodeContext(context.Background(), &cw, big, nil), "cannot encode webppicture")
-	require.Zero(t, cw.n)
+	if err := EncodeContext(context.Background(), &cw, big, nil); err == nil || err.Error() != "cannot encode webppicture" {
+		t.Fatalf("EncodeContext(20000x1) error = %v, want %q", err, "cannot encode webppicture")
+	}
+	if cw.n != 0 {
+		t.Fatalf("EncodeContext wrote %d bytes on errors, want 0", cw.n)
+	}
 }
 
 // TestEncodeContextCancelLatency cancels slow encodes while they run: they
@@ -88,13 +103,19 @@ func TestEncodeContextCancelLatency(t *testing.T) {
 	}
 	logo := loadLogo(t)
 	lossy, err := encoder.NewLossyEncoderOptions(encoder.PresetDefault, 75)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewLossyEncoderOptions: %v", err)
+	}
 	lossy.Method = 6
 	threads, err := encoder.NewLossyEncoderOptions(encoder.PresetDefault, 75)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewLossyEncoderOptions: %v", err)
+	}
 	threads.ThreadLevel = true
 	lossless, err := encoder.NewLosslessEncoderOptions(encoder.PresetDefault, 9)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewLosslessEncoderOptions: %v", err)
+	}
 	before := runtime.NumGoroutine()
 	for _, tc := range []struct {
 		name string
@@ -115,27 +136,39 @@ func TestEncodeContextCancelLatency(t *testing.T) {
 					misses = append(misses, fmt.Sprintf("ended %v before the cancellation after %v", -latency, after))
 					after /= 2
 				} else {
-					require.Equal(t, context.Canceled, err, tc.name)
-					require.Zero(t, cw.n)
+					if !reflect.DeepEqual(context.Canceled, err) {
+						t.Fatalf("%s: EncodeContext = %v, want %v", tc.name, err, context.Canceled)
+					}
+					if cw.n != 0 {
+						t.Fatalf("%s: canceled EncodeContext wrote %d bytes, want 0", tc.name, cw.n)
+					}
 					t.Logf("%s: canceled after %v, returned %v later", tc.name, after, latency)
 					if latency < 2*time.Second {
 						break
 					}
 					start = time.Now()
-					require.NoError(t, Encode(io.Discard, logo, tc.o))
+					if err := Encode(io.Discard, logo, tc.o); err != nil {
+						t.Fatalf("%s: Encode: %v", tc.name, err)
+					}
 					whole := time.Since(start)
 					if latency < whole/4 {
 						break
 					}
 					misses = append(misses, fmt.Sprintf("canceled after %v, returned %v later; the whole encode takes %v", after, latency, whole))
 				}
-				require.Less(t, attempt, 2, "%s: %s", tc.name, strings.Join(misses, "; "))
+				if attempt >= 2 {
+					t.Fatalf("%s: %d attempts missed: %s", tc.name, attempt+1, strings.Join(misses, "; "))
+				}
 			}
 		}
 	}
 	for deadline := time.Now().Add(20 * time.Second); runtime.NumGoroutine() > before; {
-		require.True(t, time.Now().Before(deadline), "goroutine leak")
+		if !time.Now().Before(deadline) {
+			t.Fatalf("goroutine leak: %d goroutines after 20s, %d before the encodes", runtime.NumGoroutine(), before)
+		}
 		time.Sleep(time.Millisecond)
 	}
-	require.NoError(t, Encode(io.Discard, logo, threads))
+	if err := Encode(io.Discard, logo, threads); err != nil {
+		t.Fatalf("Encode(threads): %v", err)
+	}
 }

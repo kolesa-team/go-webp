@@ -26,11 +26,9 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"reflect"
 	"runtime"
 	"testing"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 
 	"github.com/kolesa-team/go-webp/v2/encoder"
 	"github.com/kolesa-team/go-webp/v2/internal/status"
@@ -98,10 +96,14 @@ func alphaFiles(t testing.TB, w, h int) map[string][]byte {
 	for _, comp := range []int{0, 1} {
 		for _, filt := range []int{0, 1, 2} {
 			o, err := encoder.NewLossyEncoderOptions(encoder.PresetDefault, 70)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("NewLossyEncoderOptions: %v", err)
+			}
 			o.AlphaCompression, o.AlphaFiltering = comp, filt
 			buf := &bytes.Buffer{}
-			require.NoError(t, encodeTo(buf, img, o))
+			if err := encodeTo(buf, img, o); err != nil {
+				t.Fatalf("encode %dx%d comp%d filter%d: %v", w, h, comp, filt, err)
+			}
 			name := fmt.Sprintf("%dx%d comp%d filter%d", w, h, comp, filt)
 			out[name] = buf.Bytes()
 			out[name+" levels"] = modifyChunk(t, buf.Bytes(), "ALPH", func(p []byte) []byte { p[0] |= 0x10; return p })
@@ -150,23 +152,35 @@ func TestAlphaHelperIdentical(t *testing.T) {
 			seq := *o
 			seq.UseThreads = false
 			want := decodeOutcome(t, data, &seq)
-			require.Empty(t, want.err, name)
+			if want.err != "" {
+				t.Fatalf("%s %+v: sequential decode: %s", name, o, want.err)
+			}
 			for _, b := range budgets {
 				restore := b.set()
 				got := decodeOutcome(t, data, o)
 				na, err := newDec(t, data, o).DecodeNYCbCrA()
 				restore()
-				require.Equal(t, want, got, "%s %+v budget %s", name, o, b.name)
+				if !reflect.DeepEqual(want, got) {
+					t.Fatalf("%s %+v budget %s: got error %q, want %q (pixels equal: %v)", name, o, b.name, got.err, want.err, bytes.Equal(got.pix, want.pix))
+				}
 				if o.Scale.Empty() {
-					require.NoError(t, err)
+					if err != nil {
+						t.Fatalf("%s %+v budget %s: DecodeNYCbCrA: %v", name, o, b.name, err)
+					}
 					wantNA, err := newDec(t, data, &seq).DecodeNYCbCrA()
-					require.NoError(t, err)
-					require.Equal(t, wantNA, na, "%s %+v budget %s", name, o, b.name)
+					if err != nil {
+						t.Fatalf("%s %+v: sequential DecodeNYCbCrA: %v", name, o, err)
+					}
+					if !reflect.DeepEqual(wantNA, na) {
+						t.Fatalf("%s %+v budget %s: DecodeNYCbCrA differs from the sequential decode", name, o, b.name)
+					}
 				}
 			}
 		}
 	}
-	assert.Equal(t, 0, workers.InUse())
+	if n := workers.InUse(); n != 0 {
+		t.Errorf("workers.InUse() = %d, want 0", n)
+	}
 }
 
 // TestAlphaHelperLogo runs the real-size path (default band size) on the
@@ -182,10 +196,14 @@ func TestAlphaHelperLogo(t *testing.T) {
 			restore := b.set()
 			got := decodeOutcome(t, data, o)
 			restore()
-			require.Equal(t, want, got, "budget %s %+v", b.name, o)
+			if !reflect.DeepEqual(want, got) {
+				t.Fatalf("budget %s %+v: got error %q, want %q (pixels equal: %v)", b.name, o, got.err, want.err, bytes.Equal(got.pix, want.pix))
+			}
 		}
 	}
-	assert.Equal(t, 0, workers.InUse())
+	if n := workers.InUse(); n != 0 {
+		t.Errorf("workers.InUse() = %d, want 0", n)
+	}
 }
 
 // TestAlphaHelperStopsAtCrop checks that the helper does not decode alpha
@@ -208,19 +226,31 @@ func TestAlphaHelperStopsAtCrop(t *testing.T) {
 		steps = 0
 		seq := *o
 		seq.UseThreads = false
-		require.Equal(t, decodeOutcome(t, data, &seq), decodeOutcome(t, data, o), "%+v", o)
+		if want, got := decodeOutcome(t, data, &seq), decodeOutcome(t, data, o); !reflect.DeepEqual(want, got) {
+			t.Fatalf("%+v: got error %q, want %q (pixels equal: %v)", o, got.err, want.err, bytes.Equal(got.pix, want.pix))
+		}
 		bottom := o.Crop.Min.Y&^1 + o.Crop.Max.Y
-		assert.Positive(t, steps, "%+v: helper not used", o)
-		assert.LessOrEqual(t, steps, (bottom+1)/2, "%+v: helper decoded rows below the crop", o)
+		if steps <= 0 {
+			t.Errorf("%+v: helper not used (%d steps)", o, steps)
+		}
+		if limit := (bottom + 1) / 2; steps > limit {
+			t.Errorf("%+v: helper decoded rows below the crop (%d steps, want <= %d)", o, steps, limit)
+		}
 	}
 
 	// 97 x 20 alpha pixels to decode: below the threshold.
 	minHelperPixels = w*20 + 1
 	steps = 0
 	o := &Options{UseThreads: true, Crop: image.Rect(0, 0, w, 20)}
-	require.Equal(t, decodeOutcome(t, data, &Options{Crop: o.Crop}), decodeOutcome(t, data, o))
-	assert.Zero(t, steps, "helper started for a small crop")
-	assert.Equal(t, 0, workers.InUse())
+	if want, got := decodeOutcome(t, data, &Options{Crop: o.Crop}), decodeOutcome(t, data, o); !reflect.DeepEqual(want, got) {
+		t.Fatalf("%+v: got error %q, want %q (pixels equal: %v)", o, got.err, want.err, bytes.Equal(got.pix, want.pix))
+	}
+	if steps != 0 {
+		t.Errorf("helper started for a small crop (%d steps, want 0)", steps)
+	}
+	if n := workers.InUse(); n != 0 {
+		t.Errorf("workers.InUse() = %d, want 0", n)
+	}
 }
 
 // TestAlphaHelperErrors corrupts and truncates the ALPH (and VP8) data in
@@ -265,13 +295,19 @@ func TestAlphaHelperErrors(t *testing.T) {
 				restore := b.set()
 				got := decodeOutcome(t, v.data, o)
 				restore()
-				require.Equal(t, want, got, "%s %+v budget %s", v.name, o, b.name)
+				if !reflect.DeepEqual(want, got) {
+					t.Fatalf("%s %+v budget %s: got error %q, want %q (pixels equal: %v)", v.name, o, b.name, got.err, want.err, bytes.Equal(got.pix, want.pix))
+				}
 			}
 		}
 	}
 	t.Logf("%d variants, %d failing decodes", len(variants), failures)
-	assert.Positive(t, failures)
-	assert.Equal(t, 0, workers.InUse())
+	if failures <= 0 {
+		t.Errorf("%d failing decodes, want > 0", failures)
+	}
+	if n := workers.InUse(); n != 0 {
+		t.Errorf("workers.InUse() = %d, want 0", n)
+	}
 }
 
 func chunkData(t testing.TB, file []byte, tag string) []byte {
@@ -304,17 +340,25 @@ func TestAlphaHelperPanic(t *testing.T) {
 				r := recover()
 				var ok bool
 				pe, ok = r.(*workers.PanicError)
-				require.True(t, ok, "recovered %v", r)
+				if !ok {
+					t.Fatalf("after %d steps: recovered %v, want a *workers.PanicError", after, r)
+				}
 			}()
 			_, _ = newDec(t, data, &Options{UseThreads: true}).Decode()
 		}()
 		testHookHelperStep = nil
-		require.NotNil(t, pe)
-		assert.Equal(t, "boom", pe.Value)
+		if pe == nil {
+			t.Fatalf("after %d steps: recovered a nil *workers.PanicError", after)
+		}
+		if pe.Value != "boom" {
+			t.Errorf("after %d steps: PanicError.Value = %#v, want %q", after, pe.Value, "boom")
+		}
 	}
 	waitGoroutines(t, g)
 	// The decoder still works (no broken state was pooled).
-	assert.Equal(t, decodeOutcome(t, data, nil), decodeOutcome(t, data, &Options{UseThreads: true}))
+	if want, got := decodeOutcome(t, data, nil), decodeOutcome(t, data, &Options{UseThreads: true}); !reflect.DeepEqual(want, got) {
+		t.Errorf("after the helper panics: got error %q, want %q (pixels equal: %v)", got.err, want.err, bytes.Equal(got.pix, want.pix))
+	}
 }
 
 // FuzzAlphaHelper compares the alpha helper (tiny bands and steps) with the
