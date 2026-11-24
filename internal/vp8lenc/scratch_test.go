@@ -124,7 +124,9 @@ func TestPoolBounds(t *testing.T) {
 }
 
 // TestFreeTrimOnGC checks that the scratches of the free list are dropped
-// by garbage collections once idle.
+// by garbage collections once idle. (It runs after TestThreadLevelGOMAXPROCS,
+// whose GOMAXPROCS decreases used to stop the trimming: see armGC in
+// internal/bufpool.)
 func TestFreeTrimOnGC(t *testing.T) {
 	defer withBudget(64 << 20)()
 	defer bufpool.SetMaxIdle(bufpool.SetMaxIdle(0))
@@ -134,13 +136,17 @@ func TestFreeTrimOnGC(t *testing.T) {
 	if bufpool.Retained() == 0 {
 		t.Fatal("scratch not kept")
 	}
+	trims := bufpool.GCTrims()
 	deadline := time.Now().Add(10 * time.Second)
+	gcs := 0
 	for bufpool.Retained() != 0 {
 		if time.Now().After(deadline) {
-			t.Fatal("idle scratch not dropped by the collections")
+			t.Fatalf("idle scratch not dropped by %d collections in 10 s (the trimming ran %d times)",
+				gcs, bufpool.GCTrims()-trims)
 		}
 		runtime.GC()
 		time.Sleep(time.Millisecond)
+		gcs++
 	}
 	if scratchFree.Len() != 0 {
 		t.Fatal("scratch still listed")

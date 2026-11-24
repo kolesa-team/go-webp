@@ -29,6 +29,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -439,5 +440,57 @@ func TestDefaultLimitByWordSize(t *testing.T) {
 	}
 	if DefaultLimit != want {
 		t.Fatalf("DefaultLimit = %d, want %d on %d-bit", int64(DefaultLimit), want, strconv.IntSize)
+	}
+}
+
+// smallSink keeps the objects of TestTrimAfterGOMAXPROCSDecrease on the heap.
+var smallSink atomic.Pointer[*byte]
+
+// TestTrimAfterGOMAXPROCSDecrease checks that the trimming after garbage
+// collections keeps running when GOMAXPROCS decreases in the middle of a
+// sweep. The runtime queues the cleanups of runtime.AddCleanup in per-P
+// blocks, and a decrease strands the blocks of the destroyed Ps until
+// GOMAXPROCS grows back (Go 1.27): a hook armed with AddCleanup stopped for
+// good in about one round in five here.
+func TestTrimAfterGOMAXPROCSDecrease(t *testing.T) {
+	fresh(t, DefaultLimit, 0)
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(0))
+	defer debug.SetGCPercent(debug.SetGCPercent(10)) // a sweep is usually in progress
+	rounds := 60
+	if testing.Short() {
+		rounds = 20
+	}
+	var p Pool[byte]
+	for round := range rounds {
+		runtime.GOMAXPROCS(8)
+		var stop atomic.Bool
+		var wg sync.WaitGroup
+		for range 8 {
+			// Objects of the size class of gcSentinel, so that every P
+			// sweeps spans of that class.
+			wg.Go(func() {
+				for !stop.Load() {
+					for i := range 256 {
+						b := new(*byte)
+						if i == 0 {
+							smallSink.Store(b)
+						}
+					}
+				}
+			})
+		}
+		time.Sleep(time.Duration(round%5) * 300 * time.Microsecond)
+		runtime.GOMAXPROCS(1)
+		stop.Store(true)
+		wg.Wait()
+		p.Put(make([]byte, 1<<10))
+		deadline := time.Now().Add(5 * time.Second)
+		for Retained() != 0 {
+			if time.Now().After(deadline) {
+				t.Fatalf("round %d: the collections no longer trim after GOMAXPROCS went from 8 to 1", round)
+			}
+			runtime.GC()
+			time.Sleep(time.Millisecond)
+		}
 	}
 }

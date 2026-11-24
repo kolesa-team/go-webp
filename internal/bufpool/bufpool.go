@@ -219,23 +219,38 @@ func trimAll(cutoff int64) {
 }
 
 // gcSentinel is allocated to detect the end of a garbage collection cycle:
-// its cleanup runs once it has been collected. It holds a pointer so that
-// it is not batched by the tiny allocator (whose cleanups may not run).
+// its finalizer runs once it has been collected. It holds a pointer so that
+// it is not batched by the tiny allocator (whose finalizers may not run).
 type gcSentinel struct{ _ *byte }
 
 // armGC arranges for onGC to run after the next garbage collection.
+//
+// It sets a finalizer rather than a runtime.AddCleanup cleanup: the runtime
+// queues cleanups in per-P blocks until the sweep ends, and a GOMAXPROCS
+// decrease in the middle of a sweep strands the blocks of the destroyed Ps
+// until GOMAXPROCS grows back (Go 1.27). A stranded cleanup would end this
+// chain, and with it the trimming of idle objects, for good. Finalizers go
+// to one global queue.
 func armGC() {
-	runtime.AddCleanup(new(gcSentinel), func(struct{}) { onGC() }, struct{}{})
+	runtime.SetFinalizer(new(gcSentinel), func(*gcSentinel) { onGC() })
 }
 
 // onGC follows the Go memory limit, drops the objects idle for longer than
-// MaxIdle and re-arms itself. It runs on the runtime's cleanup goroutine.
+// MaxIdle and re-arms itself. It runs on the runtime's finalizer goroutine.
 func onGC() {
+	gcTrims.Add(1)
 	at := now()
 	refreshLimit(at)
 	trimAll(max(at-maxIdle.Load(), 0))
 	armGC()
 }
+
+// gcTrims counts the runs of onGC.
+var gcTrims atomic.Int64
+
+// GCTrims returns how many times the trimming after a garbage collection
+// has run (for tests).
+func GCTrims() int64 { return gcTrims.Load() }
 
 // numClasses covers element counts up to the largest int.
 const numClasses = 4 * 64
