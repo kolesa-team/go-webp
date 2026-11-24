@@ -2,15 +2,16 @@ name: CI
 
 # A branch with an open pull request used to get two identical runs, one
 # for the push and one for the pull request. Pushes now run CI on master
-# only (which also feeds Codecov's master badge); other branches run it
-# through their pull request, or by hand from the Actions tab.
+# only (which also refreshes the README's coverage badge); other branches
+# run it through their pull request, or by hand from the Actions tab.
 on:
   push:
     branches: [master]
   pull_request:
   workflow_dispatch:
 
-# The jobs only read the repository.
+# The jobs only read the repository (coverage, below, also commits the
+# coverage badge).
 permissions:
   contents: read
 
@@ -68,20 +69,7 @@ jobs:
         working-directory: benchmarks
         run: go vet ./suite ./v2/...
       - name: Test
-        # Coverage for Codecov is collected here, not in the race detector
-        # step: under -race every update of the (then atomic) coverage
-        # counters goes through the race runtime, and with the encoders'
-        # helper goroutines updating the same counters in their hot loops
-        # that made some packages ~300x slower and time out. -coverpkg counts
-        # code that other packages' tests exercise too (internal/status is
-        # only tested through them); it does not slow the tests down.
-        shell: bash
-        run: |
-          if [ "$RUNNER_OS" = Linux ] && [ "$RUNNER_ARCH" = X64 ] && [ "${{ matrix.go }}" = stable ]; then
-            go test -coverpkg=./... -coverprofile=coverage.txt ./...
-          else
-            go test ./...
-          fi
+        run: go test ./...
       # The assembly kernels (arm64 NEON, amd64 SSE4.1/AVX2/AVX-512) are
       # compared with the pure Go code they replace by the tests above; this
       # runs the whole suite on the pure Go code path as well (what other
@@ -151,8 +139,45 @@ jobs:
           if [ "$n" -lt 3 ]; then
             echo "decodeBit is inlined $n times into getCoeffs (want 3)"; exit 1
           fi
-      - name: Upload coverage
-        if: runner.os == 'Linux' && runner.arch == 'X64' && matrix.go == 'stable'
+
+  coverage:
+    # Coverage of the whole module on linux/amd64, as "make cover" measures
+    # it: the job fails when the total drops below the floor, and runs on
+    # master refresh the README's badge, which is kept on the badges branch
+    # (an orphan branch, so the badge commits stay out of master's history).
+    # It is a job of its own so that only it gets a write token. It does not
+    # run the tests under -race: there every update of the (then atomic)
+    # coverage counters goes through the race runtime, and with the
+    # encoders' helper goroutines updating the same counters in their hot
+    # loops that made some packages ~300x slower and time out.
+    runs-on: ubuntu-latest
+    permissions:
+      # To commit the badge (pull requests from forks get a read-only
+      # token regardless).
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The tests run in this job: keep its token out of .git/config
+          # (the badge is committed through the GitHub API).
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      # -coverpkg counts code that other packages' tests exercise too
+      # (internal/status is only tested through them); it does not slow the
+      # tests down.
+      - name: Test with coverage
+        run: go test -coverpkg=./... -coverprofile=coverage.txt ./...
+      - name: Check the coverage floor, update the badge
+        uses: vladopajic/go-test-coverage@6890500b00a7e5862e54662c04ea9fa7c799ce1e # v2.23.0
+        with:
+          profile: coverage.txt
+          threshold-total: 95
+          # The badge is committed on master only; without a token it is not.
+          git-token: ${{ github.ref == 'refs/heads/master' && secrets.GITHUB_TOKEN || '' }}
+          git-branch: badges
+      - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
         with:
           files: coverage.txt

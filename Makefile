@@ -11,8 +11,9 @@ race:
 vet:
 	$(GO) vet ./...
 
-# Coverage of the whole module, as CI uploads it to Codecov: code that any
-# package's tests run counts. Browse it with go tool cover -html=coverage.txt.
+# Coverage of the whole module, as CI measures it for the README's badge:
+# code that any package's tests run counts. Browse it with
+# go tool cover -html=coverage.txt.
 cover:
 	$(GO) test -coverpkg=./... -coverprofile=coverage.txt ./...
 	$(GO) tool cover -func=coverage.txt | tail -1
