@@ -4,7 +4,7 @@
 [![Release](https://img.shields.io/github/v/release/kolesa-team/go-webp)](https://github.com/kolesa-team/go-webp/releases/latest)
 [![Go Reference](https://pkg.go.dev/badge/github.com/kolesa-team/go-webp/v2.svg)](https://pkg.go.dev/github.com/kolesa-team/go-webp/v2)
 [![CI](https://github.com/kolesa-team/go-webp/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/kolesa-team/go-webp/actions/workflows/ci.yml?query=branch%3Amaster)
-[![Coverage](https://raw.githubusercontent.com/kolesa-team/go-webp/badges/.badges/master/coverage.svg)](#tests)
+[![Coverage](https://raw.githubusercontent.com/kolesa-team/go-webp/badges/.badges/master/coverage.svg)](https://kolesa-team.github.io/go-webp/)
 [![Go version](https://img.shields.io/github/go-mod/go-version/kolesa-team/go-webp)](go.mod)
 [![License: MIT](https://img.shields.io/github/license/kolesa-team/go-webp)](LICENSE)
 [![Mentioned in Awesome Go](https://awesome.re/mentioned-badge.svg)](https://github.com/avelino/awesome-go)
@@ -872,7 +872,9 @@ go tool cover -html=coverage.txt           # browse that coverage report
 ```
 
 CI measures the coverage of its linux/amd64 run (the Coverage badge at the
-top) and fails when the total drops below 95%.
+top) and fails when the total drops below 95%. The report of master, the
+same as `go tool cover -html` shows, is at
+[kolesa-team.github.io/go-webp](https://kolesa-team.github.io/go-webp/).
 
 ## License
 MIT licensed. See the LICENSE file for details.

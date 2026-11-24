@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
 
 # The jobs only read the repository (coverage, below, also commits the
-# coverage badge).
+# coverage badge, and pages publishes the coverage report).
 permissions:
   contents: read
 
@@ -144,7 +144,8 @@ jobs:
     # Coverage of the whole module on linux/amd64, as "make cover" measures
     # it: the job fails when the total drops below the floor, and runs on
     # master refresh the README's badge, which is kept on the badges branch
-    # (an orphan branch, so the badge commits stay out of master's history).
+    # (an orphan branch, so the badge commits stay out of master's history),
+    # and the HTML report the badge links to (published by the pages job).
     # It is a job of its own so that only it gets a write token. It does not
     # run the tests under -race: there every update of the (then atomic)
     # coverage counters goes through the race runtime, and with the
@@ -174,9 +175,47 @@ jobs:
         with:
           profile: coverage.txt
           threshold-total: 95
+          # Statements and covered statements per file ("file;all;covered"),
+          # for the table below.
+          breakdown-file-name: coverage-breakdown.txt
           # The badge is committed on master only; without a token it is not.
           git-token: ${{ github.ref == 'refs/heads/master' && secrets.GITHUB_TOKEN || '' }}
           git-branch: badges
+      # Per package, in the run's summary; also when the floor is missed.
+      # Built from go-test-coverage's counts, so the total is the badge's.
+      - name: Coverage by package
+        if: ${{ !cancelled() && hashFiles('coverage-breakdown.txt') != '' }}
+        run: |
+          awk -F';' '
+            { p = $1; if (!sub(/\/[^\/]*$/, "", p)) p = "."
+              all[p] += $2; cov[p] += $3; total += $2; covered += $3 }
+            END {
+              n = 0; for (p in all) keys[++n] = p
+              for (i = 2; i <= n; i++) {
+                k = keys[i]
+                for (j = i - 1; j > 0 && keys[j] > k; j--) keys[j + 1] = keys[j]
+                keys[j + 1] = k
+              }
+              print "| Package | Coverage | Statements |"
+              print "|---|---:|---:|"
+              for (i = 1; i <= n; i++) {
+                p = keys[i]
+                printf "| %s | %.1f%% | %d / %d |\n", p, 100 * cov[p] / all[p], cov[p], all[p]
+              }
+              printf "| **Total** | **%.1f%%** | %d / %d |\n", 100 * covered / total, covered, total
+            }' coverage-breakdown.txt >> "$GITHUB_STEP_SUMMARY"
+      # The report the badge links to: go tool cover's HTML, the source of
+      # every file with its covered and uncovered statements. It is built
+      # and uploaded on pull requests too, to check it; only master's is
+      # published (the pages job).
+      - name: Coverage report for GitHub Pages
+        run: |
+          mkdir _site
+          go tool cover -html=coverage.txt -o _site/index.html
+          sed -i 's|<title>[^<]*</title>|<title>go-webp test coverage</title>|' _site/index.html
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
         with:
@@ -186,6 +225,26 @@ jobs:
           # upload without a token, which Codecov accepts for them.
           token: ${{ secrets.CODECOV_TOKEN }}
         continue-on-error: true
+
+  pages:
+    # Publishes master's coverage report (built by the coverage job) at
+    # https://kolesa-team.github.io/go-webp/, where the badge links.
+    if: github.ref == 'refs/heads/master'
+    needs: coverage
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    # Two pushes to master in a row publish one after the other.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v5
 
   interop:
     # Conformance against libwebp's cwebp/dwebp (test-only dependency).
